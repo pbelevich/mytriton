@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from textwrap import dedent
+
 import numpy as np
 
 import mytriton as triton
 import mytriton.language as tl
+from mytriton.ssa import SSAPrinter
 from mytriton.trace import (
     AddPtr,
     Arange,
@@ -46,7 +49,7 @@ def test_add_kernel():
         received_meta = meta
         return (triton.cdiv(n, meta["BLOCK"]),)
 
-    ops = add_kernel[grid](
+    ops, ssa = add_kernel[grid](
         x,
         y,
         out,
@@ -145,3 +148,22 @@ def test_add_kernel():
     ]
 
     assert ops == expected_ops
+
+    expected_ssa = dedent(
+        """\
+        %0 = program_id {axis=0} : i32
+        %1 = mul %0, 256 : i32
+        %2 = arange {start=0, end=256} : vector<256 x i32>
+        %3 = add %1, %2 : vector<256 x i32>
+        %4 = addptr x, %3 : vector<256 x ptr<f32>>
+        %5 = cmp_lt %3, n : vector<256 x bool>
+        %6 = load %4, %5, 0.0 : vector<256 x f32>
+        %7 = addptr y, %3 : vector<256 x ptr<f32>>
+        %8 = load %7, %5, 0.0 : vector<256 x f32>
+        %9 = add %6, %8 : vector<256 x f32>
+        %10 = addptr out, %3 : vector<256 x ptr<f32>>
+        store %10, %9, %5
+        """
+    ).rstrip("\n")
+
+    assert SSAPrinter().print_ops(ssa) == expected_ssa

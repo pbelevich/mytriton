@@ -53,7 +53,7 @@ class ScalarType:
 
 @dataclass(frozen=True)
 class PointerType:
-    element: object
+    element: ScalarType
     address_space: str = "global"
 
     def __str__(self):
@@ -66,10 +66,13 @@ class PointerType:
 @dataclass(frozen=True)
 class VectorType:
     size: int
-    element: object
+    element: ScalarType | PointerType
 
     def __str__(self):
         return f"vector<{self.size} x {self.element}>"
+
+
+Type = ScalarType | PointerType | VectorType
 
 
 I32 = ScalarType("i32")

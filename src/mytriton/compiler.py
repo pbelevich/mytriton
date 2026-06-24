@@ -1,5 +1,6 @@
 import inspect
 
+from .ssa import SSALowering
 from .trace import constexpr, trace
 
 
@@ -40,7 +41,9 @@ class CompiledKernel:
 
             ops = trace(self.fn, self.signature, bound.arguments)
 
-            return ops
+            ssa = SSALowering().lower(ops)
+
+            return ops, ssa
 
         return launch
 

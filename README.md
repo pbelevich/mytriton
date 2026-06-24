@@ -1,7 +1,8 @@
 # mytriton
 
 `mytriton` is a small symbolic tracer inspired by Triton's Python API.
-It converts straight-line Python kernels into a simple expression-tree IR.
+It traces straight-line Python kernels into an expression-tree IR, infers types,
+and lowers the result into a small SSA-style IR.
 
 ## Example
 
@@ -10,6 +11,7 @@ import numpy as np
 
 import mytriton as triton
 import mytriton.language as tl
+from mytriton.ssa import SSAPrinter
 
 
 @triton.jit
@@ -27,24 +29,43 @@ x = np.ones(n, dtype=np.float32)
 y = np.ones(n, dtype=np.float32)
 out = np.empty_like(x)
 
-ops = add_kernel[lambda meta: (triton.cdiv(n, meta["BLOCK"]),)](
+expression_ops, ssa_ops = add_kernel[
+    lambda meta: (triton.cdiv(n, meta["BLOCK"]),)
+](
     x,
     y,
     out,
     n,
     BLOCK=block,
 )
-print(ops)
+
+print(expression_ops)
+print(SSAPrinter().print_ops(ssa_ops))
+```
+
+The first result contains the captured expression-tree operations. The second
+contains typed SSA operations. Shared expressions such as `offsets` and `mask`
+are lowered once and referenced by their SSA values wherever they are reused.
+
+For example, part of the resulting SSA looks like this:
+
+```text
+%2 = arange {start=0, end=256} : vector<256 x i32>
+%3 = add %1, %2 : vector<256 x i32>
+%4 = addptr x, %3 : vector<256 x ptr<f32>>
+%5 = cmp_lt %3, n : vector<256 x bool>
+%6 = load %4, %5, 0.0 : vector<256 x f32>
 ```
 
 ## Current limitations
 
-- Kernels are traced into an expression-tree IR; they are not executed.
+- Kernels are traced and lowered to typed SSA, but they are not executed.
 - No CPU or GPU code is generated.
 - Only straight-line kernels are supported. Symbolic Python control flow is rejected.
 - Runtime array arguments must be C-contiguous `float32` arrays.
 - The launch grid is evaluated and validated, but is not represented in the IR.
-- The IR is not yet typed SSA and has no optimization passes.
+- The SSA IR has no basic blocks, control-flow representation, or phi nodes yet.
+- There are no optimization passes yet.
 
 ## Development
 

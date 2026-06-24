@@ -21,7 +21,7 @@ repos:
           mypy --config-file pyproject.toml
           src tests
         language: python
-        additional_dependencies: ["mypy>=1.14", "numpy>=2,<2.3"]
+        additional_dependencies: ["mypy>=1.14", "numpy>=2,<2.3", "pytest>=8"]
         require_serial: true
         types_or: [python, pyi]
         pass_filenames: false
