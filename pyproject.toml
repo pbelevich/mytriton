@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 dependencies = ["numpy>=2"]
 
 [project.optional-dependencies]
+cuda12 = ["cupy-cuda12x>=13"]
 test = ["pytest>=8"]
 dev = [
     "mypy>=1.14",
@@ -63,5 +64,5 @@ warn_unused_ignores = true
 
 [[tool.mypy.overrides]]
 # Kernel annotations are compile-time DSL markers, not regular Python types.
-module = "test_add_kernel"
+module = ["test_add_kernel", "test_cuda_compiler"]
 ignore_errors = true

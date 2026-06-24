@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import os
 from textwrap import dedent
 
 import numpy as np
+import pytest
 
 import mytriton as triton
 import mytriton.language as tl
+from mytriton.cuda_utils import CudaUnavailableError, cuda_module
 from mytriton.ssa import SSAPrinter
 from mytriton.trace import (
     AddPtr,
@@ -49,7 +52,7 @@ def test_add_kernel():
         received_meta = meta
         return (triton.cdiv(n, meta["BLOCK"]),)
 
-    ops, ssa = add_kernel[grid](
+    ops, ssa_ops, cuda_src = add_kernel[grid](
         x,
         y,
         out,
@@ -166,4 +169,52 @@ def test_add_kernel():
         """
     ).rstrip("\n")
 
-    assert SSAPrinter().print_ops(ssa) == expected_ssa
+    assert SSAPrinter().print_ops(ssa_ops) == expected_ssa
+
+    expected_cuda_src = dedent(
+        """\
+        extern "C" __global__
+        void add_kernel(float* x, float* y, float* out, int n) {
+            int v0 = blockIdx.x;
+            int v1 = (v0 * 256);
+            int v2 = threadIdx.x;
+            int v3 = (v1 + v2);
+            bool v5 = (v3 < n);
+            float v6 = (v5 ? x[v3] : 0.0f);
+            float v8 = (v5 ? y[v3] : 0.0f);
+            float v9 = (v6 + v8);
+            if (v5) {
+                out[v3] = v9;
+            }
+        }
+    """
+    ).rstrip("\n")
+
+    assert cuda_src == expected_cuda_src
+
+
+def test_add_kernel_cuda_execution():
+    require_cuda = os.environ.get("MYTRITON_REQUIRE_CUDA") == "1"
+    try:
+        cp = cuda_module()
+    except CudaUnavailableError as error:
+        if require_cuda:
+            pytest.fail(str(error))
+        pytest.skip(str(error))
+
+    n = 1000
+    block = 256
+    x = cp.random.randn(n, dtype=cp.float32)
+    y = cp.random.randn(n, dtype=cp.float32)
+    out = cp.empty_like(x)
+
+    add_kernel[lambda meta: (triton.cdiv(n, meta["BLOCK"]),)](
+        x,
+        y,
+        out,
+        n,
+        BLOCK=block,
+    )
+
+    cp.cuda.runtime.deviceSynchronize()
+    cp.testing.assert_allclose(out, x + y, rtol=1e-5, atol=1e-6)

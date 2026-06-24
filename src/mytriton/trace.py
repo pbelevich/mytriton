@@ -230,8 +230,19 @@ def _make_param(name, value) -> Param:
     raise TypeError(f"{name}: unsupported runtime value {type(value)}")
 
 
-def trace(fn, signature, bound_args):
+def make_runtime_params(signature, bound_args):
+    return [
+        _make_param(name, bound_args[name])
+        for name, parameter in signature.parameters.items()
+        if parameter.annotation is not constexpr
+    ]
+
+
+def trace(fn, signature, bound_args, runtime_params=None):
     symbolic_arguments = {}
+    if runtime_params is None:
+        runtime_params = make_runtime_params(signature, bound_args)
+    params_by_name = {param.name: param for param in runtime_params}
 
     for name, parameter in signature.parameters.items():
         value = bound_args[name]
@@ -240,7 +251,7 @@ def trace(fn, signature, bound_args):
             symbolic_arguments[name] = value
             continue
 
-        param = _make_param(name, value)
+        param = params_by_name[name]
 
         if isinstance(param.ty, PointerType):
             symbolic_arguments[name] = Ptr(param)
@@ -253,4 +264,4 @@ def trace(fn, signature, bound_args):
     with Builder() as builder:
         fn(*symbolic_bound.args, **symbolic_bound.kwargs)
 
-    return builder.ops
+    return builder.ops, runtime_params
