@@ -86,3 +86,62 @@ def test_verifier_checks_load_fallback_conversion():
 
 def test_verifier_accepts_store_numeric_conversion():
     verify([SSAOp("store", (Param("out", PTR_F32), Const(1), None))])
+
+
+def vector_load_ops(width: int):
+    lanes = SSAValue(0, VectorType(width, I32))
+    ptrs = SSAValue(1, VectorType(width, PTR_F32))
+    values = SSAValue(2, VectorType(width, F32))
+    return (
+        [
+            SSAOp("arange", result=lanes, attrs={"start": 0, "end": width}),
+            SSAOp("addptr", (Param("x", PTR_F32), lanes), ptrs),
+            SSAOp("load", (ptrs, None, None), values),
+        ],
+        values,
+    )
+
+
+@pytest.mark.parametrize("opcode", ["sum", "max", "min"])
+def test_verifier_accepts_valid_reduction(opcode):
+    ops, value = vector_load_ops(8)
+    reduced = SSAValue(3, F32)
+    ops.extend(
+        [
+            SSAOp(opcode, (value,), reduced),
+            SSAOp("store", (Param("out", PTR_F32), reduced, None)),
+        ]
+    )
+
+    assert verify(ops, block_size=8) == ops
+
+
+def test_verifier_rejects_scalar_reduction_input():
+    op = SSAOp("sum", (Const(1.0),), SSAValue(0, F32))
+
+    with pytest.raises(CompileError, match="reduction expects vector"):
+        verify([op])
+
+
+def test_verifier_rejects_wrong_reduction_result_type():
+    ops, value = vector_load_ops(8)
+    op = SSAOp("sum", (value,), SSAValue(3, VectorType(8, F32)))
+
+    with pytest.raises(CompileError, match="expected f32"):
+        verify([*ops, op], block_size=8)
+
+
+def test_verifier_rejects_reduction_width_mismatch():
+    value = SSAValue(0, VectorType(8, F32))
+    op = SSAOp("sum", (value,), SSAValue(1, F32))
+
+    with pytest.raises(CompileError, match="does not match CUDA block size 4"):
+        SSAVerifier(block_size=4).check_reduction(0, op)
+
+
+def test_verifier_rejects_non_power_of_two_reduction_width():
+    ops, value = vector_load_ops(6)
+    op = SSAOp("sum", (value,), SSAValue(3, F32))
+
+    with pytest.raises(CompileError, match="power of two"):
+        verify([*ops, op], block_size=6)

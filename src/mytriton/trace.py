@@ -79,6 +79,36 @@ def where(
     return Value(Where(unwrap(condition), unwrap(true_value), unwrap(false_value)))
 
 
+def sum(value: Value) -> Value:
+    return Value(Sum(unwrap(value)))
+
+
+def max(value: Value) -> Value:
+    return Value(Max(unwrap(value)))
+
+
+def min(value: Value) -> Value:
+    return Value(Min(unwrap(value)))
+
+
+def static_range(start: int, stop: int | None = None, step: int = 1) -> range:
+    if stop is None:
+        start, stop = 0, start
+
+    for name, value in (
+        ("start", start),
+        ("stop", stop),
+        ("step", step),
+    ):
+        if not isinstance(value, int):
+            raise ValueError(
+                f"static_range {name} must be compile-time int, "
+                f"got {type(value).__name__}"
+            )
+
+    return range(start, stop, step)
+
+
 # ----------------------------
 # Types
 # ----------------------------
@@ -194,6 +224,21 @@ class Where:
     condition: Any
     true_value: Any
     false_value: Any
+
+
+@dataclass
+class Sum:
+    value: Any
+
+
+@dataclass
+class Max:
+    value: Any
+
+
+@dataclass
+class Min:
+    value: Any
 
 
 # ----------------------------

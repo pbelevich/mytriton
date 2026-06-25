@@ -27,8 +27,12 @@ def test_public_dsl_functions_have_annotations():
         tl.store,
         tl.minimum,
         tl.maximum,
+        tl.sum,
+        tl.max,
+        tl.min,
         tl.exp,
         tl.where,
+        tl.static_range,
     ):
         signature = inspect.signature(function)
         assert signature.return_annotation is not inspect.Signature.empty

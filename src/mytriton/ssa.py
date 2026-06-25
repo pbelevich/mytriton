@@ -7,11 +7,14 @@ from .trace import (
     BinOp,
     Const,
     Load,
+    Max,
     Maximum,
+    Min,
     Minimum,
     Param,
     ProgramId,
     Store,
+    Sum,
     Type,
     UnaryOp,
     Where,
@@ -165,6 +168,30 @@ class SSALowering:
                     true_value,
                     false_value,
                 ),
+            )
+
+        if isinstance(expr, Sum):
+            value = self.lower_expr(expr.value)
+            return self.emit(
+                "sum",
+                expr,
+                operands=(value,),
+            )
+
+        if isinstance(expr, Max):
+            value = self.lower_expr(expr.value)
+            return self.emit(
+                "max",
+                expr,
+                operands=(value,),
+            )
+
+        if isinstance(expr, Min):
+            value = self.lower_expr(expr.value)
+            return self.emit(
+                "min",
+                expr,
+                operands=(value,),
             )
 
         raise TypeError(f"Cannot lower expression: {expr}")

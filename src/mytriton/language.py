@@ -3,10 +3,14 @@ from .trace import (
     constexpr,
     exp,
     load,
+    max,
     maximum,
+    min,
     minimum,
     program_id,
+    static_range,
     store,
+    sum,
     where,
 )
 
@@ -15,9 +19,13 @@ __all__ = [
     "constexpr",
     "exp",
     "load",
+    "max",
     "maximum",
+    "min",
     "minimum",
     "program_id",
+    "static_range",
     "store",
+    "sum",
     "where",
 ]

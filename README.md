@@ -5,6 +5,24 @@ It traces straight-line Python kernels into an expression-tree IR, infers types,
 lowers the result into a small SSA-style IR, verifies and optimizes that IR,
 and emits CUDA C++ source.
 
+## Versions
+
+- [ver1](https://github.com/pbelevich/mytriton/tree/ver1): symbolic tracing,
+  Triton-like kernel launch syntax, tests, and CI.
+- [ver2](https://github.com/pbelevich/mytriton/tree/ver2): typed SSA lowering
+  and type inference for the traced expression-tree IR.
+- [ver3](https://github.com/pbelevich/mytriton/tree/ver3): CUDA C++ source
+  generation, CuPy-backed compilation, and optional CUDA execution.
+- [ver4](https://github.com/pbelevich/mytriton/tree/ver4): math operations and
+  activation kernels, including negation, `tl.exp`, `tl.minimum`,
+  `tl.maximum`, `tl.where`, ReLU, leaky ReLU, and sigmoid.
+- [ver5](https://github.com/pbelevich/mytriton/tree/ver5): SSA verifier and
+  optimization pipeline with constant folding, common subexpression
+  elimination, and dead-code elimination.
+- [ver6](https://github.com/pbelevich/mytriton/tree/ver6): row-wise reductions,
+  `tl.sum`/`tl.max`/`tl.min`, 2D matrix add, softmax, `tl.static_range`,
+  long-row sum, and a first naive matrix multiplication kernel.
+
 ## Example
 
 ```python
@@ -82,14 +100,21 @@ void add_kernel(float* x, float* y, float* out, int n) {
 }
 ```
 
-The test kernels also include a copy, ReLU through `tl.maximum`, leaky ReLU
-through `tl.where`, and sigmoid through negation, `tl.exp`, addition, and
-division.
+The test kernels also include a copy, 2D matrix add, ReLU through
+`tl.maximum`, leaky ReLU through `tl.where`, sigmoid through negation,
+`tl.exp`, addition, and division, row-wise `tl.sum`/`tl.max`/`tl.min`
+reductions, a numerically stable row-wise softmax, and a long-row sum that uses
+`tl.static_range` to unroll several block-sized loads at compile time. The
+current tests also include a naive matrix multiplication kernel that combines a
+2D launch grid, `tl.static_range` over `K`, scalar-vector broadcasting, and
+masked vector stores.
 
 Before CUDA code generation, the SSA IR is checked by a verifier. The verifier
 validates definition order, result declarations, operand types, broadcast
 shapes, pointer operations, memory masks, and operation-specific rules such as
-`tl.exp` requiring `f32` and `tl.where` lowering to a Boolean `select`.
+`tl.exp` requiring `f32`, `tl.where` lowering to a Boolean `select`, and
+reductions consuming one power-of-two vector whose width matches the CUDA block
+size.
 
 The verified SSA then runs through a small optimization pipeline:
 
@@ -115,9 +140,22 @@ before CUDA code generation.
   globals and closure values used by a kernel must remain unchanged; call
   `kernel.clear_cache()` after changing them.
 - CUDA lowering currently supports program IDs, ranges, basic arithmetic and
-  comparison, minimum and maximum, negation, `tl.exp`, `tl.where`, pointer
-  addition, masked loads, and masked stores. Floating-point extrema propagate
-  NaNs and choose the right-hand operand when values compare equal.
+  comparison, elementwise minimum and maximum, negation, `tl.exp`, `tl.where`,
+  pointer addition, masked loads, masked stores, block-local
+  `tl.sum`/`tl.max`/`tl.min` reductions, and compile-time `tl.static_range`
+  loops. Reduction lowering internally emits the CUDA shared-memory scratch
+  buffers and synchronization needed for block-local reductions. Floating-point
+  elementwise extrema propagate NaNs and choose the right-hand operand when
+  values compare equal.
+- Reductions are currently single-block reductions over the SSA vector width.
+  The vector width must be a power of two and must match the CUDA thread block
+  size. Larger rows can be handled by statically unrolling multiple loads into
+  one block-local partial vector, as in the long-row sum test, but there is no
+  multi-block reduction yet.
+- Matrix multiplication support is intentionally naive so far. The current
+  matmul kernel does not tile through shared memory because there is no
+  user-facing shared-memory API yet. It repeatedly reads from global memory and
+  uses `tl.static_range` to unroll the reduction dimension.
 - The SSA IR has no basic blocks, control-flow representation, or phi nodes yet.
 - The optimizer is intentionally small. It does local simplification, constant
   folding, common subexpression elimination, and dead-code elimination, but it

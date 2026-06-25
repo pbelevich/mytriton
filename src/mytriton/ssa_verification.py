@@ -35,6 +35,9 @@ class SSAVerifier:
         "load": 3,
         "store": 3,
         "select": 3,
+        "sum": 1,
+        "max": 1,
+        "min": 1,
     }
 
     def __init__(self, block_size: int) -> None:
@@ -251,6 +254,33 @@ class SSAVerifier:
         )
         self.require_type(index, op, result_ty, expected_ty)
 
+    def check_reduction(self, index: int, op: SSAOp) -> None:
+        value_ty = self.require_operand_type(index, op, op.operands[0], "value")
+        result_ty = self.result_type(index, op)
+
+        if not isinstance(value_ty, VectorType):
+            self.fail(index, op, f"reduction expects vector, got {value_ty}")
+
+        if value_ty.size != self.block_size:
+            self.fail(
+                index,
+                op,
+                f"reduction width {value_ty.size} does not match "
+                f"CUDA block size {self.block_size}",
+            )
+
+        if value_ty.size & (value_ty.size - 1):
+            self.fail(
+                index,
+                op,
+                f"reduction width must be a power of two, got {value_ty.size}",
+            )
+
+        if value_ty.element not in (I32, F32):
+            self.fail(index, op, f"cannot reduce elements of type {value_ty.element}")
+
+        self.require_type(index, op, result_ty, value_ty.element)
+
     def verify(self, ops: list[SSAOp]) -> list[SSAOp]:
         defined: set[int] = set()
 
@@ -329,6 +359,9 @@ class SSAVerifier:
 
             elif op.opcode == "select":
                 self.check_select(index, op)
+
+            elif op.opcode in ("sum", "max", "min"):
+                self.check_reduction(index, op)
 
             if op.result is not None:
                 if op.result.id in defined:

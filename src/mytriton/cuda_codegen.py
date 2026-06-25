@@ -34,6 +34,7 @@ class SSACUDACodegen:
     def __init__(self):
         self.lines: list[str] = []
         self.values: dict[int, str | CudaPtrRef] = {}
+        self.shared_lines: list[str] = []
 
     def cuda_type(self, ty: Type) -> str:
         if isinstance(ty, VectorType):
@@ -104,6 +105,85 @@ class SSACUDACodegen:
 
     def scalar_type(self, ty: Type) -> ScalarType | PointerType:
         return ty.element if isinstance(ty, VectorType) else ty
+
+    def reduction_update(
+        self,
+        opcode: str,
+        element_ty: ScalarType | PointerType,
+        lhs: str,
+        rhs: str,
+    ) -> str:
+        if opcode == "sum":
+            if element_ty in (F32, I32):
+                return f"{lhs} += {rhs};"
+            raise TypeError(f"Unsupported type for sum: {element_ty}")
+
+        if opcode == "max":
+            if element_ty == F32:
+                return f"{lhs} = fmaxf({lhs}, {rhs});"
+            if element_ty == I32:
+                return f"{lhs} = ({lhs} > {rhs} ? {lhs} : {rhs});"
+            raise TypeError(f"Unsupported type for max: {element_ty}")
+
+        if opcode == "min":
+            if element_ty == F32:
+                return f"{lhs} = fminf({lhs}, {rhs});"
+            if element_ty == I32:
+                return f"{lhs} = ({lhs} < {rhs} ? {lhs} : {rhs});"
+            raise TypeError(f"Unsupported type for min: {element_ty}")
+
+        raise TypeError(f"Unsupported reduction opcode: {opcode}")
+
+    def emit_reduction(self, op: SSAOp) -> None:
+        operand = op.operands[0]
+        if not isinstance(operand, SSAValue):
+            raise TypeError(f"{op.opcode} expects an SSA value, got {operand}")
+
+        result = op.result
+        if result is None:
+            raise TypeError(f"{op.opcode} requires a result")
+
+        input_ty = operand.ty
+        if not isinstance(input_ty, VectorType):
+            raise TypeError(f"{op.opcode} expects a vector input, got {input_ty}")
+
+        value = self.expression_operand(operand)
+
+        element_ty = input_ty.element
+        cuda_ty = self.cuda_type(element_ty)
+        width = input_ty.size
+        if width & (width - 1):
+            raise TypeError(f"reduction width must be a power of two, got {width}")
+
+        shared = f"reduce_smem_{result.id}"
+        stride = f"stride_{result.id}"
+
+        self.shared_lines.append(f"    __shared__ {cuda_ty} {shared}[{width}];")
+
+        self.lines.extend(
+            [
+                f"    {shared}[threadIdx.x] = {value};",
+                "    __syncthreads();",
+                f"    for (int {stride} = {width // 2}; {stride} > 0; {stride} >>= 1) {{",
+                f"        if (threadIdx.x < {stride}) {{",
+            ]
+        )
+
+        lhs = f"{shared}[threadIdx.x]"
+        rhs = f"{shared}[threadIdx.x + {stride}]"
+
+        self.lines.append(
+            f"            {self.reduction_update(op.opcode, element_ty, lhs, rhs)}"
+        )
+
+        self.lines.extend(
+            [
+                "        }",
+                "        __syncthreads();",
+                "    }",
+            ]
+        )
+        self.assign(result, f"{shared}[0]")
 
     def emit(self, op: SSAOp) -> None:
         if op.opcode == "store":
@@ -201,6 +281,8 @@ class SSACUDACodegen:
                 result,
                 f"({condition} ? {true_value} : {false_value})",
             )
+        elif op.opcode in ("sum", "max", "min"):
+            self.emit_reduction(op)
         else:
             raise TypeError(f"Unsupported SSA opcode: {op.opcode}")
 
@@ -211,6 +293,7 @@ class SSACUDACodegen:
         params: list[Param],
     ) -> str:
         self.lines = []
+        self.shared_lines = []
         self.values = {}
 
         signature = ", ".join(
@@ -224,6 +307,11 @@ class SSACUDACodegen:
             'extern "C" __global__',
             f"void {kernel_name}({signature}) {{",
         ]
+
+        body.extend(self.shared_lines)
+
+        if self.shared_lines:
+            body.append("")
 
         body.extend(self.lines)
         body.append("}")

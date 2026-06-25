@@ -9,13 +9,16 @@ from .trace import (
     BinOp,
     Const,
     Load,
+    Max,
     Maximum,
+    Min,
     Minimum,
     Param,
     PointerType,
     ProgramId,
     ScalarType,
     Store,
+    Sum,
     Type,
     UnaryOp,
     VectorType,
@@ -192,6 +195,13 @@ class TypeInference:
             false_ty = self.infer(expr.false_value)
             element = self.promote(true_ty, false_ty)
             ty = self.with_shape(element, condition, true_ty, false_ty)
+        elif isinstance(expr, (Sum, Max, Min)):
+            value_ty = self.infer(expr.value)
+            if not isinstance(value_ty, VectorType):
+                raise TypeError(f"{type(expr).__name__} expects vector, got {value_ty}")
+            if value_ty.element not in (I32, F32):
+                raise TypeError(f"cannot reduce elements of type {value_ty.element}")
+            ty = value_ty.element
         else:
             raise TypeError(f"Cannot infer type of {expr}")
 

@@ -199,6 +199,58 @@ def test_where_lowering_and_cuda_codegen():
 
 
 @pytest.mark.parametrize(
+    ("operation", "opcode"),
+    [
+        (tl.sum, "sum"),
+        (tl.max, "max"),
+        (tl.min, "min"),
+    ],
+)
+def test_reduction_lowering(operation, opcode):
+    offsets = Arange(0, 4)
+    values = Load(AddPtr(Param("x", PTR_F32), offsets), None, None)
+    expression = operation(Value(values)).expr
+
+    ssa_ops = SSALowering().lower([Store(Param("out", PTR_F32), expression, None)])
+
+    assert SSAPrinter().print_ops(ssa_ops) == dedent(
+        f"""\
+        %0 = arange {{start=0, end=4}} : vector<4 x i32>
+        %1 = addptr x, %0 : vector<4 x ptr<f32>>
+        %2 = load %1, none, none : vector<4 x f32>
+        %3 = {opcode} %2 : f32
+        store out, %3, none
+        """
+    ).rstrip("\n")
+
+
+@pytest.mark.parametrize("operation", [tl.sum, tl.max, tl.min])
+def test_reduction_returns_scalar_element_type(operation):
+    offsets = Arange(0, 4)
+    values = Load(AddPtr(Param("x", PTR_F32), offsets), None, None)
+    expression = operation(Value(values)).expr
+
+    assert TypeInference().infer(expression) == F32
+
+
+@pytest.mark.parametrize("operation", [tl.sum, tl.max, tl.min])
+def test_reduction_rejects_scalar_input(operation):
+    expression = operation(Value(Param("value", F32))).expr
+
+    with pytest.raises(TypeError, match="expects vector"):
+        TypeInference().infer(expression)
+
+
+@pytest.mark.parametrize("operation", [tl.sum, tl.max, tl.min])
+def test_reduction_rejects_boolean_vectors(operation):
+    condition = Value(Arange(0, 4)) < 2
+    expression = operation(condition).expr
+
+    with pytest.raises(TypeError, match="cannot reduce elements of type bool"):
+        TypeInference().infer(expression)
+
+
+@pytest.mark.parametrize(
     ("operation", "numpy_operation", "kernel_name"),
     [
         (tl.minimum, np.minimum, "minimum"),
