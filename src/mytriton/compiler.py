@@ -6,7 +6,9 @@ from typing import Any, Generic, ParamSpec, TypeAlias
 
 from .cuda_codegen import SSACUDACodegen
 from .cuda_utils import CudaKernelCache, execute_cuda_if_needed
+from .optim import ConstantFoldPass, CSEPass, DCEPass, PassManager
 from .ssa import SSALowering, SSAOp
+from .ssa_verification import SSAVerifier
 from .trace import VectorType, is_constexpr_annotation, make_runtime_params, trace
 
 P = ParamSpec("P")
@@ -125,6 +127,27 @@ class CompiledKernel(Generic[P]):
                 )
                 ssa_ops = SSALowering().lower(ops)
                 threads_per_block = _cuda_threads_per_block(ssa_ops)
+
+                # The optimizer assumes lowering produced valid SSA.
+                verifier = SSAVerifier(threads_per_block)
+                verifier.verify(ssa_ops)
+
+                # PassManager re-runs the verifier after each rewrite pass, so
+                # a broken optimization fails before CUDA codegen sees it.
+                ssa_ops = PassManager(
+                    passes=[
+                        ConstantFoldPass(),
+                        CSEPass(),
+                        DCEPass(),
+                    ],
+                    verifier=verifier,
+                ).run(ssa_ops)
+
+                # Recompute after optimization: DCE/CSE may remove the vector
+                # ops that originally determined the CUDA block size.
+                threads_per_block = _cuda_threads_per_block(ssa_ops)
+                SSAVerifier(threads_per_block).verify(ssa_ops)
+
                 cuda_src = SSACUDACodegen().generate(
                     self.fn.__name__,
                     ssa_ops,

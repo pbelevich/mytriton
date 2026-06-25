@@ -2,7 +2,8 @@
 
 `mytriton` is a small symbolic tracer inspired by Triton's Python API.
 It traces straight-line Python kernels into an expression-tree IR, infers types,
-lowers the result into a small SSA-style IR, and emits CUDA C++ source.
+lowers the result into a small SSA-style IR, verifies and optimizes that IR,
+and emits CUDA C++ source.
 
 ## Example
 
@@ -45,11 +46,11 @@ print(cuda_src)
 ```
 
 The first result contains the captured expression-tree operations. The second
-contains typed SSA operations, and the third contains generated CUDA C++ source.
-With NumPy arguments, compilation stops there. If the arguments are CuPy arrays
-and a CUDA GPU is available, the generated kernel is also compiled and launched.
-Shared expressions such as `offsets` and `mask` are lowered once and referenced
-by their SSA values wherever they are reused.
+contains optimized typed SSA operations, and the third contains generated CUDA
+C++ source. With NumPy arguments, compilation stops there. If the arguments are
+CuPy arrays and a CUDA GPU is available, the generated kernel is also compiled
+and launched. Shared expressions such as `offsets` and `mask` are lowered once
+and referenced by their SSA values wherever they are reused.
 
 For example, part of the resulting SSA looks like this:
 
@@ -85,6 +86,20 @@ The test kernels also include a copy, ReLU through `tl.maximum`, leaky ReLU
 through `tl.where`, and sigmoid through negation, `tl.exp`, addition, and
 division.
 
+Before CUDA code generation, the SSA IR is checked by a verifier. The verifier
+validates definition order, result declarations, operand types, broadcast
+shapes, pointer operations, memory masks, and operation-specific rules such as
+`tl.exp` requiring `f32` and `tl.where` lowering to a Boolean `select`.
+
+The verified SSA then runs through a small optimization pipeline:
+
+- constant folding and local simplifications such as `select(true, x, y) -> x`;
+- common subexpression elimination for pure operations;
+- dead-code elimination.
+
+The verifier runs after every optimization pass so malformed rewrites fail
+before CUDA code generation.
+
 ## Current limitations
 
 - Generated CUDA source is returned as a string. Execution requires CuPy built
@@ -104,7 +119,9 @@ division.
   addition, masked loads, and masked stores. Floating-point extrema propagate
   NaNs and choose the right-hand operand when values compare equal.
 - The SSA IR has no basic blocks, control-flow representation, or phi nodes yet.
-- There are no optimization passes yet.
+- The optimizer is intentionally small. It does local simplification, constant
+  folding, common subexpression elimination, and dead-code elimination, but it
+  has no control-flow or memory-aware optimization passes yet.
 
 ## Development
 
