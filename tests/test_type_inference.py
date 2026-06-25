@@ -14,6 +14,7 @@ from mytriton.trace import (
     PointerType,
     Store,
     VectorType,
+    Where,
 )
 from mytriton.type_inference import TypeInference
 
@@ -144,3 +145,37 @@ def test_integer_arithmetic_stays_integer():
     expr = BinOp("*", Const(2), Const(3))
 
     assert TypeInference().infer(expr) == I32
+
+
+def test_where_uses_condition_shape_to_broadcast_scalar_arms():
+    condition = BinOp("<", Arange(0, 4), Const(2))
+    expr = Where(condition, Const(1.0), Const(0.0))
+
+    assert TypeInference().infer(expr) == VectorType(4, F32)
+
+
+def test_where_broadcasts_scalar_condition_over_vector_arms():
+    expr = Where(Const(True), Arange(0, 4), Const(0))
+
+    assert TypeInference().infer(expr) == VectorType(4, I32)
+
+
+def test_where_promotes_branch_types():
+    expr = Where(Const(True), Const(1), Const(2.0))
+
+    assert TypeInference().infer(expr) == F32
+
+
+def test_where_rejects_non_boolean_condition():
+    expr = Where(Const(1), Const(1.0), Const(0.0))
+
+    with pytest.raises(TypeError, match="where condition must be bool"):
+        TypeInference().infer(expr)
+
+
+def test_where_rejects_incompatible_condition_shape():
+    condition = BinOp("<", Arange(0, 4), Const(4))
+    expr = Where(condition, Arange(0, 8), Const(0.0))
+
+    with pytest.raises(TypeError, match="Cannot broadcast"):
+        TypeInference().infer(expr)

@@ -1,11 +1,19 @@
 import inspect
+from collections.abc import Callable, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Generic, ParamSpec, TypeAlias
 
 from .cuda_codegen import SSACUDACodegen
 from .cuda_utils import CudaKernelCache, execute_cuda_if_needed
 from .ssa import SSALowering, SSAOp
-from .trace import VectorType, constexpr, make_runtime_params, trace
+from .trace import VectorType, is_constexpr_annotation, make_runtime_params, trace
+
+P = ParamSpec("P")
+Meta: TypeAlias = dict[str, Any]
+LaunchDimensions: TypeAlias = int | Sequence[int]
+Grid: TypeAlias = LaunchDimensions | Callable[[Meta], LaunchDimensions]
+CompilationResult: TypeAlias = tuple[list[Any], list[SSAOp], str]
 
 
 def _cuda_threads_per_block(ssa_ops: list[SSAOp]) -> int:
@@ -32,12 +40,19 @@ def _cuda_threads_per_block(ssa_ops: list[SSAOp]) -> int:
     return threads_per_block
 
 
-def _constexpr_key(meta: dict[str, object]) -> tuple[tuple[str, object], ...]:
+def _constexpr_key(
+    meta: dict[str, object],
+) -> tuple[tuple[str, type[object], object], ...]:
     supported = (bool, int, float, str)
+    entries = []
     for name, value in meta.items():
         if not isinstance(value, supported):
             raise TypeError(f"{name}: constexpr value must be bool, int, float, or str")
-    return tuple(meta.items())
+
+        normalized = float(value).hex() if isinstance(value, float) else value
+        entries.append((name, type(value), normalized))
+
+    return tuple(entries)
 
 
 @dataclass(frozen=True)
@@ -48,8 +63,8 @@ class _CompilationArtifact:
     threads_per_block: int
 
 
-class CompiledKernel:
-    def __init__(self, fn):
+class CompiledKernel(Generic[P]):
+    def __init__(self, fn: Callable[P, Any]) -> None:
         self.fn = fn
         signature = inspect.signature(fn)
         annotations = inspect.get_annotations(fn, eval_str=True)
@@ -67,16 +82,16 @@ class CompiledKernel:
         self.compilation_cache.clear()
         self.cuda_cache.clear()
 
-    def __getitem__(self, grid):
+    def __getitem__(self, grid: Grid) -> Callable[P, CompilationResult]:
 
-        def launch(*args, **kwargs):
+        def launch(*args: P.args, **kwargs: P.kwargs) -> CompilationResult:
             bound = self.signature.bind(*args, **kwargs)
             bound.apply_defaults()
 
-            meta = {
+            meta: Meta = {
                 name: bound.arguments[name]
                 for name, parameter in self.signature.parameters.items()
-                if parameter.annotation is constexpr
+                if is_constexpr_annotation(parameter.annotation)
             }
 
             launch_grid = grid(meta) if callable(grid) else grid
@@ -92,7 +107,7 @@ class CompiledKernel:
             runtime_args = tuple(
                 bound.arguments[name]
                 for name, parameter in self.signature.parameters.items()
-                if parameter.annotation is not constexpr
+                if not is_constexpr_annotation(parameter.annotation)
             )
             params = make_runtime_params(self.signature, bound.arguments)
             cache_key = (
@@ -132,10 +147,14 @@ class CompiledKernel:
                 runtime_args=runtime_args,
             )
 
-            return list(artifact.ops), list(artifact.ssa_ops), artifact.cuda_src
+            return (
+                list(deepcopy(artifact.ops)),
+                list(deepcopy(artifact.ssa_ops)),
+                artifact.cuda_src,
+            )
 
         return launch
 
 
-def jit(fn):
+def jit(fn: Callable[P, Any]) -> CompiledKernel[P]:
     return CompiledKernel(fn)

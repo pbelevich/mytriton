@@ -9,13 +9,17 @@ from .trace import (
     BinOp,
     Const,
     Load,
+    Maximum,
+    Minimum,
     Param,
     PointerType,
     ProgramId,
     ScalarType,
     Store,
     Type,
+    UnaryOp,
     VectorType,
+    Where,
 )
 
 
@@ -162,6 +166,32 @@ class TypeInference:
 
             ty = self.with_shape(ptr_element.element, *operands)
 
+        elif isinstance(expr, (Maximum, Minimum)):
+            lhs = self.infer(expr.lhs)
+            rhs = self.infer(expr.rhs)
+            element = self.promote(lhs, rhs)
+            ty = self.with_shape(element, lhs, rhs)
+
+        elif isinstance(expr, UnaryOp):
+            value = self.infer(expr.value)
+            unary_element = self.element_type(value)
+            if expr.op == "neg":
+                if unary_element not in (I32, F32):
+                    raise TypeError(f"Cannot negate {value}")
+            elif expr.op == "exp":
+                if unary_element != F32:
+                    raise TypeError(f"exp requires f32, got {value}")
+            else:
+                raise TypeError(f"Unknown unary operation: {expr.op}")
+            ty = value
+        elif isinstance(expr, Where):
+            condition = self.infer(expr.condition)
+            if self.element_type(condition) != BOOL:
+                raise TypeError(f"where condition must be bool, got {condition}")
+            true_ty = self.infer(expr.true_value)
+            false_ty = self.infer(expr.false_value)
+            element = self.promote(true_ty, false_ty)
+            ty = self.with_shape(element, condition, true_ty, false_ty)
         else:
             raise TypeError(f"Cannot infer type of {expr}")
 

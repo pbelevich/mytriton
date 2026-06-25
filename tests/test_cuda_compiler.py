@@ -6,6 +6,7 @@ import pytest
 import mytriton as triton
 import mytriton.language as tl
 from mytriton.cuda_codegen import SSACUDACodegen
+from mytriton.trace import Const
 
 
 @triton.jit
@@ -246,13 +247,41 @@ def test_cached_results_cannot_mutate_artifact():
 
     out = np.empty(1, dtype=np.float32)
     ops, ssa_ops, _ = immutable_kernel[(1,)](out)
+    ops[0].value = Const(9.0)
+    ssa_ops[-1].operands = ()
     ops.clear()
     ssa_ops.clear()
 
     cached_ops, cached_ssa_ops, _ = immutable_kernel[(1,)](out)
 
-    assert cached_ops
-    assert cached_ssa_ops
+    assert cached_ops[0].value == Const(1.0)
+    assert cached_ssa_ops[-1].operands
+
+
+def test_constexpr_cache_distinguishes_python_types():
+    @triton.jit
+    def type_sensitive_kernel(out, VALUE: tl.constexpr):
+        tl.store(out, 1.0 if type(VALUE) is bool else 2.0)
+
+    out = np.empty(1, dtype=np.float32)
+    _, _, bool_src = type_sensitive_kernel[(1,)](out, VALUE=True)
+    _, _, int_src = type_sensitive_kernel[(1,)](out, VALUE=1)
+
+    assert "out[0] = 1.0f;" in bool_src
+    assert "out[0] = 2.0f;" in int_src
+
+
+def test_constexpr_cache_preserves_signed_zero():
+    @triton.jit
+    def signed_zero_kernel(out, VALUE: tl.constexpr):
+        tl.store(out, VALUE)
+
+    out = np.empty(1, dtype=np.float32)
+    _, _, positive_src = signed_zero_kernel[(1,)](out, VALUE=0.0)
+    _, _, negative_src = signed_zero_kernel[(1,)](out, VALUE=-0.0)
+
+    assert "out[0] = 0.0f;" in positive_src
+    assert "out[0] = -0.0f;" in negative_src
 
 
 def test_clear_cache_forces_recompilation(monkeypatch):
@@ -293,3 +322,14 @@ def test_rejects_unhashable_constexpr_value():
         match="META: constexpr value must be bool, int, float, or str",
     ):
         constexpr_kernel[(1,)](out, META=[])
+
+
+def test_triton_style_constexpr_annotation_is_supported():
+    @triton.jit
+    def legacy_kernel(out, ENABLED: tl.constexpr):
+        tl.store(out, 1.0 if ENABLED else 0.0)
+
+    out = np.empty(1, dtype=np.float32)
+    _, _, cuda_src = legacy_kernel[(1,)](out, ENABLED=True)
+
+    assert "out[0] = 1.0f;" in cuda_src

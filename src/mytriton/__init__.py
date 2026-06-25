@@ -2,7 +2,7 @@ from .compiler import jit
 from .cuda_utils import cuda_available
 
 
-def cdiv(x, y):
+def cdiv(x: int, y: int) -> int:
     return (x + y - 1) // y
 
 

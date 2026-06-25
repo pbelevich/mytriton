@@ -61,8 +61,3 @@ show_error_codes = true
 warn_redundant_casts = true
 warn_unused_configs = true
 warn_unused_ignores = true
-
-[[tool.mypy.overrides]]
-# Kernel annotations are compile-time DSL markers, not regular Python types.
-module = ["test_add_kernel", "test_cuda_compiler"]
-ignore_errors = true

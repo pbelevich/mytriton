@@ -1,7 +1,21 @@
 from dataclasses import dataclass, field
 from typing import ClassVar
 
-from .trace import AddPtr, Arange, BinOp, Const, Load, Param, ProgramId, Store, Type
+from .trace import (
+    AddPtr,
+    Arange,
+    BinOp,
+    Const,
+    Load,
+    Maximum,
+    Minimum,
+    Param,
+    ProgramId,
+    Store,
+    Type,
+    UnaryOp,
+    Where,
+)
 from .type_inference import TypeInference
 
 
@@ -118,6 +132,39 @@ class SSALowering:
                 "addptr",
                 expr,
                 operands=(base, offset),
+            )
+
+        if isinstance(expr, (Maximum, Minimum)):
+            lhs = self.lower_expr(expr.lhs)
+            rhs = self.lower_expr(expr.rhs)
+
+            return self.emit(
+                "maximum" if isinstance(expr, Maximum) else "minimum",
+                expr,
+                operands=(lhs, rhs),
+            )
+
+        if isinstance(expr, UnaryOp):
+            value = self.lower_expr(expr.value)
+
+            return self.emit(
+                expr.op,
+                expr,
+                operands=(value,),
+            )
+
+        if isinstance(expr, Where):
+            condition = self.lower_expr(expr.condition)
+            true_value = self.lower_expr(expr.true_value)
+            false_value = self.lower_expr(expr.false_value)
+            return self.emit(
+                "select",
+                expr,
+                operands=(
+                    condition,
+                    true_value,
+                    false_value,
+                ),
             )
 
         raise TypeError(f"Cannot lower expression: {expr}")

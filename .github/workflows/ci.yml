@@ -43,6 +43,12 @@ jobs:
       - name: Build wheel
         run: python -m pip wheel . --no-deps --wheel-dir dist
 
+      - name: Verify typed package marker
+        run: >-
+          python -c "from pathlib import Path; from zipfile import ZipFile;
+          wheel = next(Path('dist').glob('*.whl'));
+          assert 'mytriton/py.typed' in ZipFile(wheel).namelist()"
+
   cuda:
     name: CUDA execution
     if: vars.CUDA_RUNNER_ENABLED == 'true'
@@ -66,4 +72,4 @@ jobs:
       - name: Require CUDA execution tests
         env:
           MYTRITON_REQUIRE_CUDA: "1"
-        run: python -m pytest tests/test_add_kernel.py
+        run: python -m pytest

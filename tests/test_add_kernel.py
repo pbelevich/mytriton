@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import os
 from textwrap import dedent
 
 import numpy as np
-import pytest
 
 import mytriton as triton
 import mytriton.language as tl
-from mytriton.cuda_utils import CudaUnavailableError, cuda_module
 from mytriton.ssa import SSAPrinter
 from mytriton.trace import (
     AddPtr,
@@ -193,15 +190,7 @@ def test_add_kernel():
     assert cuda_src == expected_cuda_src
 
 
-def test_add_kernel_cuda_execution():
-    require_cuda = os.environ.get("MYTRITON_REQUIRE_CUDA") == "1"
-    try:
-        cp = cuda_module()
-    except CudaUnavailableError as error:
-        if require_cuda:
-            pytest.fail(str(error))
-        pytest.skip(str(error))
-
+def test_add_kernel_cuda_execution(cp):
     n = 1000
     block = 256
     x = cp.random.randn(n, dtype=cp.float32)

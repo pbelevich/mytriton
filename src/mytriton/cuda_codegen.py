@@ -174,6 +174,33 @@ class SSACUDACodegen:
                 result,
                 f"({mask} ? {ptr.base}[{ptr.index}] : {other})",
             )
+        elif op.opcode in ("maximum", "minimum"):
+            lhs = self.expression_operand(op.operands[0])
+            rhs = self.expression_operand(op.operands[1])
+            symbol = ">" if op.opcode == "maximum" else "<"
+            comparison = f"(({lhs}) {symbol} ({rhs}) ? ({lhs}) : ({rhs}))"
+            if self.scalar_type(result.ty) == F32:
+                comparison = (
+                    f"(isnan({lhs}) ? ({lhs}) : "
+                    f"(isnan({rhs}) ? ({rhs}) : {comparison}))"
+                )
+            self.assign(result, comparison)
+        elif op.opcode == "neg":
+            value = self.expression_operand(op.operands[0])
+            self.assign(result, f"-({value})")
+        elif op.opcode == "exp":
+            value = self.expression_operand(op.operands[0])
+            if self.scalar_type(result.ty) != F32:
+                raise TypeError(f"exp requires f32, got {result.ty}")
+            self.assign(result, f"expf({value})")
+        elif op.opcode == "select":
+            condition = self.expression_operand(op.operands[0])
+            true_value = self.expression_operand(op.operands[1])
+            false_value = self.expression_operand(op.operands[2])
+            self.assign(
+                result,
+                f"({condition} ? {true_value} : {false_value})",
+            )
         else:
             raise TypeError(f"Unsupported SSA opcode: {op.opcode}")
 

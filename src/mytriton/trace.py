@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Annotated, Any, TypeAlias, get_args, get_origin
 
 import numpy as np
 
@@ -8,19 +10,34 @@ import numpy as np
 # ----------------------------
 
 
-class constexpr:
-    pass
+if TYPE_CHECKING:
+    constexpr: TypeAlias = Any
+else:
+
+    class constexpr:
+        pass
 
 
-def program_id(axis: int):
+def is_constexpr_annotation(annotation: object) -> bool:
+    if annotation is constexpr:
+        return True
+
+    return get_origin(annotation) is Annotated and constexpr in get_args(annotation)[1:]
+
+
+def program_id(axis: int) -> Value:
     return Value(ProgramId(axis))
 
 
-def arange(start: int, end: int):
+def arange(start: int, end: int) -> Value:
     return Value(Arange(start, end))
 
 
-def load(ptr, mask=None, other=None):
+def load(
+    ptr: Ptr,
+    mask: Value | bool | None = None,
+    other: Value | int | float | None = None,
+) -> Value:
     node = Load(
         ptr=unwrap(ptr),
         mask=unwrap(mask) if mask is not None else None,
@@ -29,13 +46,37 @@ def load(ptr, mask=None, other=None):
     return Value(node)
 
 
-def store(ptr, value, mask=None):
+def store(
+    ptr: Ptr,
+    value: Value | int | float,
+    mask: Value | bool | None = None,
+) -> None:
     node = Store(
         ptr=unwrap(ptr),
         value=unwrap(value),
         mask=unwrap(mask) if mask is not None else None,
     )
     Builder.current().ops.append(node)
+
+
+def maximum(lhs: Value | int | float, rhs: Value | int | float) -> Value:
+    return Value(Maximum(unwrap(lhs), unwrap(rhs)))
+
+
+def minimum(lhs: Value | int | float, rhs: Value | int | float) -> Value:
+    return Value(Minimum(unwrap(lhs), unwrap(rhs)))
+
+
+def exp(value: Value | float) -> Value:
+    return Value(UnaryOp("exp", unwrap(value)))
+
+
+def where(
+    condition: Value | bool,
+    true_value: Value | int | float,
+    false_value: Value | int | float,
+) -> Value:
+    return Value(Where(unwrap(condition), unwrap(true_value), unwrap(false_value)))
 
 
 # ----------------------------
@@ -130,12 +171,37 @@ class Store:
     mask: Any | None
 
 
+@dataclass
+class Maximum:
+    lhs: Any
+    rhs: Any
+
+
+@dataclass
+class Minimum:
+    lhs: Any
+    rhs: Any
+
+
+@dataclass
+class UnaryOp:
+    op: str
+    value: Any
+
+
+@dataclass
+class Where:
+    condition: Any
+    true_value: Any
+    false_value: Any
+
+
 # ----------------------------
 # Symbolic values
 # ----------------------------
 
 
-def unwrap(x):
+def unwrap(x: Any) -> Any:
     if isinstance(x, Value):
         return x.expr
     if isinstance(x, Ptr):
@@ -146,51 +212,54 @@ def unwrap(x):
 
 
 class Value:
-    def __init__(self, expr):
+    def __init__(self, expr: Any) -> None:
         self.expr = expr
 
-    def __add__(self, other):
+    def __add__(self, other: Value | int | float) -> Value:
         return Value(BinOp("+", self.expr, unwrap(other)))
 
-    def __radd__(self, other):
+    def __radd__(self, other: Value | int | float) -> Value:
         return Value(BinOp("+", unwrap(other), self.expr))
 
-    def __sub__(self, other):
+    def __sub__(self, other: Value | int | float) -> Value:
         return Value(BinOp("-", self.expr, unwrap(other)))
 
-    def __rsub__(self, other):
+    def __rsub__(self, other: Value | int | float) -> Value:
         return Value(BinOp("-", unwrap(other), self.expr))
 
-    def __mul__(self, other):
+    def __mul__(self, other: Value | int | float) -> Value:
         return Value(BinOp("*", self.expr, unwrap(other)))
 
-    def __rmul__(self, other):
+    def __rmul__(self, other: Value | int | float) -> Value:
         return Value(BinOp("*", unwrap(other), self.expr))
 
-    def __lt__(self, other):
+    def __lt__(self, other: Value | int | float) -> Value:
         return Value(BinOp("<", self.expr, unwrap(other)))
 
-    def __truediv__(self, other):
+    def __truediv__(self, other: Value | int | float) -> Value:
         return Value(BinOp("/", self.expr, unwrap(other)))
 
-    def __rtruediv__(self, other):
+    def __rtruediv__(self, other: Value | int | float) -> Value:
         return Value(BinOp("/", unwrap(other), self.expr))
+
+    def __neg__(self) -> Value:
+        return Value(UnaryOp("neg", self.expr))
 
     def __bool__(self) -> bool:
         raise TypeError("Python control flow over symbolic values is not supported")
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"Value({self.expr})"
 
 
 class Ptr:
-    def __init__(self, expr):
+    def __init__(self, expr: Any) -> None:
         self.expr = expr
 
-    def __add__(self, offset):
+    def __add__(self, offset: Value | int) -> Ptr:
         return Ptr(AddPtr(self.expr, unwrap(offset)))
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"Ptr({self.expr})"
 
 
@@ -234,7 +303,7 @@ def make_runtime_params(signature, bound_args):
     return [
         _make_param(name, bound_args[name])
         for name, parameter in signature.parameters.items()
-        if parameter.annotation is not constexpr
+        if not is_constexpr_annotation(parameter.annotation)
     ]
 
 
@@ -247,7 +316,7 @@ def trace(fn, signature, bound_args, runtime_params=None):
     for name, parameter in signature.parameters.items():
         value = bound_args[name]
 
-        if parameter.annotation is constexpr:
+        if is_constexpr_annotation(parameter.annotation):
             symbolic_arguments[name] = value
             continue
 

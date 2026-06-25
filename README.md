@@ -81,6 +81,10 @@ void add_kernel(float* x, float* y, float* out, int n) {
 }
 ```
 
+The test kernels also include a copy, ReLU through `tl.maximum`, leaky ReLU
+through `tl.where`, and sigmoid through negation, `tl.exp`, addition, and
+division.
+
 ## Current limitations
 
 - Generated CUDA source is returned as a string. Execution requires CuPy built
@@ -95,9 +99,10 @@ void add_kernel(float* x, float* y, float* out, int n) {
 - JIT cache entries are specialized by runtime types and constexpr values. Python
   globals and closure values used by a kernel must remain unchanged; call
   `kernel.clear_cache()` after changing them.
-- CUDA lowering currently supports the operations needed by the vector-add example:
-  program IDs, ranges, basic arithmetic and comparison, pointer addition, masked
-  loads, and masked stores.
+- CUDA lowering currently supports program IDs, ranges, basic arithmetic and
+  comparison, minimum and maximum, negation, `tl.exp`, `tl.where`, pointer
+  addition, masked loads, and masked stores. Floating-point extrema propagate
+  NaNs and choose the right-hand operand when values compare equal.
 - The SSA IR has no basic blocks, control-flow representation, or phi nodes yet.
 - There are no optimization passes yet.
 
@@ -115,10 +120,10 @@ To enable CUDA execution with CUDA 12, install the matching CuPy wheel:
 python -m pip install -e ".[cuda12]"
 ```
 
-On a GPU test runner, require the CUDA execution test to run instead of skip:
+On a GPU test runner, require all CUDA execution tests to run instead of skip:
 
 ```bash
-MYTRITON_REQUIRE_CUDA=1 python -m pytest tests/test_add_kernel.py
+MYTRITON_REQUIRE_CUDA=1 python -m pytest
 ```
 
 The GitHub Actions CUDA job is enabled when the repository variable
