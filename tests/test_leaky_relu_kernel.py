@@ -40,14 +40,14 @@ def test_leaky_relu_kernel_lowering():
         %1 = mul %0, 256 : i32
         %2 = arange {start=0, end=256} : vector<256 x i32>
         %3 = add %1, %2 : vector<256 x i32>
-        %4 = addptr x, %3 : vector<256 x ptr<f32>>
-        %5 = cmp_lt %3, n : vector<256 x bool>
-        %6 = load %4, %5, 0.0 : vector<256 x f32>
+        %4 = cmp_lt %3, n : vector<256 x bool>
+        %5 = addptr x, %3 : vector<256 x ptr<f32>>
+        %6 = load %5, %4, 0.0 : vector<256 x f32>
         %7 = cmp_lt %6, 0.0 : vector<256 x bool>
         %8 = mul alpha, %6 : vector<256 x f32>
         %9 = select %7, %8, %6 : vector<256 x f32>
         %10 = addptr out, %3 : vector<256 x ptr<f32>>
-        store %10, %9, %5
+        store %10, %9, %4
         """
     ).rstrip("\n")
 
@@ -59,12 +59,12 @@ def test_leaky_relu_kernel_lowering():
             int v1 = (v0 * 256);
             int v2 = threadIdx.x;
             int v3 = (v1 + v2);
-            bool v5 = (v3 < n);
-            float v6 = (v5 ? x[v3] : 0.0f);
+            bool v4 = (v3 < n);
+            float v6 = (v4 ? x[v3] : 0.0f);
             bool v7 = (v6 < 0.0f);
             float v8 = (alpha * v6);
             float v9 = (v7 ? v8 : v6);
-            if (v5) {
+            if (v4) {
                 out[v3] = v9;
             }
         }

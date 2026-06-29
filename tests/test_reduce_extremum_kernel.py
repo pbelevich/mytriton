@@ -133,16 +133,16 @@ def test_row_extremum_kernel_lowering(
     assert SSAPrinter().print_ops(ssa_ops) == dedent(
         f"""\
         %0 = program_id {{axis=0}} : i32
-        %1 = mul %0, n_cols : i32
-        %2 = arange {{start=0, end=8}} : vector<8 x i32>
-        %3 = add %1, %2 : vector<8 x i32>
-        %4 = addptr x, %3 : vector<8 x ptr<f32>>
-        %5 = cmp_lt %2, n_cols : vector<8 x bool>
-        %6 = load %4, %5, {fallback_ssa} : vector<8 x f32>
+        %1 = arange {{start=0, end=8}} : vector<8 x i32>
+        %2 = mul %0, n_cols : i32
+        %3 = add %2, %1 : vector<8 x i32>
+        %4 = cmp_lt %1, n_cols : vector<8 x bool>
+        %5 = addptr x, %3 : vector<8 x ptr<f32>>
+        %6 = load %5, %4, {fallback_ssa} : vector<8 x f32>
         %7 = {opcode} %6 : f32
-        %8 = addptr out, %0 : ptr<f32>
-        %9 = cmp_lt %2, 1 : vector<8 x bool>
-        store %8, %7, %9
+        %8 = cmp_lt %1, 1 : vector<8 x bool>
+        %9 = addptr out, %0 : ptr<f32>
+        store %9, %7, %8
         """
     ).rstrip("\n")
 
@@ -153,11 +153,11 @@ def test_row_extremum_kernel_lowering(
             __shared__ float reduce_smem_7[8];
 
             int v0 = blockIdx.x;
-            int v1 = (v0 * n_cols);
-            int v2 = threadIdx.x;
-            int v3 = (v1 + v2);
-            bool v5 = (v2 < n_cols);
-            float v6 = (v5 ? x[v3] : {fallback_cuda});
+            int v1 = threadIdx.x;
+            int v2 = (v0 * n_cols);
+            int v3 = (v2 + v1);
+            bool v4 = (v1 < n_cols);
+            float v6 = (v4 ? x[v3] : {fallback_cuda});
             reduce_smem_7[threadIdx.x] = v6;
             __syncthreads();
             for (int stride_7 = 4; stride_7 > 0; stride_7 >>= 1) {{
@@ -167,8 +167,8 @@ def test_row_extremum_kernel_lowering(
                 __syncthreads();
             }}
             float v7 = reduce_smem_7[0];
-            bool v9 = (v2 < 1);
-            if (v9) {{
+            bool v8 = (v1 < 1);
+            if (v8) {{
                 out[v0] = v7;
             }}
         }}

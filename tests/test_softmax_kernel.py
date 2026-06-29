@@ -101,28 +101,42 @@ def test_softmax_kernel_trace():
     n_cols_param = Param(name="n_cols", ty=i32)
     row = ProgramId(axis=0)
     cols_expr = Arange(start=0, end=8)
+    row_start = BinOp(op="*", lhs=row, rhs=n_cols_param)
     offsets = BinOp(
         op="+",
-        lhs=BinOp(op="*", lhs=row, rhs=n_cols_param),
+        lhs=row_start,
         rhs=cols_expr,
     )
     mask = BinOp(op="<", lhs=cols_expr, rhs=n_cols_param)
+    load_ptr = AddPtr(base=x_param, offset=offsets)
     values = Load(
-        ptr=AddPtr(base=x_param, offset=offsets),
+        ptr=load_ptr,
         mask=mask,
         other=Const(value=float("-inf")),
     )
     row_max = Max(value=values)
-    numerators = UnaryOp(op="exp", value=BinOp(op="-", lhs=values, rhs=row_max))
+    shifted = BinOp(op="-", lhs=values, rhs=row_max)
+    numerators = UnaryOp(op="exp", value=shifted)
     denominator = Sum(value=numerators)
     probabilities = BinOp(op="/", lhs=numerators, rhs=denominator)
+    out_ptr = AddPtr(base=out_param, offset=offsets)
+    store = Store(ptr=out_ptr, value=probabilities, mask=mask)
 
     expected_ops = [
-        Store(
-            ptr=AddPtr(base=out_param, offset=offsets),
-            value=probabilities,
-            mask=mask,
-        )
+        row,
+        cols_expr,
+        row_start,
+        offsets,
+        mask,
+        load_ptr,
+        values,
+        row_max,
+        shifted,
+        numerators,
+        denominator,
+        probabilities,
+        out_ptr,
+        store,
     ]
 
     assert ops == expected_ops
@@ -155,19 +169,19 @@ def test_softmax_kernel_lowering():
     assert SSAPrinter().print_ops(ssa_ops) == dedent(
         """\
         %0 = program_id {axis=0} : i32
-        %1 = mul %0, n_cols : i32
-        %2 = arange {start=0, end=8} : vector<8 x i32>
-        %3 = add %1, %2 : vector<8 x i32>
-        %4 = addptr x, %3 : vector<8 x ptr<f32>>
-        %5 = cmp_lt %2, n_cols : vector<8 x bool>
-        %6 = load %4, %5, -inf : vector<8 x f32>
+        %1 = arange {start=0, end=8} : vector<8 x i32>
+        %2 = mul %0, n_cols : i32
+        %3 = add %2, %1 : vector<8 x i32>
+        %4 = cmp_lt %1, n_cols : vector<8 x bool>
+        %5 = addptr x, %3 : vector<8 x ptr<f32>>
+        %6 = load %5, %4, -inf : vector<8 x f32>
         %7 = max %6 : f32
         %8 = sub %6, %7 : vector<8 x f32>
         %9 = exp %8 : vector<8 x f32>
         %10 = sum %9 : f32
         %11 = div %9, %10 : vector<8 x f32>
         %12 = addptr out, %3 : vector<8 x ptr<f32>>
-        store %12, %11, %5
+        store %12, %11, %4
         """
     ).rstrip("\n")
 
@@ -179,11 +193,11 @@ def test_softmax_kernel_lowering():
             __shared__ float reduce_smem_10[8];
 
             int v0 = blockIdx.x;
-            int v1 = (v0 * n_cols);
-            int v2 = threadIdx.x;
-            int v3 = (v1 + v2);
-            bool v5 = (v2 < n_cols);
-            float v6 = (v5 ? x[v3] : (-__int_as_float(0x7f800000)));
+            int v1 = threadIdx.x;
+            int v2 = (v0 * n_cols);
+            int v3 = (v2 + v1);
+            bool v4 = (v1 < n_cols);
+            float v6 = (v4 ? x[v3] : (-__int_as_float(0x7f800000)));
             reduce_smem_7[threadIdx.x] = v6;
             __syncthreads();
             for (int stride_7 = 4; stride_7 > 0; stride_7 >>= 1) {
@@ -205,7 +219,7 @@ def test_softmax_kernel_lowering():
             }
             float v10 = reduce_smem_10[0];
             float v11 = (v9 / v10);
-            if (v5) {
+            if (v4) {
                 out[v3] = v11;
             }
         }

@@ -71,36 +71,44 @@ def test_matrix_add_kernel():
     n_cols_param = Param(name="n_cols", ty=i32)
     row = ProgramId(axis=0)
     col_block = ProgramId(axis=1)
+    col_start = BinOp(op="*", lhs=col_block, rhs=Const(value=256))
+    lanes = Arange(start=0, end=256)
     cols_expr = BinOp(
         op="+",
-        lhs=BinOp(op="*", lhs=col_block, rhs=Const(value=256)),
-        rhs=Arange(start=0, end=256),
+        lhs=col_start,
+        rhs=lanes,
     )
+    row_start = BinOp(op="*", lhs=row, rhs=n_cols_param)
     offsets = BinOp(
         op="+",
-        lhs=BinOp(op="*", lhs=row, rhs=n_cols_param),
+        lhs=row_start,
         rhs=cols_expr,
     )
     mask = BinOp(op="<", lhs=cols_expr, rhs=n_cols_param)
+    x_ptr = AddPtr(base=x_param, offset=offsets)
+    lhs = Load(ptr=x_ptr, mask=mask, other=Const(value=0.0))
+    y_ptr = AddPtr(base=y_param, offset=offsets)
+    rhs = Load(ptr=y_ptr, mask=mask, other=Const(value=0.0))
+    out_ptr = AddPtr(base=out_param, offset=offsets)
+    value = BinOp(op="+", lhs=lhs, rhs=rhs)
+    store = Store(ptr=out_ptr, value=value, mask=mask)
 
     expected_ops = [
-        Store(
-            ptr=AddPtr(base=out_param, offset=offsets),
-            value=BinOp(
-                op="+",
-                lhs=Load(
-                    ptr=AddPtr(base=x_param, offset=offsets),
-                    mask=mask,
-                    other=Const(value=0.0),
-                ),
-                rhs=Load(
-                    ptr=AddPtr(base=y_param, offset=offsets),
-                    mask=mask,
-                    other=Const(value=0.0),
-                ),
-            ),
-            mask=mask,
-        )
+        row,
+        col_block,
+        col_start,
+        lanes,
+        cols_expr,
+        row_start,
+        offsets,
+        mask,
+        x_ptr,
+        lhs,
+        y_ptr,
+        rhs,
+        out_ptr,
+        value,
+        store,
     ]
 
     assert ops == expected_ops
@@ -108,20 +116,20 @@ def test_matrix_add_kernel():
     expected_ssa = dedent(
         """\
         %0 = program_id {axis=0} : i32
-        %1 = mul %0, n_cols : i32
-        %2 = program_id {axis=1} : i32
-        %3 = mul %2, 256 : i32
-        %4 = arange {start=0, end=256} : vector<256 x i32>
-        %5 = add %3, %4 : vector<256 x i32>
-        %6 = add %1, %5 : vector<256 x i32>
-        %7 = addptr x, %6 : vector<256 x ptr<f32>>
-        %8 = cmp_lt %5, n_cols : vector<256 x bool>
-        %9 = load %7, %8, 0.0 : vector<256 x f32>
+        %1 = program_id {axis=1} : i32
+        %2 = mul %1, 256 : i32
+        %3 = arange {start=0, end=256} : vector<256 x i32>
+        %4 = add %2, %3 : vector<256 x i32>
+        %5 = mul %0, n_cols : i32
+        %6 = add %5, %4 : vector<256 x i32>
+        %7 = cmp_lt %4, n_cols : vector<256 x bool>
+        %8 = addptr x, %6 : vector<256 x ptr<f32>>
+        %9 = load %8, %7, 0.0 : vector<256 x f32>
         %10 = addptr y, %6 : vector<256 x ptr<f32>>
-        %11 = load %10, %8, 0.0 : vector<256 x f32>
-        %12 = add %9, %11 : vector<256 x f32>
-        %13 = addptr out, %6 : vector<256 x ptr<f32>>
-        store %13, %12, %8
+        %11 = load %10, %7, 0.0 : vector<256 x f32>
+        %12 = addptr out, %6 : vector<256 x ptr<f32>>
+        %13 = add %9, %11 : vector<256 x f32>
+        store %12, %13, %7
         """
     ).rstrip("\n")
 
@@ -132,18 +140,18 @@ def test_matrix_add_kernel():
         extern "C" __global__
         void matrix_add_kernel(float* x, float* y, float* out, int n_cols) {
             int v0 = blockIdx.x;
-            int v1 = (v0 * n_cols);
-            int v2 = blockIdx.y;
-            int v3 = (v2 * 256);
-            int v4 = threadIdx.x;
-            int v5 = (v3 + v4);
-            int v6 = (v1 + v5);
-            bool v8 = (v5 < n_cols);
-            float v9 = (v8 ? x[v6] : 0.0f);
-            float v11 = (v8 ? y[v6] : 0.0f);
-            float v12 = (v9 + v11);
-            if (v8) {
-                out[v6] = v12;
+            int v1 = blockIdx.y;
+            int v2 = (v1 * 256);
+            int v3 = threadIdx.x;
+            int v4 = (v2 + v3);
+            int v5 = (v0 * n_cols);
+            int v6 = (v5 + v4);
+            bool v7 = (v4 < n_cols);
+            float v9 = (v7 ? x[v6] : 0.0f);
+            float v11 = (v7 ? y[v6] : 0.0f);
+            float v13 = (v9 + v11);
+            if (v7) {
+                out[v6] = v13;
             }
         }
     """

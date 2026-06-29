@@ -26,11 +26,11 @@ def is_constexpr_annotation(annotation: object) -> bool:
 
 
 def program_id(axis: int) -> Value:
-    return Value(ProgramId(axis))
+    return Value(Builder.record(ProgramId(axis)))
 
 
 def arange(start: int, end: int) -> Value:
-    return Value(Arange(start, end))
+    return Value(Builder.record(Arange(start, end)))
 
 
 def load(
@@ -38,12 +38,15 @@ def load(
     mask: Value | bool | None = None,
     other: Value | int | float | None = None,
 ) -> Value:
-    node = Load(
-        ptr=unwrap(ptr),
-        mask=unwrap(mask) if mask is not None else None,
-        other=unwrap(other) if other is not None else None,
+    return Value(
+        Builder.record(
+            Load(
+                ptr=unwrap(ptr),
+                mask=unwrap(mask) if mask is not None else None,
+                other=unwrap(other) if other is not None else None,
+            )
+        )
     )
-    return Value(node)
 
 
 def store(
@@ -51,24 +54,25 @@ def store(
     value: Value | int | float,
     mask: Value | bool | None = None,
 ) -> None:
-    node = Store(
-        ptr=unwrap(ptr),
-        value=unwrap(value),
-        mask=unwrap(mask) if mask is not None else None,
+    Builder.record(
+        Store(
+            ptr=unwrap(ptr),
+            value=unwrap(value),
+            mask=unwrap(mask) if mask is not None else None,
+        )
     )
-    Builder.current().ops.append(node)
 
 
 def maximum(lhs: Value | int | float, rhs: Value | int | float) -> Value:
-    return Value(Maximum(unwrap(lhs), unwrap(rhs)))
+    return Value(Builder.record(Maximum(unwrap(lhs), unwrap(rhs))))
 
 
 def minimum(lhs: Value | int | float, rhs: Value | int | float) -> Value:
-    return Value(Minimum(unwrap(lhs), unwrap(rhs)))
+    return Value(Builder.record(Minimum(unwrap(lhs), unwrap(rhs))))
 
 
 def exp(value: Value | float) -> Value:
-    return Value(UnaryOp("exp", unwrap(value)))
+    return Value(Builder.record(UnaryOp("exp", unwrap(value))))
 
 
 def where(
@@ -76,19 +80,23 @@ def where(
     true_value: Value | int | float,
     false_value: Value | int | float,
 ) -> Value:
-    return Value(Where(unwrap(condition), unwrap(true_value), unwrap(false_value)))
+    return Value(
+        Builder.record(
+            Where(unwrap(condition), unwrap(true_value), unwrap(false_value))
+        )
+    )
 
 
 def sum(value: Value) -> Value:
-    return Value(Sum(unwrap(value)))
+    return Value(Builder.record(Sum(unwrap(value))))
 
 
 def max(value: Value) -> Value:
-    return Value(Max(unwrap(value)))
+    return Value(Builder.record(Max(unwrap(value))))
 
 
 def min(value: Value) -> Value:
-    return Value(Min(unwrap(value)))
+    return Value(Builder.record(Min(unwrap(value))))
 
 
 def static_range(start: int, stop: int | None = None, step: int = 1) -> range:
@@ -261,34 +269,34 @@ class Value:
         self.expr = expr
 
     def __add__(self, other: Value | int | float) -> Value:
-        return Value(BinOp("+", self.expr, unwrap(other)))
+        return Value(Builder.record(BinOp("+", self.expr, unwrap(other))))
 
     def __radd__(self, other: Value | int | float) -> Value:
-        return Value(BinOp("+", unwrap(other), self.expr))
+        return Value(Builder.record(BinOp("+", unwrap(other), self.expr)))
 
     def __sub__(self, other: Value | int | float) -> Value:
-        return Value(BinOp("-", self.expr, unwrap(other)))
+        return Value(Builder.record(BinOp("-", self.expr, unwrap(other))))
 
     def __rsub__(self, other: Value | int | float) -> Value:
-        return Value(BinOp("-", unwrap(other), self.expr))
+        return Value(Builder.record(BinOp("-", unwrap(other), self.expr)))
 
     def __mul__(self, other: Value | int | float) -> Value:
-        return Value(BinOp("*", self.expr, unwrap(other)))
+        return Value(Builder.record(BinOp("*", self.expr, unwrap(other))))
 
     def __rmul__(self, other: Value | int | float) -> Value:
-        return Value(BinOp("*", unwrap(other), self.expr))
+        return Value(Builder.record(BinOp("*", unwrap(other), self.expr)))
 
     def __lt__(self, other: Value | int | float) -> Value:
-        return Value(BinOp("<", self.expr, unwrap(other)))
+        return Value(Builder.record(BinOp("<", self.expr, unwrap(other))))
 
     def __truediv__(self, other: Value | int | float) -> Value:
-        return Value(BinOp("/", self.expr, unwrap(other)))
+        return Value(Builder.record(BinOp("/", self.expr, unwrap(other))))
 
     def __rtruediv__(self, other: Value | int | float) -> Value:
-        return Value(BinOp("/", unwrap(other), self.expr))
+        return Value(Builder.record(BinOp("/", unwrap(other), self.expr)))
 
     def __neg__(self) -> Value:
-        return Value(UnaryOp("neg", self.expr))
+        return Value(Builder.record(UnaryOp("neg", self.expr)))
 
     def __bool__(self) -> bool:
         raise TypeError("Python control flow over symbolic values is not supported")
@@ -302,7 +310,7 @@ class Ptr:
         self.expr = expr
 
     def __add__(self, offset: Value | int) -> Ptr:
-        return Ptr(AddPtr(self.expr, unwrap(offset)))
+        return Ptr(Builder.record(AddPtr(self.expr, unwrap(offset))))
 
     def __repr__(self) -> str:
         return f"Ptr({self.expr})"
@@ -325,6 +333,12 @@ class Builder:
     def current():
         assert Builder._current is not None
         return Builder._current
+
+    @staticmethod
+    def record(node):
+        if Builder._current is not None:
+            Builder._current.ops.append(node)
+        return node
 
 
 def _make_param(name, value) -> Param:

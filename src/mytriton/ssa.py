@@ -42,6 +42,24 @@ class SSAOp:
     attrs: dict[str, object] = field(default_factory=dict)
 
 
+EXPR_NODES = (
+    Const,
+    Param,
+    ProgramId,
+    Arange,
+    BinOp,
+    AddPtr,
+    Load,
+    Maximum,
+    Minimum,
+    UnaryOp,
+    Where,
+    Sum,
+    Max,
+    Min,
+)
+
+
 class SSALowering:
     BINOPS: ClassVar[dict[str, str]] = {
         "+": "add",
@@ -211,6 +229,13 @@ class SSALowering:
                         operands=(ptr, value, mask),
                     )
                 )
+                continue
+
+            if isinstance(
+                op,
+                EXPR_NODES,
+            ):
+                self.lower_expr(op)
                 continue
 
             raise TypeError(f"Cannot lower operation: {op}")

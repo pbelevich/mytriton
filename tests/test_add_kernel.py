@@ -59,92 +59,38 @@ def test_add_kernel():
 
     assert received_meta == {"BLOCK": BLOCK}
 
+    f32_ptr = PointerType(element=ScalarType(name="f32"), address_space="global")
+    i32 = ScalarType(name="i32")
+    x_param = Param(name="x", ty=f32_ptr)
+    y_param = Param(name="y", ty=f32_ptr)
+    out_param = Param(name="out", ty=f32_ptr)
+    n_param = Param(name="n", ty=i32)
+    pid = ProgramId(axis=0)
+    block_start = BinOp(op="*", lhs=pid, rhs=Const(value=256))
+    lanes = Arange(start=0, end=256)
+    offs = BinOp(op="+", lhs=block_start, rhs=lanes)
+    mask = BinOp(op="<", lhs=offs, rhs=n_param)
+    x_ptr = AddPtr(base=x_param, offset=offs)
+    a = Load(ptr=x_ptr, mask=mask, other=Const(value=0.0))
+    y_ptr = AddPtr(base=y_param, offset=offs)
+    b = Load(ptr=y_ptr, mask=mask, other=Const(value=0.0))
+    out_ptr = AddPtr(base=out_param, offset=offs)
+    value = BinOp(op="+", lhs=a, rhs=b)
+    store = Store(ptr=out_ptr, value=value, mask=mask)
+
     expected_ops = [
-        Store(
-            ptr=AddPtr(
-                base=Param(
-                    name="out",
-                    ty=PointerType(
-                        element=ScalarType(name="f32"), address_space="global"
-                    ),
-                ),
-                offset=BinOp(
-                    op="+",
-                    lhs=BinOp(op="*", lhs=ProgramId(axis=0), rhs=Const(value=256)),
-                    rhs=Arange(start=0, end=256),
-                ),
-            ),
-            value=BinOp(
-                op="+",
-                lhs=Load(
-                    ptr=AddPtr(
-                        base=Param(
-                            name="x",
-                            ty=PointerType(
-                                element=ScalarType(name="f32"), address_space="global"
-                            ),
-                        ),
-                        offset=BinOp(
-                            op="+",
-                            lhs=BinOp(
-                                op="*", lhs=ProgramId(axis=0), rhs=Const(value=256)
-                            ),
-                            rhs=Arange(start=0, end=256),
-                        ),
-                    ),
-                    mask=BinOp(
-                        op="<",
-                        lhs=BinOp(
-                            op="+",
-                            lhs=BinOp(
-                                op="*", lhs=ProgramId(axis=0), rhs=Const(value=256)
-                            ),
-                            rhs=Arange(start=0, end=256),
-                        ),
-                        rhs=Param(name="n", ty=ScalarType(name="i32")),
-                    ),
-                    other=Const(value=0.0),
-                ),
-                rhs=Load(
-                    ptr=AddPtr(
-                        base=Param(
-                            name="y",
-                            ty=PointerType(
-                                element=ScalarType(name="f32"), address_space="global"
-                            ),
-                        ),
-                        offset=BinOp(
-                            op="+",
-                            lhs=BinOp(
-                                op="*", lhs=ProgramId(axis=0), rhs=Const(value=256)
-                            ),
-                            rhs=Arange(start=0, end=256),
-                        ),
-                    ),
-                    mask=BinOp(
-                        op="<",
-                        lhs=BinOp(
-                            op="+",
-                            lhs=BinOp(
-                                op="*", lhs=ProgramId(axis=0), rhs=Const(value=256)
-                            ),
-                            rhs=Arange(start=0, end=256),
-                        ),
-                        rhs=Param(name="n", ty=ScalarType(name="i32")),
-                    ),
-                    other=Const(value=0.0),
-                ),
-            ),
-            mask=BinOp(
-                op="<",
-                lhs=BinOp(
-                    op="+",
-                    lhs=BinOp(op="*", lhs=ProgramId(axis=0), rhs=Const(value=256)),
-                    rhs=Arange(start=0, end=256),
-                ),
-                rhs=Param(name="n", ty=ScalarType(name="i32")),
-            ),
-        )
+        pid,
+        block_start,
+        lanes,
+        offs,
+        mask,
+        x_ptr,
+        a,
+        y_ptr,
+        b,
+        out_ptr,
+        value,
+        store,
     ]
 
     assert ops == expected_ops
@@ -155,14 +101,14 @@ def test_add_kernel():
         %1 = mul %0, 256 : i32
         %2 = arange {start=0, end=256} : vector<256 x i32>
         %3 = add %1, %2 : vector<256 x i32>
-        %4 = addptr x, %3 : vector<256 x ptr<f32>>
-        %5 = cmp_lt %3, n : vector<256 x bool>
-        %6 = load %4, %5, 0.0 : vector<256 x f32>
+        %4 = cmp_lt %3, n : vector<256 x bool>
+        %5 = addptr x, %3 : vector<256 x ptr<f32>>
+        %6 = load %5, %4, 0.0 : vector<256 x f32>
         %7 = addptr y, %3 : vector<256 x ptr<f32>>
-        %8 = load %7, %5, 0.0 : vector<256 x f32>
-        %9 = add %6, %8 : vector<256 x f32>
-        %10 = addptr out, %3 : vector<256 x ptr<f32>>
-        store %10, %9, %5
+        %8 = load %7, %4, 0.0 : vector<256 x f32>
+        %9 = addptr out, %3 : vector<256 x ptr<f32>>
+        %10 = add %6, %8 : vector<256 x f32>
+        store %9, %10, %4
         """
     ).rstrip("\n")
 
@@ -176,12 +122,12 @@ def test_add_kernel():
             int v1 = (v0 * 256);
             int v2 = threadIdx.x;
             int v3 = (v1 + v2);
-            bool v5 = (v3 < n);
-            float v6 = (v5 ? x[v3] : 0.0f);
-            float v8 = (v5 ? y[v3] : 0.0f);
-            float v9 = (v6 + v8);
-            if (v5) {
-                out[v3] = v9;
+            bool v4 = (v3 < n);
+            float v6 = (v4 ? x[v3] : 0.0f);
+            float v8 = (v4 ? y[v3] : 0.0f);
+            float v10 = (v6 + v8);
+            if (v4) {
+                out[v3] = v10;
             }
         }
     """

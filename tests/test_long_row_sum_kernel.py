@@ -102,38 +102,70 @@ def test_long_row_sum_kernel_trace():
     row = ProgramId(axis=0)
     lanes = Arange(start=0, end=4)
     row_start = BinOp(op="*", lhs=row, rhs=Const(value=10))
-    row_base = AddPtr(base=x_param, offset=row_start)
 
     cols0 = BinOp(op="+", lhs=Const(value=0), rhs=lanes)
+    mask0 = BinOp(op="<", lhs=cols0, rhs=Const(value=10))
+    row_base0 = AddPtr(base=x_param, offset=row_start)
+    ptr0 = AddPtr(base=row_base0, offset=cols0)
     values0 = Load(
-        ptr=AddPtr(base=row_base, offset=cols0),
-        mask=BinOp(op="<", lhs=cols0, rhs=Const(value=10)),
+        ptr=ptr0,
+        mask=mask0,
         other=Const(value=0.0),
     )
     partial0 = BinOp(op="+", lhs=Const(value=0.0), rhs=values0)
 
     cols4 = BinOp(op="+", lhs=Const(value=4), rhs=lanes)
+    mask4 = BinOp(op="<", lhs=cols4, rhs=Const(value=10))
+    row_base4 = AddPtr(base=x_param, offset=row_start)
+    ptr4 = AddPtr(base=row_base4, offset=cols4)
     values4 = Load(
-        ptr=AddPtr(base=row_base, offset=cols4),
-        mask=BinOp(op="<", lhs=cols4, rhs=Const(value=10)),
+        ptr=ptr4,
+        mask=mask4,
         other=Const(value=0.0),
     )
     partial4 = BinOp(op="+", lhs=partial0, rhs=values4)
 
     cols8 = BinOp(op="+", lhs=Const(value=8), rhs=lanes)
+    mask8 = BinOp(op="<", lhs=cols8, rhs=Const(value=10))
+    row_base8 = AddPtr(base=x_param, offset=row_start)
+    ptr8 = AddPtr(base=row_base8, offset=cols8)
     values8 = Load(
-        ptr=AddPtr(base=row_base, offset=cols8),
-        mask=BinOp(op="<", lhs=cols8, rhs=Const(value=10)),
+        ptr=ptr8,
+        mask=mask8,
         other=Const(value=0.0),
     )
     partial8 = BinOp(op="+", lhs=partial4, rhs=values8)
+    total = Sum(value=partial8)
+    first_lane = BinOp(op="<", lhs=lanes, rhs=Const(value=1))
+    out_ptr = AddPtr(base=out_param, offset=row)
+    store = Store(ptr=out_ptr, value=total, mask=first_lane)
 
     expected_ops = [
-        Store(
-            ptr=AddPtr(base=out_param, offset=row),
-            value=Sum(value=partial8),
-            mask=BinOp(op="<", lhs=lanes, rhs=Const(value=1)),
-        )
+        row,
+        lanes,
+        row_start,
+        cols0,
+        mask0,
+        row_base0,
+        ptr0,
+        values0,
+        partial0,
+        cols4,
+        mask4,
+        row_base4,
+        ptr4,
+        values4,
+        partial4,
+        cols8,
+        mask8,
+        row_base8,
+        ptr8,
+        values8,
+        partial8,
+        total,
+        first_lane,
+        out_ptr,
+        store,
     ]
 
     assert ops == expected_ops
@@ -166,28 +198,28 @@ def test_long_row_sum_kernel_lowering():
     assert SSAPrinter().print_ops(ssa_ops) == dedent(
         """\
         %0 = program_id {axis=0} : i32
-        %1 = mul %0, 10 : i32
-        %2 = addptr x, %1 : ptr<f32>
-        %3 = arange {start=0, end=4} : vector<4 x i32>
-        %4 = add 0, %3 : vector<4 x i32>
-        %5 = addptr %2, %4 : vector<4 x ptr<f32>>
-        %6 = cmp_lt %4, 10 : vector<4 x bool>
-        %7 = load %5, %6, 0.0 : vector<4 x f32>
+        %1 = arange {start=0, end=4} : vector<4 x i32>
+        %2 = mul %0, 10 : i32
+        %3 = add 0, %1 : vector<4 x i32>
+        %4 = cmp_lt %3, 10 : vector<4 x bool>
+        %5 = addptr x, %2 : ptr<f32>
+        %6 = addptr %5, %3 : vector<4 x ptr<f32>>
+        %7 = load %6, %4, 0.0 : vector<4 x f32>
         %8 = add 0.0, %7 : vector<4 x f32>
-        %10 = add 4, %3 : vector<4 x i32>
-        %11 = addptr %2, %10 : vector<4 x ptr<f32>>
-        %12 = cmp_lt %10, 10 : vector<4 x bool>
-        %13 = load %11, %12, 0.0 : vector<4 x f32>
+        %9 = add 4, %1 : vector<4 x i32>
+        %10 = cmp_lt %9, 10 : vector<4 x bool>
+        %12 = addptr %5, %9 : vector<4 x ptr<f32>>
+        %13 = load %12, %10, 0.0 : vector<4 x f32>
         %14 = add %8, %13 : vector<4 x f32>
-        %16 = add 8, %3 : vector<4 x i32>
-        %17 = addptr %2, %16 : vector<4 x ptr<f32>>
-        %18 = cmp_lt %16, 10 : vector<4 x bool>
-        %19 = load %17, %18, 0.0 : vector<4 x f32>
+        %15 = add 8, %1 : vector<4 x i32>
+        %16 = cmp_lt %15, 10 : vector<4 x bool>
+        %18 = addptr %5, %15 : vector<4 x ptr<f32>>
+        %19 = load %18, %16, 0.0 : vector<4 x f32>
         %20 = add %14, %19 : vector<4 x f32>
         %21 = sum %20 : f32
-        %22 = addptr out, %0 : ptr<f32>
-        %23 = cmp_lt %3, 1 : vector<4 x bool>
-        store %22, %21, %23
+        %22 = cmp_lt %1, 1 : vector<4 x bool>
+        %23 = addptr out, %0 : ptr<f32>
+        store %23, %21, %22
         """
     ).rstrip("\n")
 
@@ -198,19 +230,19 @@ def test_long_row_sum_kernel_lowering():
             __shared__ float reduce_smem_21[4];
 
             int v0 = blockIdx.x;
-            int v1 = (v0 * 10);
-            int v3 = threadIdx.x;
-            int v4 = (0 + v3);
-            bool v6 = (v4 < 10);
-            float v7 = (v6 ? x[(v1 + v4)] : 0.0f);
+            int v1 = threadIdx.x;
+            int v2 = (v0 * 10);
+            int v3 = (0 + v1);
+            bool v4 = (v3 < 10);
+            float v7 = (v4 ? x[(v2 + v3)] : 0.0f);
             float v8 = (0.0f + v7);
-            int v10 = (4 + v3);
-            bool v12 = (v10 < 10);
-            float v13 = (v12 ? x[(v1 + v10)] : 0.0f);
+            int v9 = (4 + v1);
+            bool v10 = (v9 < 10);
+            float v13 = (v10 ? x[(v2 + v9)] : 0.0f);
             float v14 = (v8 + v13);
-            int v16 = (8 + v3);
-            bool v18 = (v16 < 10);
-            float v19 = (v18 ? x[(v1 + v16)] : 0.0f);
+            int v15 = (8 + v1);
+            bool v16 = (v15 < 10);
+            float v19 = (v16 ? x[(v2 + v15)] : 0.0f);
             float v20 = (v14 + v19);
             reduce_smem_21[threadIdx.x] = v20;
             __syncthreads();
@@ -221,8 +253,8 @@ def test_long_row_sum_kernel_lowering():
                 __syncthreads();
             }
             float v21 = reduce_smem_21[0];
-            bool v23 = (v3 < 1);
-            if (v23) {
+            bool v22 = (v1 < 1);
+            if (v22) {
                 out[v0] = v21;
             }
         }

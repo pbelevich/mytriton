@@ -37,12 +37,12 @@ def test_relu_kernel_lowering():
         %1 = mul %0, 256 : i32
         %2 = arange {start=0, end=256} : vector<256 x i32>
         %3 = add %1, %2 : vector<256 x i32>
-        %4 = addptr x, %3 : vector<256 x ptr<f32>>
-        %5 = cmp_lt %3, n : vector<256 x bool>
-        %6 = load %4, %5, 0.0 : vector<256 x f32>
-        %7 = maximum %6, 0.0 : vector<256 x f32>
-        %8 = addptr out, %3 : vector<256 x ptr<f32>>
-        store %8, %7, %5
+        %4 = cmp_lt %3, n : vector<256 x bool>
+        %5 = addptr x, %3 : vector<256 x ptr<f32>>
+        %6 = load %5, %4, 0.0 : vector<256 x f32>
+        %7 = addptr out, %3 : vector<256 x ptr<f32>>
+        %8 = maximum %6, 0.0 : vector<256 x f32>
+        store %7, %8, %4
         """
     ).rstrip("\n")
 
@@ -54,11 +54,11 @@ def test_relu_kernel_lowering():
             int v1 = (v0 * 256);
             int v2 = threadIdx.x;
             int v3 = (v1 + v2);
-            bool v5 = (v3 < n);
-            float v6 = (v5 ? x[v3] : 0.0f);
-            float v7 = (isnan(v6) ? (v6) : (isnan(0.0f) ? (0.0f) : ((v6) > (0.0f) ? (v6) : (0.0f))));
-            if (v5) {
-                out[v3] = v7;
+            bool v4 = (v3 < n);
+            float v6 = (v4 ? x[v3] : 0.0f);
+            float v8 = (isnan(v6) ? (v6) : (isnan(0.0f) ? (0.0f) : ((v6) > (0.0f) ? (v6) : (0.0f))));
+            if (v4) {
+                out[v3] = v8;
             }
         }
         """

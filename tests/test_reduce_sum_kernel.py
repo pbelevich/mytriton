@@ -95,24 +95,36 @@ def test_reduce_sum_kernel_trace():
     n_cols_param = Param(name="n_cols", ty=i32)
     row = ProgramId(axis=0)
     cols_expr = Arange(start=0, end=8)
+    row_start = BinOp(op="*", lhs=row, rhs=n_cols_param)
     offsets = BinOp(
         op="+",
-        lhs=BinOp(op="*", lhs=row, rhs=n_cols_param),
+        lhs=row_start,
         rhs=cols_expr,
     )
     mask = BinOp(op="<", lhs=cols_expr, rhs=n_cols_param)
+    load_ptr = AddPtr(base=x_param, offset=offsets)
     values = Load(
-        ptr=AddPtr(base=x_param, offset=offsets),
+        ptr=load_ptr,
         mask=mask,
         other=Const(value=0.0),
     )
+    total = Sum(value=values)
+    store_mask = BinOp(op="<", lhs=cols_expr, rhs=Const(value=1))
+    out_ptr = AddPtr(base=out_param, offset=row)
+    store = Store(ptr=out_ptr, value=total, mask=store_mask)
 
     expected_ops = [
-        Store(
-            ptr=AddPtr(base=out_param, offset=row),
-            value=Sum(value=values),
-            mask=BinOp(op="<", lhs=cols_expr, rhs=Const(value=1)),
-        )
+        row,
+        cols_expr,
+        row_start,
+        offsets,
+        mask,
+        load_ptr,
+        values,
+        total,
+        store_mask,
+        out_ptr,
+        store,
     ]
 
     assert ops == expected_ops
@@ -145,16 +157,16 @@ def test_reduce_sum_kernel_lowering():
     assert SSAPrinter().print_ops(ssa_ops) == dedent(
         """\
         %0 = program_id {axis=0} : i32
-        %1 = mul %0, n_cols : i32
-        %2 = arange {start=0, end=8} : vector<8 x i32>
-        %3 = add %1, %2 : vector<8 x i32>
-        %4 = addptr x, %3 : vector<8 x ptr<f32>>
-        %5 = cmp_lt %2, n_cols : vector<8 x bool>
-        %6 = load %4, %5, 0.0 : vector<8 x f32>
+        %1 = arange {start=0, end=8} : vector<8 x i32>
+        %2 = mul %0, n_cols : i32
+        %3 = add %2, %1 : vector<8 x i32>
+        %4 = cmp_lt %1, n_cols : vector<8 x bool>
+        %5 = addptr x, %3 : vector<8 x ptr<f32>>
+        %6 = load %5, %4, 0.0 : vector<8 x f32>
         %7 = sum %6 : f32
-        %8 = addptr out, %0 : ptr<f32>
-        %9 = cmp_lt %2, 1 : vector<8 x bool>
-        store %8, %7, %9
+        %8 = cmp_lt %1, 1 : vector<8 x bool>
+        %9 = addptr out, %0 : ptr<f32>
+        store %9, %7, %8
         """
     ).rstrip("\n")
 
@@ -165,11 +177,11 @@ def test_reduce_sum_kernel_lowering():
             __shared__ float reduce_smem_7[8];
 
             int v0 = blockIdx.x;
-            int v1 = (v0 * n_cols);
-            int v2 = threadIdx.x;
-            int v3 = (v1 + v2);
-            bool v5 = (v2 < n_cols);
-            float v6 = (v5 ? x[v3] : 0.0f);
+            int v1 = threadIdx.x;
+            int v2 = (v0 * n_cols);
+            int v3 = (v2 + v1);
+            bool v4 = (v1 < n_cols);
+            float v6 = (v4 ? x[v3] : 0.0f);
             reduce_smem_7[threadIdx.x] = v6;
             __syncthreads();
             for (int stride_7 = 4; stride_7 > 0; stride_7 >>= 1) {
@@ -179,8 +191,8 @@ def test_reduce_sum_kernel_lowering():
                 __syncthreads();
             }
             float v7 = reduce_smem_7[0];
-            bool v9 = (v2 < 1);
-            if (v9) {
+            bool v8 = (v1 < 1);
+            if (v8) {
                 out[v0] = v7;
             }
         }

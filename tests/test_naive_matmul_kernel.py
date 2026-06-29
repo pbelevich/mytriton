@@ -119,54 +119,69 @@ def test_naive_matmul_kernel_trace():
     n_cols_param = Param(name="n_cols", ty=i32)
     row = ProgramId(axis=0)
     col_block = ProgramId(axis=1)
+    col_start = BinOp(op="*", lhs=col_block, rhs=Const(value=4))
+    lanes = Arange(start=0, end=4)
     cols_expr = BinOp(
         op="+",
-        lhs=BinOp(op="*", lhs=col_block, rhs=Const(value=4)),
-        rhs=Arange(start=0, end=4),
+        lhs=col_start,
+        rhs=lanes,
     )
     mask = BinOp(op="<", lhs=cols_expr, rhs=n_cols_param)
-    a_row_base = AddPtr(
-        base=a_param,
-        offset=BinOp(op="*", lhs=row, rhs=Const(value=3)),
-    )
+    a_row_start = BinOp(op="*", lhs=row, rhs=Const(value=3))
 
-    def dot_term(k: int) -> BinOp:
-        return BinOp(
-            op="*",
-            lhs=Load(
-                ptr=AddPtr(base=a_row_base, offset=Const(value=k)),
-                mask=None,
-                other=None,
-            ),
-            rhs=Load(
-                ptr=AddPtr(
-                    base=b_param,
-                    offset=BinOp(
-                        op="+",
-                        lhs=BinOp(op="*", lhs=Const(value=k), rhs=n_cols_param),
-                        rhs=cols_expr,
-                    ),
-                ),
-                mask=mask,
-                other=Const(value=0.0),
-            ),
-        )
+    def dot_term(k: int):
+        a_row_base = AddPtr(base=a_param, offset=a_row_start)
+        a_ptr = AddPtr(base=a_row_base, offset=Const(value=k))
+        a_value = Load(ptr=a_ptr, mask=None, other=None)
+        b_row_start = BinOp(op="*", lhs=Const(value=k), rhs=n_cols_param)
+        b_offsets = BinOp(op="+", lhs=b_row_start, rhs=cols_expr)
+        b_ptr = AddPtr(base=b_param, offset=b_offsets)
+        b_values = Load(ptr=b_ptr, mask=mask, other=Const(value=0.0))
+        product = BinOp(op="*", lhs=a_value, rhs=b_values)
+        return [
+            a_row_base,
+            a_ptr,
+            a_value,
+            b_row_start,
+            b_offsets,
+            b_ptr,
+            b_values,
+            product,
+        ]
 
-    accumulator = BinOp(op="+", lhs=Const(value=0.0), rhs=dot_term(0))
-    accumulator = BinOp(op="+", lhs=accumulator, rhs=dot_term(1))
-    accumulator = BinOp(op="+", lhs=accumulator, rhs=dot_term(2))
+    term0 = dot_term(0)
+    accumulator0 = BinOp(op="+", lhs=Const(value=0.0), rhs=term0[-1])
+    term1 = dot_term(1)
+    accumulator1 = BinOp(op="+", lhs=accumulator0, rhs=term1[-1])
+    term2 = dot_term(2)
+    accumulator2 = BinOp(op="+", lhs=accumulator1, rhs=term2[-1])
+    c_row_start = BinOp(op="*", lhs=row, rhs=n_cols_param)
     c_offsets = BinOp(
         op="+",
-        lhs=BinOp(op="*", lhs=row, rhs=n_cols_param),
+        lhs=c_row_start,
         rhs=cols_expr,
     )
+    c_ptr = AddPtr(base=c_param, offset=c_offsets)
+    store = Store(ptr=c_ptr, value=accumulator2, mask=mask)
 
     expected_ops = [
-        Store(
-            ptr=AddPtr(base=c_param, offset=c_offsets),
-            value=accumulator,
-            mask=mask,
-        )
+        row,
+        col_block,
+        col_start,
+        lanes,
+        cols_expr,
+        mask,
+        a_row_start,
+        *term0,
+        accumulator0,
+        *term1,
+        accumulator1,
+        *term2,
+        accumulator2,
+        c_row_start,
+        c_offsets,
+        c_ptr,
+        store,
     ]
 
     assert ops == expected_ops
@@ -203,41 +218,41 @@ def test_naive_matmul_kernel_lowering():
     assert SSAPrinter().print_ops(ssa_ops) == dedent(
         """\
         %0 = program_id {axis=0} : i32
-        %1 = mul %0, 3 : i32
-        %2 = addptr a, %1 : ptr<f32>
-        %3 = addptr %2, 0 : ptr<f32>
-        %4 = load %3, none, none : f32
-        %5 = mul 0, n_cols : i32
-        %6 = program_id {axis=1} : i32
-        %7 = mul %6, 4 : i32
-        %8 = arange {start=0, end=4} : vector<4 x i32>
-        %9 = add %7, %8 : vector<4 x i32>
-        %10 = add %5, %9 : vector<4 x i32>
-        %11 = addptr b, %10 : vector<4 x ptr<f32>>
-        %12 = cmp_lt %9, n_cols : vector<4 x bool>
-        %13 = load %11, %12, 0.0 : vector<4 x f32>
-        %14 = mul %4, %13 : vector<4 x f32>
+        %1 = program_id {axis=1} : i32
+        %2 = mul %1, 4 : i32
+        %3 = arange {start=0, end=4} : vector<4 x i32>
+        %4 = add %2, %3 : vector<4 x i32>
+        %5 = cmp_lt %4, n_cols : vector<4 x bool>
+        %6 = mul %0, 3 : i32
+        %7 = addptr a, %6 : ptr<f32>
+        %8 = addptr %7, 0 : ptr<f32>
+        %9 = load %8, none, none : f32
+        %10 = mul 0, n_cols : i32
+        %11 = add %10, %4 : vector<4 x i32>
+        %12 = addptr b, %11 : vector<4 x ptr<f32>>
+        %13 = load %12, %5, 0.0 : vector<4 x f32>
+        %14 = mul %9, %13 : vector<4 x f32>
         %15 = add 0.0, %14 : vector<4 x f32>
-        %17 = addptr %2, 1 : ptr<f32>
+        %17 = addptr %7, 1 : ptr<f32>
         %18 = load %17, none, none : f32
         %19 = mul 1, n_cols : i32
-        %20 = add %19, %9 : vector<4 x i32>
+        %20 = add %19, %4 : vector<4 x i32>
         %21 = addptr b, %20 : vector<4 x ptr<f32>>
-        %22 = load %21, %12, 0.0 : vector<4 x f32>
+        %22 = load %21, %5, 0.0 : vector<4 x f32>
         %23 = mul %18, %22 : vector<4 x f32>
         %24 = add %15, %23 : vector<4 x f32>
-        %26 = addptr %2, 2 : ptr<f32>
+        %26 = addptr %7, 2 : ptr<f32>
         %27 = load %26, none, none : f32
         %28 = mul 2, n_cols : i32
-        %29 = add %28, %9 : vector<4 x i32>
+        %29 = add %28, %4 : vector<4 x i32>
         %30 = addptr b, %29 : vector<4 x ptr<f32>>
-        %31 = load %30, %12, 0.0 : vector<4 x f32>
+        %31 = load %30, %5, 0.0 : vector<4 x f32>
         %32 = mul %27, %31 : vector<4 x f32>
         %33 = add %24, %32 : vector<4 x f32>
         %34 = mul %0, n_cols : i32
-        %35 = add %34, %9 : vector<4 x i32>
+        %35 = add %34, %4 : vector<4 x i32>
         %36 = addptr c, %35 : vector<4 x ptr<f32>>
-        store %36, %33, %12
+        store %36, %33, %5
         """
     ).rstrip("\n")
 
@@ -246,33 +261,33 @@ def test_naive_matmul_kernel_lowering():
         extern "C" __global__
         void naive_matmul_kernel(float* a, float* b, float* c, int n_cols) {
             int v0 = blockIdx.x;
-            int v1 = (v0 * 3);
-            float v4 = (true ? a[(v1 + 0)] : 0.0f);
-            int v5 = (0 * n_cols);
-            int v6 = blockIdx.y;
-            int v7 = (v6 * 4);
-            int v8 = threadIdx.x;
-            int v9 = (v7 + v8);
-            int v10 = (v5 + v9);
-            bool v12 = (v9 < n_cols);
-            float v13 = (v12 ? b[v10] : 0.0f);
-            float v14 = (v4 * v13);
+            int v1 = blockIdx.y;
+            int v2 = (v1 * 4);
+            int v3 = threadIdx.x;
+            int v4 = (v2 + v3);
+            bool v5 = (v4 < n_cols);
+            int v6 = (v0 * 3);
+            float v9 = (true ? a[(v6 + 0)] : 0.0f);
+            int v10 = (0 * n_cols);
+            int v11 = (v10 + v4);
+            float v13 = (v5 ? b[v11] : 0.0f);
+            float v14 = (v9 * v13);
             float v15 = (0.0f + v14);
-            float v18 = (true ? a[(v1 + 1)] : 0.0f);
+            float v18 = (true ? a[(v6 + 1)] : 0.0f);
             int v19 = (1 * n_cols);
-            int v20 = (v19 + v9);
-            float v22 = (v12 ? b[v20] : 0.0f);
+            int v20 = (v19 + v4);
+            float v22 = (v5 ? b[v20] : 0.0f);
             float v23 = (v18 * v22);
             float v24 = (v15 + v23);
-            float v27 = (true ? a[(v1 + 2)] : 0.0f);
+            float v27 = (true ? a[(v6 + 2)] : 0.0f);
             int v28 = (2 * n_cols);
-            int v29 = (v28 + v9);
-            float v31 = (v12 ? b[v29] : 0.0f);
+            int v29 = (v28 + v4);
+            float v31 = (v5 ? b[v29] : 0.0f);
             float v32 = (v27 * v31);
             float v33 = (v24 + v32);
             int v34 = (v0 * n_cols);
-            int v35 = (v34 + v9);
-            if (v12) {
+            int v35 = (v34 + v4);
+            if (v5) {
                 c[v35] = v33;
             }
         }
