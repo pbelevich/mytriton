@@ -38,6 +38,7 @@ class SSAVerifier:
         "sum": 1,
         "max": 1,
         "min": 1,
+        "dot": 2,
     }
 
     def __init__(self, block_size: int) -> None:
@@ -281,6 +282,38 @@ class SSAVerifier:
 
         self.require_type(index, op, result_ty, value_ty.element)
 
+    def check_dot(self, index: int, op: SSAOp) -> None:
+        lhs_ty = self.require_operand_type(index, op, op.operands[0], "lhs")
+        rhs_ty = self.require_operand_type(index, op, op.operands[1], "rhs")
+        result_ty = self.result_type(index, op)
+
+        if not isinstance(lhs_ty, VectorType):
+            self.fail(index, op, f"lhs must be vector, got {lhs_ty}")
+
+        if not isinstance(rhs_ty, VectorType):
+            self.fail(index, op, f"rhs must be vector, got {rhs_ty}")
+
+        if lhs_ty.size != rhs_ty.size:
+            self.fail(index, op, f"size mismatch: {lhs_ty} and {rhs_ty}")
+
+        if lhs_ty.size != self.block_size:
+            self.fail(
+                index,
+                op,
+                f"dot width {lhs_ty.size} does not match "
+                f"CUDA block size {self.block_size}",
+            )
+
+        if lhs_ty.size & (lhs_ty.size - 1):
+            self.fail(
+                index,
+                op,
+                f"dot width must be a power of two, got {lhs_ty.size}",
+            )
+
+        element = self.promote_numeric(index, op, lhs_ty, rhs_ty)
+        self.require_type(index, op, result_ty, element)
+
     def verify(self, ops: list[SSAOp]) -> list[SSAOp]:
         defined: set[int] = set()
 
@@ -362,6 +395,9 @@ class SSAVerifier:
 
             elif op.opcode in ("sum", "max", "min"):
                 self.check_reduction(index, op)
+
+            elif op.opcode == "dot":
+                self.check_dot(index, op)
 
             if op.result is not None:
                 if op.result.id in defined:

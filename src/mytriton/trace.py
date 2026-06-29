@@ -117,6 +117,10 @@ def static_range(start: int, stop: int | None = None, step: int = 1) -> range:
     return range(start, stop, step)
 
 
+def dot(lhs: Value, rhs: Value) -> Value:
+    return Value(Builder.record(Dot(unwrap(lhs), unwrap(rhs))))
+
+
 # ----------------------------
 # Types
 # ----------------------------
@@ -247,6 +251,12 @@ class Max:
 @dataclass
 class Min:
     value: Any
+
+
+@dataclass
+class Dot:
+    lhs: Any
+    rhs: Any
 
 
 # ----------------------------

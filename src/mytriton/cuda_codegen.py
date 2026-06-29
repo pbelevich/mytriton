@@ -185,6 +185,66 @@ class SSACUDACodegen:
         )
         self.assign(result, f"{shared}[0]")
 
+    def emit_dot(self, op: SSAOp) -> None:
+        lhs_operand = op.operands[0]
+        rhs_operand = op.operands[1]
+
+        if not isinstance(lhs_operand, SSAValue):
+            raise TypeError(f"dot lhs expects SSA value, got {lhs_operand}")
+
+        if not isinstance(rhs_operand, SSAValue):
+            raise TypeError(f"dot rhs expects SSA value, got {rhs_operand}")
+
+        result = op.result
+        if result is None:
+            raise TypeError("dot requires a result")
+
+        lhs_ty = lhs_operand.ty
+        rhs_ty = rhs_operand.ty
+
+        if not isinstance(lhs_ty, VectorType):
+            raise TypeError(f"dot lhs expects vector, got {lhs_ty}")
+
+        if not isinstance(rhs_ty, VectorType):
+            raise TypeError(f"dot rhs expects vector, got {rhs_ty}")
+
+        if lhs_ty.size != rhs_ty.size:
+            raise TypeError(f"dot size mismatch: {lhs_ty} and {rhs_ty}")
+
+        element_ty = result.ty
+        cuda_ty = self.cuda_type(element_ty)
+        width = lhs_ty.size
+
+        if width & (width - 1):
+            raise TypeError(f"dot width must be a power of two, got {width}")
+
+        lhs = self.expression_operand(lhs_operand)
+        rhs = self.expression_operand(rhs_operand)
+
+        product = f"dot_product_{result.id}"
+        shared = f"dot_smem_{result.id}"
+        stride = f"stride_{result.id}"
+
+        self.shared_lines.append(f"    __shared__ {cuda_ty} {shared}[{width}];")
+
+        self.lines.extend(
+            [
+                f"    {cuda_ty} {product} = ({lhs} * {rhs});",
+                f"    {shared}[threadIdx.x] = {product};",
+                "    __syncthreads();",
+                f"    for (int {stride} = {width // 2}; "
+                f"{stride} > 0; {stride} >>= 1) {{",
+                f"        if (threadIdx.x < {stride}) {{",
+                f"            {shared}[threadIdx.x] += "
+                f"{shared}[threadIdx.x + {stride}];",
+                "        }",
+                "        __syncthreads();",
+                "    }",
+            ]
+        )
+
+        self.assign(result, f"{shared}[0]")
+
     def emit(self, op: SSAOp) -> None:
         if op.opcode == "store":
             ptr = self.pointer_operand(op.operands[0])
@@ -283,6 +343,8 @@ class SSACUDACodegen:
             )
         elif op.opcode in ("sum", "max", "min"):
             self.emit_reduction(op)
+        elif op.opcode == "dot":
+            self.emit_dot(op)
         else:
             raise TypeError(f"Unsupported SSA opcode: {op.opcode}")
 

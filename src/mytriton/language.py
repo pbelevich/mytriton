@@ -1,6 +1,7 @@
 from .trace import (
     arange,
     constexpr,
+    dot,
     exp,
     load,
     max,
@@ -17,6 +18,7 @@ from .trace import (
 __all__ = [
     "arange",
     "constexpr",
+    "dot",
     "exp",
     "load",
     "max",

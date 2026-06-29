@@ -8,6 +8,7 @@ from .trace import (
     Arange,
     BinOp,
     Const,
+    Dot,
     Load,
     Max,
     Maximum,
@@ -202,6 +203,21 @@ class TypeInference:
             if value_ty.element not in (I32, F32):
                 raise TypeError(f"cannot reduce elements of type {value_ty.element}")
             ty = value_ty.element
+        elif isinstance(expr, Dot):
+            lhs_ty = self.infer(expr.lhs)
+            rhs_ty = self.infer(expr.rhs)
+
+            if not isinstance(lhs_ty, VectorType):
+                raise TypeError(f"dot lhs must be vector, got {lhs_ty}")
+
+            if not isinstance(rhs_ty, VectorType):
+                raise TypeError(f"dot rhs must be vector, got {rhs_ty}")
+
+            if lhs_ty.size != rhs_ty.size:
+                raise TypeError(f"dot size mismatch: {lhs_ty} and {rhs_ty}")
+
+            element = self.promote(lhs_ty, rhs_ty)
+            ty = element
         else:
             raise TypeError(f"Cannot infer type of {expr}")
 

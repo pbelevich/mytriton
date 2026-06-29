@@ -6,6 +6,7 @@ from .trace import (
     Arange,
     BinOp,
     Const,
+    Dot,
     Load,
     Max,
     Maximum,
@@ -57,6 +58,7 @@ EXPR_NODES = (
     Sum,
     Max,
     Min,
+    Dot,
 )
 
 
@@ -210,6 +212,16 @@ class SSALowering:
                 "min",
                 expr,
                 operands=(value,),
+            )
+
+        if isinstance(expr, Dot):
+            lhs = self.lower_expr(expr.lhs)
+            rhs = self.lower_expr(expr.rhs)
+
+            return self.emit(
+                "dot",
+                expr,
+                operands=(lhs, rhs),
             )
 
         raise TypeError(f"Cannot lower expression: {expr}")
