@@ -18,7 +18,7 @@ def mlir_available() -> bool:
 def require_mlir():
     try:
         # Importing these modules registers the dialects in typical MLIR builds.
-        from mlir.dialects import arith, func, memref, scf  # noqa: F401
+        from mlir.dialects import arith, func, gpu, memref, scf  # noqa: F401
         from mlir.ir import Context, Location, Module
         from mlir.passmanager import PassManager
     except ImportError as error:

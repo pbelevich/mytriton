@@ -5,7 +5,7 @@ import pytest
 
 import mytriton as triton
 import mytriton.language as tl
-from mytriton.mlir_codegen import SSAMLIRCodegen
+from mytriton.mlir_codegen import SSAGPUMLIRCodegen, SSAMLIRCodegen
 from mytriton.ssa import SSALowering
 from mytriton.trace import make_runtime_params, trace
 
@@ -22,7 +22,7 @@ def add_kernel(x, y, out, n, BLOCK: tl.constexpr):
     tl.store(out + offs, a + b, mask=mask)
 
 
-def build_add_kernel_mlir():
+def build_add_kernel_ssa():
     n = 1000
     block = 256
 
@@ -41,12 +41,12 @@ def build_add_kernel_mlir():
     )
 
     ssa_ops = SSALowering().lower(ops)
+    return ssa_ops, params
 
-    return SSAMLIRCodegen().generate(
-        "add_kernel",
-        ssa_ops,
-        params,
-    )
+
+def build_add_kernel_mlir():
+    ssa_ops, params = build_add_kernel_ssa()
+    return SSAMLIRCodegen().generate("add_kernel", ssa_ops, params)
 
 
 def test_add_kernel_mlir_codegen_snapshot():
@@ -97,3 +97,34 @@ def test_add_kernel_mlir_parses_with_bindings():
     assert "func.func @add_kernel" in rendered
     assert "scf.if" in rendered
     assert "memref.load" in rendered
+
+
+def build_add_kernel_gpu_mlir():
+    ssa_ops, params = build_add_kernel_ssa()
+    return SSAGPUMLIRCodegen().generate("add_kernel", ssa_ops, params)
+
+
+def test_add_kernel_gpu_mlir_codegen_snapshot():
+    mlir_text = build_add_kernel_gpu_mlir()
+
+    assert "module attributes {gpu.container_module}" in mlir_text
+    assert "gpu.module @kernels" in mlir_text
+    assert "gpu.func @add_kernel" in mlir_text
+    assert "gpu.block_id x" in mlir_text
+    assert "gpu.thread_id x" in mlir_text
+    assert "arith.index_cast %bid_x : index to i32" in mlir_text
+    assert "arith.index_cast %tid_x : index to i32" in mlir_text
+    assert "memref.load" in mlir_text
+    assert "memref.store" in mlir_text
+    assert "gpu.return" in mlir_text
+
+
+def test_add_kernel_gpu_mlir_parses_with_bindings():
+    pytest.importorskip("mlir")
+
+    from mytriton.mlir_backend import parse_mlir_module
+
+    rendered = parse_mlir_module(build_add_kernel_gpu_mlir())
+
+    assert "gpu.module @kernels" in rendered
+    assert "gpu.func @add_kernel" in rendered

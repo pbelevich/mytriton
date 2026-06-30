@@ -14,7 +14,8 @@ class MLIRPtrRef:
 
 
 class SSAMLIRCodegen:
-    def __init__(self) -> None:
+    def __init__(self, indent: str = "    ") -> None:
+        self.indent = indent
         self.lines: list[str] = []
         self.values: dict[int, str | MLIRPtrRef] = {}
         self.constants: dict[tuple[object, str], str] = {}
@@ -63,7 +64,7 @@ class SSAMLIRCodegen:
         name = f"%c_{mlir_ty}_{safe_value}"
         literal = self.const_literal(value, mlir_ty)
 
-        self.lines.append(f"    {name} = arith.constant {literal} : {mlir_ty}")
+        self.lines.append(f"{self.indent}{name} = arith.constant {literal} : {mlir_ty}")
         self.constants[key] = name
         return name
 
@@ -113,7 +114,9 @@ class SSAMLIRCodegen:
 
         if op.opcode == "cmp_lt":
             opcode = "arith.cmpi slt" if lhs_ty == "i32" else "arith.cmpf olt"
-            self.lines.append(f"    %v{result.id} = {opcode}, {lhs}, {rhs} : {lhs_ty}")
+            self.lines.append(
+                f"{self.indent}%v{result.id} = {opcode}, {lhs}, {rhs} : {lhs_ty}"
+            )
         else:
             opcode = {
                 ("add", "i32"): "arith.addi",
@@ -126,7 +129,7 @@ class SSAMLIRCodegen:
                 ("div", "f32"): "arith.divf",
             }[(op.opcode, result_ty)]
             self.lines.append(
-                f"    %v{result.id} = {opcode} {lhs}, {rhs} : {result_ty}"
+                f"{self.indent}%v{result.id} = {opcode} {lhs}, {rhs} : {result_ty}"
             )
 
         self.values[result.id] = f"%v{result.id}"
@@ -142,7 +145,9 @@ class SSAMLIRCodegen:
             raise TypeError(f"addptr expected pointer base, got {base}")
 
         index = f"%idx{result.id}"
-        self.lines.append(f"    {index} = arith.index_cast {offset} : i32 to index")
+        self.lines.append(
+            f"{self.indent}{index} = arith.index_cast {offset} : i32 to index"
+        )
         self.values[result.id] = MLIRPtrRef(
             base=base.base, index=index, memref_ty=base.memref_ty
         )
@@ -165,17 +170,17 @@ class SSAMLIRCodegen:
 
         if mask is None:
             self.lines.append(
-                f"    %v{result.id} = memref.load {ptr.base}[{ptr.index}] : {ptr.memref_ty}"
+                f"{self.indent}%v{result.id} = memref.load {ptr.base}[{ptr.index}] : {ptr.memref_ty}"
             )
         else:
             self.lines.extend(
                 [
-                    f"    %v{result.id} = scf.if {mask} -> ({result_ty}) {{",
-                    f"      %loaded{result.id} = memref.load {ptr.base}[{ptr.index}] : {ptr.memref_ty}",
-                    f"      scf.yield %loaded{result.id} : {result_ty}",
-                    "    } else {",
-                    f"      scf.yield {other} : {result_ty}",
-                    "    }",
+                    f"{self.indent}%v{result.id} = scf.if {mask} -> ({result_ty}) {{",
+                    f"{self.indent}  %loaded{result.id} = memref.load {ptr.base}[{ptr.index}] : {ptr.memref_ty}",
+                    f"{self.indent}  scf.yield %loaded{result.id} : {result_ty}",
+                    f"{self.indent}}} else {{",
+                    f"{self.indent}  scf.yield {other} : {result_ty}",
+                    f"{self.indent}}}",
                 ]
             )
 
@@ -191,14 +196,14 @@ class SSAMLIRCodegen:
 
         if mask is None:
             self.lines.append(
-                f"    memref.store {value}, {ptr.base}[{ptr.index}] : {ptr.memref_ty}"
+                f"{self.indent}memref.store {value}, {ptr.base}[{ptr.index}] : {ptr.memref_ty}"
             )
         else:
             self.lines.extend(
                 [
-                    f"    scf.if {mask} {{",
-                    f"      memref.store {value}, {ptr.base}[{ptr.index}] : {ptr.memref_ty}",
-                    "    }",
+                    f"{self.indent}scf.if {mask} {{",
+                    f"{self.indent}  memref.store {value}, {ptr.base}[{ptr.index}] : {ptr.memref_ty}",
+                    f"{self.indent}}}",
                 ]
             )
 
@@ -237,7 +242,46 @@ class SSAMLIRCodegen:
 
         body = ["module {", f"  func.func @{kernel_name}({', '.join(args)}) {{"]
         body.extend(self.lines)
-        body.append("    return")
+        body.append(f"{self.indent}return")
         body.append("  }")
         body.append("}")
+        return "\n".join(body)
+
+
+class SSAGPUMLIRCodegen(SSAMLIRCodegen):
+    def __init__(self) -> None:
+        super().__init__(indent="      ")
+
+    def generate(
+        self, kernel_name: str, ssa_ops: list[SSAOp], params: list[Param]
+    ) -> str:
+        self.lines = []
+        self.values = {}
+        self.constants = {}
+
+        args = [f"%{param.name}: {self.mlir_param_type(param.ty)}" for param in params]
+
+        self.lines.extend(
+            [
+                f"{self.indent}%bid_x = gpu.block_id x",
+                f"{self.indent}%tid_x = gpu.thread_id x",
+                f"{self.indent}%block_id_x = arith.index_cast %bid_x : index to i32",
+                f"{self.indent}%thread_id_x = arith.index_cast %tid_x : index to i32",
+            ]
+        )
+
+        for op in ssa_ops:
+            self.emit(op)
+
+        body = [
+            "module attributes {gpu.container_module} {",
+            "  gpu.module @kernels {",
+            f"    gpu.func @{kernel_name}({', '.join(args)}) kernel {{",
+        ]
+        body.extend(self.lines)
+        body.append("      gpu.return")
+        body.append("    }")
+        body.append("  }")
+        body.append("}")
+
         return "\n".join(body)
