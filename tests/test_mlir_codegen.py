@@ -20,7 +20,11 @@ from mytriton.mlir_backend import (
     try_run_mlir_pass_pipeline,
     try_run_mlir_pass_pipelines,
 )
-from mytriton.mlir_codegen import SSAGPUMLIRCodegen, SSAMLIRCodegen
+from mytriton.mlir_codegen import (
+    SSAGPUExecutableMLIRCodegen,
+    SSAGPUMLIRCodegen,
+    SSAMLIRCodegen,
+)
 from mytriton.ssa import SSALowering
 from mytriton.trace import make_runtime_params, trace
 
@@ -276,3 +280,65 @@ def test_attach_nvvm_target_stage_with_bindings():
 
     assert "gpu.module @kernels" in result.final_output
     assert "nvvm.target" in result.final_output
+
+
+def build_add_kernel_executable_gpu_mlir():
+    n = 1000
+    block = 256
+    grid = triton.cdiv(n, block)
+
+    ssa_ops, params = build_add_kernel_ssa()
+
+    return SSAGPUExecutableMLIRCodegen().generate(
+        "add_kernel",
+        ssa_ops,
+        params,
+        grid_x=grid,
+        block_x=block,
+    )
+
+
+def test_add_kernel_executable_gpu_mlir_codegen_snapshot():
+    mlir_text = build_add_kernel_executable_gpu_mlir()
+
+    assert "module attributes {gpu.container_module}" in mlir_text
+    assert "func.func @launch_add_kernel" in mlir_text
+    assert "gpu.launch_func @kernels::@add_kernel" in mlir_text
+    assert "blocks in (%grid_x, %c1, %c1)" in mlir_text
+    assert "threads in (%block_x, %c1, %c1)" in mlir_text
+    assert "dynamic_shared_memory_size %dynamic_smem" in mlir_text
+    assert "gpu.module @kernels" in mlir_text
+    assert "gpu.func @add_kernel" in mlir_text
+
+
+def test_add_kernel_executable_gpu_mlir_parses_with_bindings():
+    pytest.importorskip("mlir")
+
+    from mytriton.mlir_backend import parse_mlir_module
+
+    rendered = parse_mlir_module(build_add_kernel_executable_gpu_mlir())
+
+    assert "func.func @launch_add_kernel" in rendered
+    assert "gpu.launch_func" in rendered
+    assert "gpu.module @kernels" in rendered
+
+
+def test_executable_gpu_mlir_try_produce_gpu_binary_with_bindings():
+    pytest.importorskip("mlir")
+
+    from mytriton.mlir_backend import (
+        executable_gpu_to_binary_stages,
+        run_mlir_pipeline_stages,
+    )
+
+    mlir_text = build_add_kernel_executable_gpu_mlir()
+
+    result = run_mlir_pipeline_stages(
+        mlir_text,
+        executable_gpu_to_binary_stages(),
+    )
+
+    if result.ok:
+        assert "gpu.binary @kernels" in result.final_output
+    else:
+        assert result.first_error is not None

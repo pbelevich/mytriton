@@ -320,3 +320,35 @@ def format_mlir_lowering_report(result: MLIRLoweringResult) -> str:
             lines.append(result.first_error)
 
     return "\n".join(lines)
+
+
+def executable_gpu_to_binary_stages(
+    *,
+    chip: str = "sm_80",
+    opt_level: int = 3,
+) -> list[MLIRPipelineStage]:
+    return [
+        MLIRPipelineStage(
+            name="generic-cleanup",
+            pipeline=GENERIC_CLEANUP_PIPELINE,
+        ),
+        MLIRPipelineStage(
+            name="attach-nvvm-target",
+            pipeline=nvvm_attach_target_pipeline(
+                chip=chip,
+                opt_level=opt_level,
+            ),
+        ),
+        MLIRPipelineStage(
+            name="convert-gpu-to-nvvm",
+            pipeline="builtin.module(gpu.module(convert-gpu-to-nvvm))",
+        ),
+        MLIRPipelineStage(
+            name="gpu-to-llvm",
+            pipeline="builtin.module(gpu-to-llvm)",
+        ),
+        MLIRPipelineStage(
+            name="gpu-module-to-binary",
+            pipeline="builtin.module(gpu-module-to-binary)",
+        ),
+    ]

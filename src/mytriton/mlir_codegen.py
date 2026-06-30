@@ -228,8 +228,16 @@ class SSAMLIRCodegen:
             raise TypeError(f"MLIR lowering does not support {op.opcode!r} yet")
 
     def generate(
-        self, kernel_name: str, ssa_ops: list[SSAOp], params: list[Param]
+        self,
+        kernel_name: str,
+        ssa_ops: list[SSAOp],
+        params: list[Param],
+        *,
+        host_name: str | None = None,
+        grid_x: int | None = None,
+        block_x: int | None = None,
     ) -> str:
+        del host_name, grid_x, block_x
         self.lines = []
         self.values = {}
         self.constants = {}
@@ -253,8 +261,16 @@ class SSAGPUMLIRCodegen(SSAMLIRCodegen):
         super().__init__(indent="      ")
 
     def generate(
-        self, kernel_name: str, ssa_ops: list[SSAOp], params: list[Param]
+        self,
+        kernel_name: str,
+        ssa_ops: list[SSAOp],
+        params: list[Param],
+        *,
+        host_name: str | None = None,
+        grid_x: int | None = None,
+        block_x: int | None = None,
     ) -> str:
+        del host_name, grid_x, block_x
         self.lines = []
         self.values = {}
         self.constants = {}
@@ -285,3 +301,94 @@ class SSAGPUMLIRCodegen(SSAMLIRCodegen):
         body.append("}")
 
         return "\n".join(body)
+
+
+class SSAGPUExecutableMLIRCodegen(SSAGPUMLIRCodegen):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def index_const(self, name: str, value: int, indent: str) -> str:
+        return f"{indent}%{name} = arith.constant {value} : index"
+
+    def i32_const(self, name: str, value: int, indent: str) -> str:
+        return f"{indent}%{name} = arith.constant {value} : i32"
+
+    def generate(
+        self,
+        kernel_name: str,
+        ssa_ops: list[SSAOp],
+        params: list[Param],
+        *,
+        host_name: str | None = None,
+        grid_x: int | None = None,
+        block_x: int | None = None,
+    ) -> str:
+        if grid_x is None or block_x is None:
+            raise ValueError(
+                "executable GPU MLIR generation requires grid_x and block_x"
+            )
+
+        host_name = host_name or f"launch_{kernel_name}"
+
+        self.lines = []
+        self.values = {}
+        self.constants = {}
+
+        device_args = [
+            f"%{param.name}: {self.mlir_param_type(param.ty)}" for param in params
+        ]
+
+        host_args = [
+            f"%{param.name}: {self.mlir_param_type(param.ty)}" for param in params
+        ]
+
+        # Device prelude.
+        self.lines.extend(
+            [
+                f"{self.indent}%bid_x = gpu.block_id x",
+                f"{self.indent}%tid_x = gpu.thread_id x",
+                f"{self.indent}%block_id_x = arith.index_cast %bid_x : index to i32",
+                f"{self.indent}%thread_id_x = arith.index_cast %tid_x : index to i32",
+            ]
+        )
+
+        for op in ssa_ops:
+            self.emit(op)
+
+        body: list[str] = [
+            "module attributes {gpu.container_module} {",
+            f"  func.func @{host_name}({', '.join(host_args)}) {{",
+            "    %c1 = arith.constant 1 : index",
+            f"    %grid_x = arith.constant {grid_x} : index",
+            f"    %block_x = arith.constant {block_x} : index",
+            "    %dynamic_smem = arith.constant 0 : i32",
+            f"    gpu.launch_func @kernels::@{kernel_name}",
+            "        blocks in (%grid_x, %c1, %c1)",
+            "        threads in (%block_x, %c1, %c1)",
+            "        dynamic_shared_memory_size %dynamic_smem",
+            f"        args({self.host_launch_args(params)})",
+            "    return",
+            "  }",
+            "",
+            "  gpu.module @kernels {",
+            f"    gpu.func @{kernel_name}({', '.join(device_args)}) kernel {{",
+        ]
+
+        body.extend(self.lines)
+
+        body.extend(
+            [
+                "      gpu.return",
+                "    }",
+                "  }",
+                "}",
+            ]
+        )
+
+        return "\n".join(body)
+
+    def host_launch_args(self, params: list[Param]) -> str:
+        parts = []
+        for param in params:
+            parts.append(f"%{param.name} : {self.mlir_param_type(param.ty)}")
+        return ", ".join(parts)
