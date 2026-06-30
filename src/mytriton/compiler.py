@@ -9,7 +9,7 @@ from .cuda_utils import CudaKernelCache, execute_cuda_if_needed
 from .optim import ConstantFoldPass, CSEPass, DCEPass, PassManager
 from .ssa import SSALowering, SSAOp
 from .ssa_verification import SSAVerifier
-from .trace import VectorType, is_constexpr_annotation, make_runtime_params, trace
+from .trace import block_numel, is_constexpr_annotation, make_runtime_params, trace
 
 P = ParamSpec("P")
 Meta: TypeAlias = dict[str, Any]
@@ -19,20 +19,23 @@ CompilationResult: TypeAlias = tuple[list[Any], list[SSAOp], str]
 
 
 def _cuda_threads_per_block(ssa_ops: list[SSAOp]) -> int:
-    vector_widths = {
-        op.result.ty.size
+    block_sizes = {
+        numel
         for op in ssa_ops
-        if op.result is not None and isinstance(op.result.ty, VectorType)
+        if op.result is not None
+        for numel in [block_numel(op.result.ty)]
+        if numel is not None
     }
 
-    if not vector_widths:
+    if not block_sizes:
         return 1
 
-    if len(vector_widths) != 1:
-        rendered = ", ".join(str(width) for width in sorted(vector_widths))
-        raise ValueError(f"CUDA lowering requires one vector width, got: {rendered}")
+    if len(block_sizes) != 1:
+        rendered = ", ".join(str(width) for width in sorted(block_sizes))
+        raise ValueError(f"CUDA lowering requires one block size, got: {rendered}")
 
-    threads_per_block = next(iter(vector_widths))
+    threads_per_block = next(iter(block_sizes))
+
     if not 1 <= threads_per_block <= 1024:
         raise ValueError(
             "CUDA threads per block must be between 1 and 1024, "

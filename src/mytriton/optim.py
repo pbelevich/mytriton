@@ -3,7 +3,7 @@ from collections.abc import Mapping
 from typing import ClassVar
 
 from .ssa import SSAOp, SSAOperand, SSAValue
-from .trace import BOOL, F32, I32, Const, Param, VectorType
+from .trace import BOOL, F32, I32, Const, Param, type_element
 
 # Optimization passes assume their input SSA has already passed SSAVerifier.
 # PassManager verifies after every pass so broken rewrites fail before codegen.
@@ -49,7 +49,7 @@ def resolve_operand(
 
 class ConstantFoldPass:
     def scalar_type(self, ty):
-        return ty.element if isinstance(ty, VectorType) else ty
+        return type_element(ty)
 
     def is_integer_result(self, op):
         return self.scalar_type(op.result.ty) == I32

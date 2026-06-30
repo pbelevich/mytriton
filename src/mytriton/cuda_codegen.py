@@ -13,6 +13,8 @@ from .trace import (
     ScalarType,
     Type,
     VectorType,
+    block_shape,
+    type_element,
 )
 
 
@@ -37,8 +39,7 @@ class SSACUDACodegen:
         self.shared_lines: list[str] = []
 
     def cuda_type(self, ty: Type) -> str:
-        if isinstance(ty, VectorType):
-            ty = ty.element
+        ty = type_element(ty)
 
         if ty == I32:
             return "int"
@@ -104,7 +105,7 @@ class SSACUDACodegen:
         self.values[result.id] = name
 
     def scalar_type(self, ty: Type) -> ScalarType | PointerType:
-        return ty.element if isinstance(ty, VectorType) else ty
+        return type_element(ty)
 
     def reduction_update(
         self,
@@ -144,14 +145,20 @@ class SSACUDACodegen:
             raise TypeError(f"{op.opcode} requires a result")
 
         input_ty = operand.ty
-        if not isinstance(input_ty, VectorType):
-            raise TypeError(f"{op.opcode} expects a vector input, got {input_ty}")
+        shape = block_shape(input_ty)
 
+        if shape is None:
+            raise TypeError(f"{op.opcode} expects a block input, got {input_ty}")
+
+        if len(shape) != 1:
+            raise TypeError(
+                f"{op.opcode} currently supports only 1D blocks, got {input_ty}"
+            )
+
+        width = shape[0]
         value = self.expression_operand(operand)
-
-        element_ty = input_ty.element
+        element_ty = type_element(input_ty)
         cuda_ty = self.cuda_type(element_ty)
-        width = input_ty.size
         if width & (width - 1):
             raise TypeError(f"reduction width must be a power of two, got {width}")
 

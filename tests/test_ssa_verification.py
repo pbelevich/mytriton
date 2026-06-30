@@ -119,7 +119,7 @@ def test_verifier_accepts_valid_reduction(opcode):
 def test_verifier_rejects_scalar_reduction_input():
     op = SSAOp("sum", (Const(1.0),), SSAValue(0, F32))
 
-    with pytest.raises(CompileError, match="reduction expects vector"):
+    with pytest.raises(CompileError, match="reduction expects block"):
         verify([op])
 
 

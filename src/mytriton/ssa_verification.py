@@ -11,6 +11,10 @@ from .trace import (
     ScalarType,
     Type,
     VectorType,
+    block_numel,
+    block_shape,
+    make_block_type,
+    type_element,
 )
 
 
@@ -48,10 +52,13 @@ class SSAVerifier:
         raise CompileError(f"ssa-verifier: op #{index} '{op.opcode}': {message}")
 
     def element_type(self, ty: Type) -> ScalarType | PointerType:
-        return ty.element if isinstance(ty, VectorType) else ty
+        return type_element(ty)
 
-    def width(self, ty: Type) -> int | None:
-        return ty.size if isinstance(ty, VectorType) else None
+    def shape(self, ty: Type) -> tuple[int, ...] | None:
+        return block_shape(ty)
+
+    def numel(self, ty: Type) -> int | None:
+        return block_numel(ty)
 
     def operand_type(self, operand: SSAOperand) -> Type | None:
         if operand is None:
@@ -89,14 +96,16 @@ class SSAVerifier:
 
         return op.result.ty
 
-    def vector_size(self, index: int, op: SSAOp, *types: Type) -> int | None:
-        sizes = {ty.size for ty in types if isinstance(ty, VectorType)}
+    def common_block_shape(
+        self, index: int, op: SSAOp, *types: Type
+    ) -> tuple[int, ...] | None:
+        shapes = {block_shape(ty) for ty in types if block_shape(ty) is not None}
 
-        if len(sizes) > 1:
+        if len(shapes) > 1:
             rendered = ", ".join(str(ty) for ty in types)
             self.fail(index, op, f"incompatible shapes: {rendered}")
 
-        return next(iter(sizes), None)
+        return next(iter(shapes), None)
 
     def with_shape(
         self,
@@ -105,8 +114,8 @@ class SSAVerifier:
         element: ScalarType | PointerType,
         *types: Type,
     ) -> Type:
-        size = self.vector_size(index, op, *types)
-        return VectorType(size, element) if size is not None else element
+        shape = self.common_block_shape(index, op, *types)
+        return make_block_type(shape, element) if shape is not None else element
 
     def require_type(self, index: int, op: SSAOp, actual: Type, expected: Type) -> None:
         if actual != expected:
@@ -232,7 +241,7 @@ class SSAVerifier:
 
             shape_operands.append(mask_ty)
 
-        self.vector_size(index, op, *shape_operands)
+        self.common_block_shape(index, op, *shape_operands)
 
     def check_select(self, index: int, op: SSAOp) -> None:
         condition, true_value, false_value = op.operands
@@ -259,28 +268,36 @@ class SSAVerifier:
         value_ty = self.require_operand_type(index, op, op.operands[0], "value")
         result_ty = self.result_type(index, op)
 
-        if not isinstance(value_ty, VectorType):
-            self.fail(index, op, f"reduction expects vector, got {value_ty}")
+        shape = block_shape(value_ty)
+        if shape is None:
+            self.fail(index, op, f"reduction expects block, got {value_ty}")
 
-        if value_ty.size != self.block_size:
+        if len(shape) != 1:
             self.fail(
                 index,
                 op,
-                f"reduction width {value_ty.size} does not match "
+                f"reduction currently supports only 1D blocks, got {value_ty}",
+            )
+
+        width = shape[0]
+
+        if width != self.block_size:
+            self.fail(
+                index,
+                op,
+                f"reduction width {width} does not match "
                 f"CUDA block size {self.block_size}",
             )
 
-        if value_ty.size & (value_ty.size - 1):
-            self.fail(
-                index,
-                op,
-                f"reduction width must be a power of two, got {value_ty.size}",
-            )
+        if width & (width - 1):
+            self.fail(index, op, f"reduction width must be a power of two, got {width}")
 
-        if value_ty.element not in (I32, F32):
-            self.fail(index, op, f"cannot reduce elements of type {value_ty.element}")
+        value_element = self.element_type(value_ty)
 
-        self.require_type(index, op, result_ty, value_ty.element)
+        if value_element not in (I32, F32):
+            self.fail(index, op, f"cannot reduce elements of type {value_element}")
+
+        self.require_type(index, op, result_ty, value_element)
 
     def check_dot(self, index: int, op: SSAOp) -> None:
         lhs_ty = self.require_operand_type(index, op, op.operands[0], "lhs")

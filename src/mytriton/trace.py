@@ -155,7 +155,75 @@ class VectorType:
         return f"vector<{self.size} x {self.element}>"
 
 
-Type = ScalarType | PointerType | VectorType
+def _prod(values: tuple[int, ...]) -> int:
+    result = 1
+    for value in values:
+        result *= value
+    return result
+
+
+@dataclass(frozen=True)
+class BlockType:
+    shape: tuple[int, ...]
+    element: ScalarType | PointerType
+
+    def __post_init__(self):
+        if not self.shape:
+            raise TypeError("0D BlockType is forbidden")
+
+        for dim in self.shape:
+            if type(dim) is not int or dim <= 0:
+                raise TypeError(f"invalid block dimension: {dim!r}")
+
+    @property
+    def numel(self) -> int:
+        return _prod(self.shape)
+
+    def __str__(self):
+        dims = " x ".join(str(dim) for dim in self.shape)
+        return f"block<{dims} x {self.element}>"
+
+
+def is_block_type(ty: Type) -> bool:
+    return isinstance(ty, (VectorType, BlockType))
+
+
+def block_shape(ty: Type) -> tuple[int, ...] | None:
+    if isinstance(ty, VectorType):
+        return (ty.size,)
+
+    if isinstance(ty, BlockType):
+        return ty.shape
+
+    return None
+
+
+def block_numel(ty: Type) -> int | None:
+    shape = block_shape(ty)
+    return None if shape is None else _prod(shape)
+
+
+def type_element(ty: Type) -> ScalarType | PointerType:
+    if isinstance(ty, VectorType):
+        return ty.element
+
+    if isinstance(ty, BlockType):
+        return ty.element
+
+    return ty
+
+
+def make_block_type(
+    shape: tuple[int, ...],
+    element: ScalarType | PointerType,
+) -> Type:
+    if len(shape) == 1:
+        return VectorType(shape[0], element)
+
+    return BlockType(shape, element)
+
+
+Type = ScalarType | PointerType | VectorType | BlockType
 
 
 I32 = ScalarType("i32")

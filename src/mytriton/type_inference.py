@@ -24,6 +24,9 @@ from .trace import (
     UnaryOp,
     VectorType,
     Where,
+    block_shape,
+    make_block_type,
+    type_element,
 )
 
 
@@ -34,24 +37,24 @@ class TypeInference:
         self.types: dict[int, Type] = {}
 
     def element_type(self, ty: Type) -> ScalarType | PointerType:
-        return ty.element if isinstance(ty, VectorType) else ty
+        return type_element(ty)
 
-    def common_vector_size(self, *types: Type) -> int | None:
-        sizes = {ty.size for ty in types if isinstance(ty, VectorType)}
+    def common_block_shape(self, *types: Type) -> tuple[int, ...] | None:
+        shapes = {block_shape(ty) for ty in types if block_shape(ty) is not None}
 
-        if len(sizes) > 1:
+        if len(shapes) > 1:
             rendered = ", ".join(str(ty) for ty in types)
             raise TypeError(f"Cannot broadcast: {rendered}")
 
-        return next(iter(sizes), None)
+        return next(iter(shapes), None)
 
     def with_shape(
         self,
         element: ScalarType | PointerType,
         *types: Type,
     ) -> Type:
-        size = self.common_vector_size(*types)
-        return VectorType(size, element) if size is not None else element
+        shape = self.common_block_shape(*types)
+        return make_block_type(shape, element) if shape is not None else element
 
     def promote(self, lhs: Type, rhs: Type) -> ScalarType:
         lhs_element = self.element_type(lhs)
@@ -198,11 +201,18 @@ class TypeInference:
             ty = self.with_shape(element, condition, true_ty, false_ty)
         elif isinstance(expr, (Sum, Max, Min)):
             value_ty = self.infer(expr.value)
-            if not isinstance(value_ty, VectorType):
-                raise TypeError(f"{type(expr).__name__} expects vector, got {value_ty}")
-            if value_ty.element not in (I32, F32):
-                raise TypeError(f"cannot reduce elements of type {value_ty.element}")
-            ty = value_ty.element
+            shape = block_shape(value_ty)
+            if shape is None:
+                raise TypeError(f"{type(expr).__name__} expects block, got {value_ty}")
+            if len(shape) != 1:
+                raise TypeError(
+                    f"{type(expr).__name__} currently supports only 1D blocks, "
+                    f"got {value_ty}"
+                )
+            value_element = self.element_type(value_ty)
+            if value_element not in (I32, F32):
+                raise TypeError(f"cannot reduce elements of type {value_element}")
+            ty = value_element
         elif isinstance(expr, Dot):
             lhs_ty = self.infer(expr.lhs)
             rhs_ty = self.infer(expr.rhs)
@@ -245,4 +255,4 @@ class TypeInference:
             self.require_mask(mask)
             operands.append(mask)
 
-        self.common_vector_size(*operands)
+        self.common_block_shape(*operands)

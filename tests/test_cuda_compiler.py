@@ -55,7 +55,7 @@ def test_rejects_inconsistent_vector_widths():
 
     with pytest.raises(
         ValueError,
-        match="CUDA lowering requires one vector width, got: 128, 256",
+        match="CUDA lowering requires one block size, got: 128, 256",
     ):
         inconsistent_width_kernel[(1,)](out, n)
 

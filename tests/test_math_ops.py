@@ -237,7 +237,7 @@ def test_reduction_returns_scalar_element_type(operation):
 def test_reduction_rejects_scalar_input(operation):
     expression = operation(Value(Param("value", F32))).expr
 
-    with pytest.raises(TypeError, match="expects vector"):
+    with pytest.raises(TypeError, match="expects block"):
         TypeInference().infer(expression)
 
 
