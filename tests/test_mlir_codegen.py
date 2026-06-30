@@ -9,8 +9,12 @@ from mytriton.mlir_backend import (
     FUNC_CLEANUP_PIPELINE,
     GENERIC_CLEANUP_PIPELINE,
     GPU_CLEANUP_PIPELINE,
+    GPU_LOWER_TO_NVVM_PIPELINE,
+    NVVM_ATTACH_TARGET_PIPELINE,
     run_mlir_pass_pipeline,
+    run_mlir_pass_pipelines,
     try_run_mlir_pass_pipeline,
+    try_run_mlir_pass_pipelines,
 )
 from mytriton.mlir_codegen import SSAGPUMLIRCodegen, SSAMLIRCodegen
 from mytriton.ssa import SSALowering
@@ -188,3 +192,43 @@ def test_mlir_invalid_pipeline_reports_error_with_bindings():
     assert not result.ok
     assert result.error is not None
     assert "this-pass-does-not-exist" in result.error
+
+
+def test_add_kernel_gpu_mlir_attach_nvvm_target_with_bindings():
+    pytest.importorskip("mlir")
+
+    mlir_text = build_add_kernel_gpu_mlir()
+
+    rendered = run_mlir_pass_pipelines(
+        mlir_text,
+        [
+            GPU_CLEANUP_PIPELINE,
+            NVVM_ATTACH_TARGET_PIPELINE,
+        ],
+    )
+
+    assert "gpu.module @kernels" in rendered
+    assert "nvvm.target" in rendered
+    assert 'chip = "sm_80"' in rendered
+
+
+def test_add_kernel_gpu_mlir_lower_to_nvvm_smoke_with_bindings():
+    pytest.importorskip("mlir")
+
+    mlir_text = build_add_kernel_gpu_mlir()
+
+    result = try_run_mlir_pass_pipelines(
+        mlir_text,
+        [
+            GPU_CLEANUP_PIPELINE,
+            NVVM_ATTACH_TARGET_PIPELINE,
+            GPU_LOWER_TO_NVVM_PIPELINE,
+        ],
+    )
+
+    if result.ok:
+        assert "gpu.func" not in result.output or "nvvm." in result.output
+        assert "llvm." in result.output or "nvvm." in result.output
+    else:
+        assert result.error is not None
+        assert "failed to run MLIR pass pipeline" in result.error
