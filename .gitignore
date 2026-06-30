@@ -29,3 +29,4 @@ coverage.xml
 *.swp
 *.swo
 
+mlir-debug

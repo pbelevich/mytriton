@@ -11,8 +11,12 @@ from mytriton.mlir_backend import (
     GPU_CLEANUP_PIPELINE,
     GPU_LOWER_TO_NVVM_PIPELINE,
     NVVM_ATTACH_TARGET_PIPELINE,
+    MLIRStageStatus,
+    default_gpu_to_nvvm_stages,
+    format_mlir_lowering_report,
     run_mlir_pass_pipeline,
     run_mlir_pass_pipelines,
+    run_mlir_pipeline_stages,
     try_run_mlir_pass_pipeline,
     try_run_mlir_pass_pipelines,
 )
@@ -232,3 +236,43 @@ def test_add_kernel_gpu_mlir_lower_to_nvvm_smoke_with_bindings():
     else:
         assert result.error is not None
         assert "failed to run MLIR pass pipeline" in result.error
+
+
+def test_gpu_to_nvvm_staged_pipeline_reports_result_with_bindings():
+    pytest.importorskip("mlir")
+
+    mlir_text = build_add_kernel_gpu_mlir()
+
+    result = run_mlir_pipeline_stages(
+        mlir_text,
+        default_gpu_to_nvvm_stages(),
+    )
+
+    assert result.stages
+    assert result.stages[0].name == "gpu-cleanup"
+
+    report = format_mlir_lowering_report(result)
+    assert "Stage 0: gpu-cleanup" in report
+
+    if result.ok:
+        assert result.first_error is None
+    else:
+        assert result.first_error is not None
+
+
+def test_attach_nvvm_target_stage_with_bindings():
+    pytest.importorskip("mlir")
+
+    mlir_text = build_add_kernel_gpu_mlir()
+
+    result = run_mlir_pipeline_stages(
+        mlir_text,
+        default_gpu_to_nvvm_stages()[:2],
+    )
+
+    assert len(result.stages) == 2
+    assert result.stages[0].status == MLIRStageStatus.OK
+    assert result.stages[1].status == MLIRStageStatus.OK
+
+    assert "gpu.module @kernels" in result.final_output
+    assert "nvvm.target" in result.final_output

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import suppress
 from dataclasses import dataclass
+from enum import Enum
 
 FUNC_CLEANUP_PIPELINE = "builtin.module(func.func(cse,canonicalize))"
 
@@ -37,6 +38,52 @@ class MLIRPipelineResult:
     ok: bool
     output: str
     error: str | None = None
+
+
+class MLIRStageStatus(str, Enum):
+    OK = "ok"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+@dataclass(frozen=True)
+class MLIRPipelineStage:
+    name: str
+    pipeline: str
+
+
+@dataclass(frozen=True)
+class MLIRStageResult:
+    name: str
+    pipeline: str
+    status: MLIRStageStatus
+    input_text: str
+    output_text: str
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class MLIRLoweringResult:
+    stages: tuple[MLIRStageResult, ...]
+
+    @property
+    def ok(self) -> bool:
+        return all(stage.status == MLIRStageStatus.OK for stage in self.stages)
+
+    @property
+    def final_output(self) -> str:
+        if not self.stages:
+            return ""
+
+        return self.stages[-1].output_text
+
+    @property
+    def first_error(self) -> str | None:
+        for stage in self.stages:
+            if stage.error is not None:
+                return stage.error
+
+        return None
 
 
 def mlir_available() -> bool:
@@ -127,3 +174,149 @@ def try_run_mlir_pass_pipelines(
             output=mlir_text,
             error=str(error),
         )
+
+
+def nvvm_attach_target_pipeline(
+    *,
+    module: str = ".*",
+    chip: str = "sm_80",
+    opt_level: int = 3,
+) -> str:
+    return (
+        "builtin.module("
+        f"nvvm-attach-target{{module={module} chip={chip} O={opt_level}}}"
+        ")"
+    )
+
+
+def gpu_lower_to_nvvm_pipeline(
+    *,
+    chip: str = "sm_80",
+    features: str = "+ptx80",
+    opt_level: int = 3,
+) -> str:
+    return (
+        "builtin.module("
+        "gpu-lower-to-nvvm-pipeline{"
+        f"cubin-chip={chip} "
+        f"cubin-features={features} "
+        f"opt-level={opt_level}"
+        "}"
+        ")"
+    )
+
+
+def run_mlir_pipeline_stages(
+    mlir_text: str,
+    stages: list[MLIRPipelineStage],
+    *,
+    stop_on_error: bool = True,
+) -> MLIRLoweringResult:
+    results: list[MLIRStageResult] = []
+    current = mlir_text
+    failed = False
+
+    for stage in stages:
+        if failed:
+            results.append(
+                MLIRStageResult(
+                    name=stage.name,
+                    pipeline=stage.pipeline,
+                    status=MLIRStageStatus.SKIPPED,
+                    input_text=current,
+                    output_text=current,
+                    error="skipped because previous stage failed",
+                )
+            )
+            continue
+
+        try:
+            output = run_mlir_pass_pipeline(current, stage.pipeline)
+
+            results.append(
+                MLIRStageResult(
+                    name=stage.name,
+                    pipeline=stage.pipeline,
+                    status=MLIRStageStatus.OK,
+                    input_text=current,
+                    output_text=output,
+                    error=None,
+                )
+            )
+
+            current = output
+
+        except Exception as error:
+            failed = True
+
+            results.append(
+                MLIRStageResult(
+                    name=stage.name,
+                    pipeline=stage.pipeline,
+                    status=MLIRStageStatus.FAILED,
+                    input_text=current,
+                    output_text=current,
+                    error=str(error),
+                )
+            )
+
+            if not stop_on_error:
+                continue
+
+    return MLIRLoweringResult(tuple(results))
+
+
+def default_gpu_to_nvvm_stages(
+    *,
+    chip: str = "sm_80",
+    features: str = "+ptx80",
+    opt_level: int = 3,
+) -> list[MLIRPipelineStage]:
+    return [
+        MLIRPipelineStage(
+            name="gpu-cleanup",
+            pipeline=GPU_CLEANUP_PIPELINE,
+        ),
+        MLIRPipelineStage(
+            name="attach-nvvm-target",
+            pipeline=nvvm_attach_target_pipeline(
+                chip=chip,
+                opt_level=opt_level,
+            ),
+        ),
+        MLIRPipelineStage(
+            name="gpu-lower-to-nvvm",
+            pipeline=gpu_lower_to_nvvm_pipeline(
+                chip=chip,
+                features=features,
+                opt_level=opt_level,
+            ),
+        ),
+    ]
+
+
+def format_mlir_lowering_report(result: MLIRLoweringResult) -> str:
+    lines: list[str] = []
+
+    for index, stage in enumerate(result.stages):
+        lines.append(f"=== Stage {index}: {stage.name} ===")
+        lines.append(f"status: {stage.status.value}")
+        lines.append(f"pipeline: {stage.pipeline}")
+
+        if stage.error is not None:
+            lines.append("")
+            lines.append("error:")
+            lines.append(stage.error)
+
+        lines.append("")
+
+    if result.ok:
+        lines.append("MLIR lowering pipeline completed successfully.")
+    else:
+        lines.append("MLIR lowering pipeline failed.")
+        if result.first_error is not None:
+            lines.append("")
+            lines.append("first error:")
+            lines.append(result.first_error)
+
+    return "\n".join(lines)
