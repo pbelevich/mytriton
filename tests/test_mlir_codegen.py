@@ -13,6 +13,7 @@ from mytriton.mlir_backend import (
     NVVM_ATTACH_TARGET_PIPELINE,
     MLIRStageStatus,
     default_gpu_to_nvvm_stages,
+    extract_gpu_binary,
     format_mlir_lowering_report,
     run_mlir_pass_pipeline,
     run_mlir_pass_pipelines,
@@ -338,7 +339,44 @@ def test_executable_gpu_mlir_try_produce_gpu_binary_with_bindings():
         executable_gpu_to_binary_stages(),
     )
 
-    if result.ok:
-        assert "gpu.binary @kernels" in result.final_output
-    else:
-        assert result.first_error is not None
+    assert result.ok, result.first_error
+    assert "gpu.binary @kernels" in result.final_output
+    assert extract_gpu_binary(result.final_output).startswith(b"P\xedU\xba")
+
+
+def test_add_kernel_launch_runs_mlir_lowering_with_bindings(monkeypatch):
+    pytest.importorskip("mlir")
+    monkeypatch.setenv("MYTRITON_BACKEND", "mlir")
+
+    n = 1000
+    block = 256
+    x = np.empty(n, dtype=np.float32)
+    y = np.empty(n, dtype=np.float32)
+    out = np.empty_like(x)
+
+    add_kernel.clear_cache()
+    ops, ssa_ops, cuda_src = add_kernel[lambda meta: (triton.cdiv(n, meta["BLOCK"]),)](
+        x,
+        y,
+        out,
+        n,
+        BLOCK=block,
+    )
+
+    assert ops
+    assert ssa_ops
+    assert "void add_kernel" in cuda_src
+    assert add_kernel.last_mlir_source is not None
+    assert "func.func @launch_add_kernel" in add_kernel.last_mlir_source
+    assert "gpu.launch_func @kernels::@add_kernel" in add_kernel.last_mlir_source
+    assert add_kernel.last_mlir_lowering is not None
+    assert add_kernel.last_mlir_lowering.ok
+    assert add_kernel.last_mlir_cubin is not None
+    assert add_kernel.last_mlir_cubin.startswith(b"P\xedU\xba")
+    assert [stage.name for stage in add_kernel.last_mlir_lowering.stages] == [
+        "generic-cleanup",
+        "attach-nvvm-target",
+        "convert-scf-to-cf",
+        "convert-gpu-to-nvvm",
+        "gpu-module-to-binary",
+    ]

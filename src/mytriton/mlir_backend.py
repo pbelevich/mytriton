@@ -340,15 +340,59 @@ def executable_gpu_to_binary_stages(
             ),
         ),
         MLIRPipelineStage(
-            name="convert-gpu-to-nvvm",
-            pipeline="builtin.module(gpu.module(convert-gpu-to-nvvm))",
+            name="convert-scf-to-cf",
+            pipeline="builtin.module(gpu.module(gpu.func(convert-scf-to-cf)))",
         ),
         MLIRPipelineStage(
-            name="gpu-to-llvm",
-            pipeline="builtin.module(gpu-to-llvm)",
+            name="convert-gpu-to-nvvm",
+            pipeline="builtin.module(gpu.module(convert-gpu-to-nvvm))",
         ),
         MLIRPipelineStage(
             name="gpu-module-to-binary",
             pipeline="builtin.module(gpu-module-to-binary)",
         ),
     ]
+
+
+def extract_gpu_binary(mlir_text: str, *, symbol_name: str = "kernels") -> bytes:
+    marker = f"gpu.binary @{symbol_name}"
+    start = mlir_text.find(marker)
+    if start < 0:
+        raise ValueError(f"MLIR module does not contain {marker}")
+
+    object_start = mlir_text.find(', "', start)
+    if object_start < 0:
+        raise ValueError(f"MLIR gpu.binary @{symbol_name} does not contain an object")
+
+    return _decode_mlir_byte_string(mlir_text, object_start + 3)
+
+
+def _decode_mlir_byte_string(text: str, start: int) -> bytes:
+    hex_digits = set("0123456789abcdefABCDEF")
+    output = bytearray()
+    index = start
+
+    while index < len(text):
+        char = text[index]
+        if char == '"':
+            return bytes(output)
+
+        if (
+            char == "\\"
+            and index + 2 < len(text)
+            and text[index + 1] in hex_digits
+            and text[index + 2] in hex_digits
+        ):
+            output.append(int(text[index + 1 : index + 3], 16))
+            index += 3
+            continue
+
+        if char == "\\" and index + 1 < len(text):
+            output.append(ord(text[index + 1]))
+            index += 2
+            continue
+
+        output.extend(char.encode("utf-8"))
+        index += 1
+
+    raise ValueError("unterminated MLIR byte string")

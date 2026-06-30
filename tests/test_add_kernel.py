@@ -3,9 +3,11 @@ from __future__ import annotations
 from textwrap import dedent
 
 import numpy as np
+import pytest
 
 import mytriton as triton
 import mytriton.language as tl
+from mytriton.mlir_backend import mlir_available
 from mytriton.ssa import SSAPrinter
 from mytriton.trace import (
     AddPtr,
@@ -21,6 +23,16 @@ from mytriton.trace import (
 )
 
 
+@pytest.fixture(params=["cuda", "mlir"])
+def backend(request, monkeypatch):
+    selected = request.param
+    if selected == "mlir" and not mlir_available():
+        pytest.skip("MLIR Python bindings are not installed")
+
+    monkeypatch.setenv("MYTRITON_BACKEND", selected)
+    return selected
+
+
 @triton.jit
 def add_kernel(x, y, out, n, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
@@ -34,7 +46,7 @@ def add_kernel(x, y, out, n, BLOCK: tl.constexpr):
     tl.store(out + offs, a + b, mask=mask)
 
 
-def test_add_kernel():
+def test_add_kernel(backend):
     n = 1000
     BLOCK = 256
 
@@ -188,9 +200,13 @@ def test_add_kernel():
     ).rstrip("\n")
 
     assert cuda_src == expected_cuda_src
+    if backend == "mlir":
+        assert add_kernel.last_mlir_cubin is not None
+    else:
+        assert add_kernel.last_mlir_cubin is None
 
 
-def test_add_kernel_cuda_execution(cp):
+def test_add_kernel_cuda_execution(cp, backend):
     n = 1000
     block = 256
     x = cp.random.randn(n, dtype=cp.float32)
@@ -206,4 +222,8 @@ def test_add_kernel_cuda_execution(cp):
     )
 
     cp.cuda.runtime.deviceSynchronize()
+    if backend == "mlir":
+        assert add_kernel.last_mlir_cubin is not None
+    else:
+        assert add_kernel.last_mlir_cubin is None
     cp.testing.assert_allclose(out, x + y, rtol=1e-5, atol=1e-6)
