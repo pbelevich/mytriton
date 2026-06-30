@@ -5,6 +5,13 @@ import pytest
 
 import mytriton as triton
 import mytriton.language as tl
+from mytriton.mlir_backend import (
+    FUNC_CLEANUP_PIPELINE,
+    GENERIC_CLEANUP_PIPELINE,
+    GPU_CLEANUP_PIPELINE,
+    run_mlir_pass_pipeline,
+    try_run_mlir_pass_pipeline,
+)
 from mytriton.mlir_codegen import SSAGPUMLIRCodegen, SSAMLIRCodegen
 from mytriton.ssa import SSALowering
 from mytriton.trace import make_runtime_params, trace
@@ -128,3 +135,56 @@ def test_add_kernel_gpu_mlir_parses_with_bindings():
 
     assert "gpu.module @kernels" in rendered
     assert "gpu.func @add_kernel" in rendered
+
+
+def test_add_kernel_func_mlir_cleanup_pipeline_with_bindings():
+    pytest.importorskip("mlir")
+
+    mlir_text = build_add_kernel_mlir()
+    rendered = run_mlir_pass_pipeline(
+        mlir_text,
+        FUNC_CLEANUP_PIPELINE,
+    )
+
+    assert "func.func @add_kernel" in rendered
+    assert "arith.muli" in rendered
+    assert "memref.load" in rendered
+    assert "memref.store" in rendered
+
+
+def test_add_kernel_gpu_mlir_cleanup_pipeline_with_bindings():
+    pytest.importorskip("mlir")
+
+    mlir_text = build_add_kernel_gpu_mlir()
+
+    result = try_run_mlir_pass_pipeline(
+        mlir_text,
+        GPU_CLEANUP_PIPELINE,
+    )
+
+    if not result.ok:
+        result = try_run_mlir_pass_pipeline(
+            mlir_text,
+            GENERIC_CLEANUP_PIPELINE,
+        )
+
+    assert result.ok, result.error
+    assert "gpu.module @kernels" in result.output
+    assert "gpu.func @add_kernel" in result.output
+    assert "gpu.block_id" in result.output
+    assert "gpu.thread_id" in result.output
+
+
+def test_mlir_invalid_pipeline_reports_error_with_bindings():
+    pytest.importorskip("mlir")
+
+    mlir_text = build_add_kernel_mlir()
+
+    result = try_run_mlir_pass_pipeline(
+        mlir_text,
+        "builtin.module(this-pass-does-not-exist)",
+    )
+
+    assert not result.ok
+    assert result.error is not None
+    assert "this-pass-does-not-exist" in result.error
