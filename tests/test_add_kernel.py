@@ -3,6 +3,7 @@ from __future__ import annotations
 from textwrap import dedent
 
 import numpy as np
+import pytest
 
 import mytriton as triton
 import mytriton.language as tl
@@ -34,7 +35,8 @@ def add_kernel(x, y, out, n, BLOCK: tl.constexpr):
     tl.store(out + offs, a + b, mask=mask)
 
 
-def test_add_kernel():
+@pytest.mark.codegen
+def test_add_kernel_codegen(backend):
     n = 1000
     BLOCK = 256
 
@@ -49,7 +51,8 @@ def test_add_kernel():
         received_meta = meta
         return (triton.cdiv(n, meta["BLOCK"]),)
 
-    ops, ssa_ops, cuda_src = add_kernel[grid](
+    add_kernel.clear_cache()
+    ops, ssa_ops, src = add_kernel[grid](
         x,
         y,
         out,
@@ -168,35 +171,77 @@ def test_add_kernel():
 
     assert SSAPrinter().print_ops(ssa_ops) == expected_ssa
 
-    expected_cuda_src = dedent(
-        """\
-        extern "C" __global__
-        void add_kernel(float* x, float* y, float* out, int n) {
-            int v0 = blockIdx.x;
-            int v1 = (v0 * 256);
-            int v2 = threadIdx.x;
-            int v3 = (v1 + v2);
-            bool v5 = (v3 < n);
-            float v6 = (v5 ? x[v3] : 0.0f);
-            float v8 = (v5 ? y[v3] : 0.0f);
-            float v9 = (v6 + v8);
-            if (v5) {
-                out[v3] = v9;
+    if backend == "cuda":
+        expected_src = dedent(
+            """\
+            extern "C" __global__
+            void add_kernel(float* x, float* y, float* out, int n) {
+                int v0 = blockIdx.x;
+                int v1 = (v0 * 256);
+                int v2 = threadIdx.x;
+                int v3 = (v1 + v2);
+                bool v5 = (v3 < n);
+                float v6 = (v5 ? x[v3] : 0.0f);
+                float v8 = (v5 ? y[v3] : 0.0f);
+                float v9 = (v6 + v8);
+                if (v5) {
+                    out[v3] = v9;
+                }
             }
-        }
-    """
-    ).rstrip("\n")
+        """
+        ).rstrip("\n")
+    else:
+        expected_src = dedent(
+            """\
+            module attributes {gpu.container_module} {
+              gpu.module @kernels {
+                gpu.func @add_kernel(%x: memref<?xf32>, %y: memref<?xf32>, %out: memref<?xf32>, %n: i32) kernel {
+                  %bid_x = gpu.block_id x
+                  %tid_x = gpu.thread_id x
+                  %block_id_x = arith.index_cast %bid_x : index to i32
+                  %thread_id_x = arith.index_cast %tid_x : index to i32
+                  %c_i32_256 = arith.constant 256 : i32
+                  %v1 = arith.muli %block_id_x, %c_i32_256 : i32
+                  %v3 = arith.addi %v1, %thread_id_x : i32
+                  %idx4 = arith.index_cast %v3 : i32 to index
+                  %v5 = arith.cmpi slt, %v3, %n : i32
+                  %c_f32_0_0 = arith.constant 0.000000e+00 : f32
+                  %v6 = scf.if %v5 -> (f32) {
+                    %loaded6 = memref.load %x[%idx4] : memref<?xf32>
+                    scf.yield %loaded6 : f32
+                  } else {
+                    scf.yield %c_f32_0_0 : f32
+                  }
+                  %idx7 = arith.index_cast %v3 : i32 to index
+                  %v8 = scf.if %v5 -> (f32) {
+                    %loaded8 = memref.load %y[%idx7] : memref<?xf32>
+                    scf.yield %loaded8 : f32
+                  } else {
+                    scf.yield %c_f32_0_0 : f32
+                  }
+                  %v9 = arith.addf %v6, %v8 : f32
+                  %idx10 = arith.index_cast %v3 : i32 to index
+                  scf.if %v5 {
+                    memref.store %v9, %out[%idx10] : memref<?xf32>
+                  }
+                  gpu.return
+                }
+              }
+            }"""
+        )
 
-    assert cuda_src == expected_cuda_src
+    assert src == expected_src
 
 
-def test_add_kernel_cuda_execution(cp):
+@pytest.mark.execution
+def test_add_kernel_execution(cp, backend):
     n = 1000
     block = 256
     x = cp.random.randn(n, dtype=cp.float32)
     y = cp.random.randn(n, dtype=cp.float32)
     out = cp.empty_like(x)
 
+    add_kernel.clear_cache()
     add_kernel[lambda meta: (triton.cdiv(n, meta["BLOCK"]),)](
         x,
         y,

@@ -1,21 +1,38 @@
 import inspect
+import os
 from collections.abc import Callable, Sequence
 from copy import deepcopy
-from dataclasses import dataclass
-from typing import Any, Generic, ParamSpec, TypeAlias
+from dataclasses import dataclass, replace
+from typing import Any, Generic, Literal, ParamSpec, TypeAlias, cast
 
 from .cuda_codegen import SSACUDACodegen
-from .cuda_utils import CudaKernelCache, execute_cuda_if_needed
+from .cuda_utils import (
+    CudaKernelCache,
+    CudaUnavailableError,
+    cuda_chip,
+    cuda_execution_required,
+    execute_cuda_if_needed,
+    execute_mlir_cubin_if_needed,
+)
+from .mlir_codegen import MLIRCodegen, compile_mlir_source_to_cubin
 from .optim import ConstantFoldPass, CSEPass, DCEPass, PassManager
 from .ssa import SSALowering, SSAOp
 from .ssa_verification import SSAVerifier
-from .trace import VectorType, is_constexpr_annotation, make_runtime_params, trace
+from .trace import (
+    VectorType,
+    is_constexpr_annotation,
+    make_runtime_params,
+    trace,
+)
 
 P = ParamSpec("P")
 Meta: TypeAlias = dict[str, Any]
 LaunchDimensions: TypeAlias = int | Sequence[int]
 Grid: TypeAlias = LaunchDimensions | Callable[[Meta], LaunchDimensions]
 CompilationResult: TypeAlias = tuple[list[Any], list[SSAOp], str]
+
+
+Backend: TypeAlias = Literal["cuda", "mlir"]
 
 
 def _cuda_threads_per_block(ssa_ops: list[SSAOp]) -> int:
@@ -61,8 +78,9 @@ def _constexpr_key(
 class _CompilationArtifact:
     ops: tuple[Any, ...]
     ssa_ops: tuple[SSAOp, ...]
-    cuda_src: str
+    src: str
     threads_per_block: int
+    cubin: bytes | None = None
 
 
 class CompiledKernel(Generic[P]):
@@ -83,6 +101,14 @@ class CompiledKernel(Generic[P]):
     def clear_cache(self) -> None:
         self.compilation_cache.clear()
         self.cuda_cache.clear()
+
+    def _resolve_backend(self) -> Backend:
+        selected = os.environ.get("MYTRITON_BACKEND", "cuda")
+        if selected not in {"cuda", "mlir"}:
+            raise ValueError(
+                f"unsupported backend {selected!r}; expected 'cuda' or 'mlir'"
+            )
+        return cast(Backend, selected)
 
     def __getitem__(self, grid: Grid) -> Callable[P, CompilationResult]:
 
@@ -112,7 +138,17 @@ class CompiledKernel(Generic[P]):
                 if not is_constexpr_annotation(parameter.annotation)
             )
             params = make_runtime_params(self.signature, bound.arguments)
+            backend = self._resolve_backend()
+            chip = None
+            if backend == "mlir":
+                try:
+                    chip = cuda_chip()
+                except CudaUnavailableError:
+                    chip = "sm_80"
+
             cache_key = (
+                backend,
+                chip,
                 tuple(param.ty for param in params),
                 _constexpr_key(meta),
             )
@@ -148,32 +184,61 @@ class CompiledKernel(Generic[P]):
                 threads_per_block = _cuda_threads_per_block(ssa_ops)
                 SSAVerifier(threads_per_block).verify(ssa_ops)
 
-                cuda_src = SSACUDACodegen().generate(
-                    self.fn.__name__,
-                    ssa_ops,
-                    params,
-                )
+                cubin = None
+                if backend == "mlir":
+                    src = MLIRCodegen().generate(self.fn.__name__, ssa_ops, params)
+                else:
+                    src = SSACUDACodegen().generate(
+                        self.fn.__name__,
+                        ssa_ops,
+                        params,
+                    )
+
                 artifact = _CompilationArtifact(
                     ops=tuple(ops),
                     ssa_ops=tuple(ssa_ops),
-                    cuda_src=cuda_src,
+                    src=src,
                     threads_per_block=threads_per_block,
+                    cubin=cubin,
                 )
                 self.compilation_cache[cache_key] = artifact
 
-            execute_cuda_if_needed(
-                kernel_cache=self.cuda_cache,
-                cuda_src=artifact.cuda_src,
-                kernel_name=self.fn.__name__,
-                launch_grid=launch_grid,
-                threads_per_block=artifact.threads_per_block,
-                runtime_args=runtime_args,
-            )
+            if backend == "mlir":
+                needs_execution = cuda_execution_required(
+                    runtime_args, backend_name="MLIR"
+                )
+                if artifact.cubin is None and needs_execution:
+                    assert chip is not None
+                    artifact = replace(
+                        artifact,
+                        cubin=compile_mlir_source_to_cubin(artifact.src, chip=chip),
+                    )
+                    self.compilation_cache[cache_key] = artifact
+
+                if needs_execution:
+                    assert artifact.cubin is not None
+                    execute_mlir_cubin_if_needed(
+                        kernel_cache=self.cuda_cache,
+                        cubin=artifact.cubin,
+                        kernel_name=self.fn.__name__,
+                        launch_grid=launch_grid,
+                        threads_per_block=artifact.threads_per_block,
+                        runtime_args=runtime_args,
+                    )
+            else:
+                execute_cuda_if_needed(
+                    kernel_cache=self.cuda_cache,
+                    cuda_src=artifact.src,
+                    kernel_name=self.fn.__name__,
+                    launch_grid=launch_grid,
+                    threads_per_block=artifact.threads_per_block,
+                    runtime_args=runtime_args,
+                )
 
             return (
                 list(deepcopy(artifact.ops)),
                 list(deepcopy(artifact.ssa_ops)),
-                artifact.cuda_src,
+                artifact.src,
             )
 
         return launch
