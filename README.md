@@ -3,7 +3,9 @@
 `mytriton` is a small symbolic tracer inspired by Triton's Python API.
 It traces straight-line Python kernels into an expression-tree IR, infers types,
 lowers the result into a small SSA-style IR, verifies and optimizes that IR,
-and emits CUDA C++ source.
+and emits backend source. The default backend emits CUDA C++; an experimental
+MLIR backend can lower a small subset of kernels through MLIR's GPU/NVVM stack
+to a cubin.
 
 ## Versions
 
@@ -22,6 +24,9 @@ and emits CUDA C++ source.
 - [ver6](https://github.com/pbelevich/mytriton/tree/ver6): row-wise reductions,
   `tl.sum`/`tl.max`/`tl.min`, 2D matrix add, softmax, `tl.static_range`,
   long-row sum, and a first naive matrix multiplication kernel.
+- [ver7](https://github.com/pbelevich/mytriton/tree/ver7): an experimental
+  MLIR backend for 1D elementwise kernels, backend-parametrized tests, MLIR GPU
+  dialect emission, lowering to cubin, and CuPy-backed cubin execution.
 
 ## Example
 
@@ -48,7 +53,7 @@ x = np.ones(n, dtype=np.float32)
 y = np.ones(n, dtype=np.float32)
 out = np.empty_like(x)
 
-expression_ops, ssa_ops, cuda_src = add_kernel[
+expression_ops, ssa_ops, src = add_kernel[
     lambda meta: (triton.cdiv(n, meta["BLOCK"]),)
 ](
     x,
@@ -60,15 +65,16 @@ expression_ops, ssa_ops, cuda_src = add_kernel[
 
 print(expression_ops)
 print(SSAPrinter().print_ops(ssa_ops))
-print(cuda_src)
+print(src)
 ```
 
 The first result contains the captured expression-tree operations. The second
-contains optimized typed SSA operations, and the third contains generated CUDA
-C++ source. With NumPy arguments, compilation stops there. If the arguments are
-CuPy arrays and a CUDA GPU is available, the generated kernel is also compiled
-and launched. Shared expressions such as `offsets` and `mask` are lowered once
-and referenced by their SSA values wherever they are reused.
+contains optimized typed SSA operations, and the third contains generated source
+for the selected backend. The default backend is CUDA, so `src` is CUDA C++.
+With NumPy arguments, compilation stops there. If the arguments are CuPy arrays
+and a CUDA GPU is available, the generated kernel is also compiled and launched.
+Shared expressions such as `offsets` and `mask` are lowered once and referenced
+by their SSA values wherever they are reused.
 
 For example, part of the resulting SSA looks like this:
 
@@ -100,6 +106,43 @@ void add_kernel(float* x, float* y, float* out, int n) {
 }
 ```
 
+The backend can be selected with `MYTRITON_BACKEND` when running your own
+script:
+
+```bash
+MYTRITON_BACKEND=cuda python examples_or_your_script.py
+MYTRITON_BACKEND=mlir python examples_or_your_script.py
+```
+
+The `add_kernel` and `copy_kernel` tests are parameterized over both backends,
+so they exercise CUDA and MLIR from the same test body.
+
+With `MYTRITON_BACKEND=mlir`, the same optimized SSA is emitted as MLIR GPU
+dialect instead of CUDA C++:
+
+```mlir
+module attributes {gpu.container_module} {
+  gpu.module @kernels {
+    gpu.func @add_kernel(%x: memref<?xf32>, %y: memref<?xf32>, %out: memref<?xf32>, %n: i32) kernel {
+      %bid_x = gpu.block_id x
+      %tid_x = gpu.thread_id x
+      %block_id_x = arith.index_cast %bid_x : index to i32
+      %thread_id_x = arith.index_cast %tid_x : index to i32
+      ...
+      gpu.return
+    }
+  }
+}
+```
+
+For NumPy arguments, the MLIR backend stops after source generation, so MLIR
+Python bindings are not required just to inspect the emitted MLIR. For CuPy
+arguments, the backend runs a small pass pipeline that attaches an NVVM target,
+converts GPU operations to NVVM, emits a GPU binary, extracts the cubin, loads
+it through CuPy, and launches it with the same grid and thread-block size used
+by the CUDA backend. CuPy arrays are passed using the ranked-memref ABI:
+allocated pointer, aligned pointer, offset, size, and stride.
+
 The test kernels also include a copy, 2D matrix add, ReLU through
 `tl.maximum`, leaky ReLU through `tl.where`, sigmoid through negation,
 `tl.exp`, addition, and division, row-wise `tl.sum`/`tl.max`/`tl.min`
@@ -127,9 +170,13 @@ before CUDA code generation.
 
 ## Current limitations
 
-- Generated CUDA source is returned as a string. Execution requires CuPy built
-  for the installed CUDA version and an available CUDA GPU; NumPy inputs remain
-  compilation-only.
+- Generated backend source is returned as a string. Execution requires CuPy
+  built for the installed CUDA version and an available CUDA GPU; NumPy inputs
+  remain compilation-only.
+- `MYTRITON_BACKEND` can be `cuda` or `mlir`. The CUDA backend is the default
+  and supports the full current mytriton test language. The MLIR backend is an
+  experimental MVP for 1D elementwise kernels. MLIR source generation does not
+  require MLIR Python bindings, but MLIR cubin execution does.
 - Only straight-line kernels are supported. Symbolic Python control flow is rejected.
 - Runtime array arguments must be C-contiguous `float32` arrays.
 - The launch grid is evaluated and used for CUDA execution, but it is not
@@ -156,6 +203,15 @@ before CUDA code generation.
   matmul kernel does not tile through shared memory because there is no
   user-facing shared-memory API yet. It repeatedly reads from global memory and
   uses `tl.static_range` to unroll the reduction dimension.
+- MLIR lowering currently supports only `ptr<f32>` parameters as
+  `memref<?xf32>`, scalar `i32`/`f32`/`bool`, `tl.program_id(0)`,
+  `tl.arange(0, BLOCK)`, basic arithmetic and `<`, pointer addition, masked
+  loads, and masked stores. It intentionally rejects nonzero program axes and
+  nonzero `arange` starts instead of silently generating wrong code. It does
+  not yet support 2D program IDs, reductions, `tl.maximum`, `tl.minimum`,
+  `tl.where`, negation, `tl.exp`, `tl.static_range`, or matrix multiplication.
+- MLIR execution currently supports only 1D C-contiguous CuPy arrays because it
+  builds one-dimensional memref descriptors.
 - The SSA IR has no basic blocks, control-flow representation, or phi nodes yet.
 - The optimizer is intentionally small. It does local simplification, constant
   folding, common subexpression elimination, and dead-code elimination, but it
@@ -175,15 +231,24 @@ To enable CUDA execution with CUDA 12, install the matching CuPy wheel:
 python -m pip install -e ".[cuda12]"
 ```
 
-On a GPU test runner, require all CUDA execution tests to run instead of skip:
+MLIR cubin execution requires Python bindings importable as `mlir.ir` and
+`mlir.passmanager`, plus an MLIR build that includes the GPU/NVVM passes needed
+by `gpu-module-to-binary`. These bindings are intentionally not listed as a
+default or development dependency because MLIR Python packaging depends on the
+LLVM/MLIR build or wheel you use.
+
+GitHub Actions runs linting, type checks, unit tests, and CUDA/MLIR codegen
+tests, but excludes GPU execution tests:
+
+```bash
+python -m pytest -m "not execution"
+```
+
+On a GPU machine, run execution tests locally:
 
 ```bash
 MYTRITON_REQUIRE_CUDA=1 python -m pytest
 ```
-
-The GitHub Actions CUDA job is enabled when the repository variable
-`CUDA_RUNNER_ENABLED` is set to `true` and a self-hosted runner has the `gpu`
-label.
 
 Format the project and apply safe lint fixes:
 
