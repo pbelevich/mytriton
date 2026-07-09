@@ -12,6 +12,7 @@ dependencies = ["numpy>=2"]
 
 [project.optional-dependencies]
 cuda12 = ["cupy-cuda12x>=13"]
+cuda13 = ["cupy-cuda13x>=14"]
 test = ["pytest>=8"]
 dev = [
     "mypy>=1.14",
@@ -57,7 +58,7 @@ known-first-party = ["mytriton"]
 docstring-code-format = true
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.12"
 files = ["src", "tests"]
 check_untyped_defs = true
 no_implicit_optional = true

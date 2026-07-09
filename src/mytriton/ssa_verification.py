@@ -5,12 +5,12 @@ from .trace import (
     BOOL,
     F32,
     I32,
+    BlockType,
     Const,
     Param,
     PointerType,
     ScalarType,
     Type,
-    VectorType,
 )
 
 
@@ -46,11 +46,11 @@ class SSAVerifier:
     def fail(self, index: int, op: SSAOp, message: str) -> NoReturn:
         raise CompileError(f"ssa-verifier: op #{index} '{op.opcode}': {message}")
 
-    def element_type(self, ty: Type) -> ScalarType | PointerType:
-        return ty.element if isinstance(ty, VectorType) else ty
+    def element_type(self, ty: Type):
+        return ty.element if isinstance(ty, BlockType) else ty
 
     def width(self, ty: Type) -> int | None:
-        return ty.size if isinstance(ty, VectorType) else None
+        return ty.size if isinstance(ty, BlockType) else None
 
     def operand_type(self, operand: SSAOperand) -> Type | None:
         if operand is None:
@@ -88,14 +88,14 @@ class SSAVerifier:
 
         return op.result.ty
 
-    def vector_size(self, index: int, op: SSAOp, *types: Type) -> int | None:
-        sizes = {ty.size for ty in types if isinstance(ty, VectorType)}
+    def block_shape(self, index, op, *types):
+        shapes = {ty.shape for ty in types if isinstance(ty, BlockType)}
 
-        if len(sizes) > 1:
+        if len(shapes) > 1:
             rendered = ", ".join(str(ty) for ty in types)
             self.fail(index, op, f"incompatible shapes: {rendered}")
 
-        return next(iter(sizes), None)
+        return next(iter(shapes), None)
 
     def with_shape(
         self,
@@ -104,8 +104,8 @@ class SSAVerifier:
         element: ScalarType | PointerType,
         *types: Type,
     ) -> Type:
-        size = self.vector_size(index, op, *types)
-        return VectorType(size, element) if size is not None else element
+        size = self.block_shape(index, op, *types)
+        return BlockType(size, element) if size is not None else element
 
     def require_type(self, index: int, op: SSAOp, actual: Type, expected: Type) -> None:
         if actual != expected:
@@ -231,7 +231,7 @@ class SSAVerifier:
 
             shape_operands.append(mask_ty)
 
-        self.vector_size(index, op, *shape_operands)
+        self.block_shape(index, op, *shape_operands)
 
     def check_select(self, index: int, op: SSAOp) -> None:
         condition, true_value, false_value = op.operands
@@ -258,8 +258,8 @@ class SSAVerifier:
         value_ty = self.require_operand_type(index, op, op.operands[0], "value")
         result_ty = self.result_type(index, op)
 
-        if not isinstance(value_ty, VectorType):
-            self.fail(index, op, f"reduction expects vector, got {value_ty}")
+        if not isinstance(value_ty, BlockType) or value_ty.rank != 1:
+            self.fail(index, op, f"reduction expects rank-1 block, got {value_ty}")
 
         if value_ty.size != self.block_size:
             self.fail(
@@ -328,7 +328,7 @@ class SSAVerifier:
                 if width <= 0:
                     self.fail(index, op, f"invalid range [{start}, {end})")
 
-                expected_ty = VectorType(width, I32)
+                expected_ty = BlockType((width,), I32)
                 self.require_type(index, op, self.result_type(index, op), expected_ty)
 
                 if width != self.block_size:

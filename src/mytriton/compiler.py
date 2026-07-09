@@ -19,7 +19,7 @@ from .optim import ConstantFoldPass, CSEPass, DCEPass, PassManager
 from .ssa import SSALowering, SSAOp
 from .ssa_verification import SSAVerifier
 from .trace import (
-    VectorType,
+    BlockType,
     is_constexpr_annotation,
     make_runtime_params,
     trace,
@@ -36,20 +36,20 @@ Backend: TypeAlias = Literal["cuda", "mlir"]
 
 
 def _cuda_threads_per_block(ssa_ops: list[SSAOp]) -> int:
-    vector_widths = {
-        op.result.ty.size
+    block_sizes = {
+        op.result.ty.num_elements
         for op in ssa_ops
-        if op.result is not None and isinstance(op.result.ty, VectorType)
+        if op.result is not None and isinstance(op.result.ty, BlockType)
     }
 
-    if not vector_widths:
+    if not block_sizes:
         return 1
 
-    if len(vector_widths) != 1:
-        rendered = ", ".join(str(width) for width in sorted(vector_widths))
+    if len(block_sizes) != 1:
+        rendered = ", ".join(str(width) for width in sorted(block_sizes))
         raise ValueError(f"CUDA lowering requires one vector width, got: {rendered}")
 
-    threads_per_block = next(iter(vector_widths))
+    threads_per_block = next(iter(block_sizes))
     if not 1 <= threads_per_block <= 1024:
         raise ValueError(
             "CUDA threads per block must be between 1 and 1024, "

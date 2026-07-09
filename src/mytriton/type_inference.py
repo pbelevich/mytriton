@@ -7,6 +7,7 @@ from .trace import (
     AddPtr,
     Arange,
     BinOp,
+    BlockType,
     Const,
     Load,
     Max,
@@ -21,7 +22,6 @@ from .trace import (
     Sum,
     Type,
     UnaryOp,
-    VectorType,
     Where,
 )
 
@@ -33,24 +33,22 @@ class TypeInference:
         self.types: dict[int, Type] = {}
 
     def element_type(self, ty: Type) -> ScalarType | PointerType:
-        return ty.element if isinstance(ty, VectorType) else ty
+        return ty.element if isinstance(ty, BlockType) else ty
 
-    def common_vector_size(self, *types: Type) -> int | None:
-        sizes = {ty.size for ty in types if isinstance(ty, VectorType)}
-
-        if len(sizes) > 1:
+    def common_block_shape(self, *types: Type) -> tuple[int, ...] | None:
+        shapes = {ty.shape for ty in types if isinstance(ty, BlockType)}
+        if len(shapes) > 1:
             rendered = ", ".join(str(ty) for ty in types)
             raise TypeError(f"Cannot broadcast: {rendered}")
-
-        return next(iter(sizes), None)
+        return next(iter(shapes), None)
 
     def with_shape(
         self,
         element: ScalarType | PointerType,
         *types: Type,
     ) -> Type:
-        size = self.common_vector_size(*types)
-        return VectorType(size, element) if size is not None else element
+        shape = self.common_block_shape(*types)
+        return BlockType(shape, element) if shape is not None else element
 
     def promote(self, lhs: Type, rhs: Type) -> ScalarType:
         lhs_element = self.element_type(lhs)
@@ -114,7 +112,7 @@ class TypeInference:
                     f"arange requires end > start, got [{expr.start}, {expr.end})"
                 )
 
-            ty = VectorType(size, I32)
+            ty = BlockType((size,), I32)
 
         elif isinstance(expr, BinOp):
             lhs = self.infer(expr.lhs)
@@ -197,7 +195,7 @@ class TypeInference:
             ty = self.with_shape(element, condition, true_ty, false_ty)
         elif isinstance(expr, (Sum, Max, Min)):
             value_ty = self.infer(expr.value)
-            if not isinstance(value_ty, VectorType):
+            if not isinstance(value_ty, BlockType) or value_ty.rank != 1:
                 raise TypeError(f"{type(expr).__name__} expects vector, got {value_ty}")
             if value_ty.element not in (I32, F32):
                 raise TypeError(f"cannot reduce elements of type {value_ty.element}")
@@ -229,4 +227,4 @@ class TypeInference:
             self.require_mask(mask)
             operands.append(mask)
 
-        self.common_vector_size(*operands)
+        self.common_block_shape(*operands)

@@ -8,7 +8,7 @@ from .mlir_backend import (
     run_pipeline,
 )
 from .ssa import SSAOp, SSAOperand, SSAValue
-from .trace import BOOL, F32, I32, Const, Param, PointerType, Type, VectorType
+from .trace import BOOL, F32, I32, BlockType, Const, Param, PointerType, Type
 
 
 @dataclass(frozen=True)
@@ -26,7 +26,7 @@ class MLIRCodegen:
         self.constants: dict[tuple[object, str], str] = {}
 
     def scalar_type(self, ty: Type) -> Type:
-        return ty.element if isinstance(ty, VectorType) else ty
+        return ty.element if isinstance(ty, BlockType) else ty
 
     def mlir_scalar_type(self, ty: Type) -> str:
         ty = self.scalar_type(ty)

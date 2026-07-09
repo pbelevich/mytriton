@@ -135,15 +135,46 @@ class PointerType:
 
 
 @dataclass(frozen=True)
-class VectorType:
-    size: int
+class BlockType:
+    shape: tuple[int, ...]
     element: ScalarType | PointerType
 
+    def __post_init__(self):
+        if not self.shape:
+            raise TypeError("block shape must not be empty")
+        if any(dim <= 0 for dim in self.shape):
+            raise TypeError(f"block dimensions must be positive, got {self.shape}")
+
+    @property
+    def rank(self) -> int:
+        return len(self.shape)
+
+    @property
+    def num_elements(self) -> int:
+        result = 1
+        for dim in self.shape:
+            result *= dim
+        return result
+
+    @property
+    def size(self) -> int:
+        if self.rank != 1:
+            raise TypeError(f"rank-{self.rank} block has no single size")
+        return self.shape[0]
+
     def __str__(self):
-        return f"vector<{self.size} x {self.element}>"
+        if self.rank == 1:
+            return f"vector<{self.shape[0]} x {self.element}>"
+
+        shape = "x".join(str(dim) for dim in self.shape)
+        return f"block<{shape} x {self.element}>"
 
 
-Type = ScalarType | PointerType | VectorType
+def VectorType(size: int, element: ScalarType | PointerType) -> BlockType:
+    return BlockType((size,), element)
+
+
+Type = ScalarType | PointerType | BlockType
 
 
 I32 = ScalarType("i32")

@@ -7,12 +7,12 @@ from .trace import (
     BOOL,
     F32,
     I32,
+    BlockType,
     Const,
     Param,
     PointerType,
     ScalarType,
     Type,
-    VectorType,
 )
 
 
@@ -37,7 +37,7 @@ class SSACUDACodegen:
         self.shared_lines: list[str] = []
 
     def cuda_type(self, ty: Type) -> str:
-        if isinstance(ty, VectorType):
+        if isinstance(ty, BlockType):
             ty = ty.element
 
         if ty == I32:
@@ -104,7 +104,7 @@ class SSACUDACodegen:
         self.values[result.id] = name
 
     def scalar_type(self, ty: Type) -> ScalarType | PointerType:
-        return ty.element if isinstance(ty, VectorType) else ty
+        return ty.element if isinstance(ty, BlockType) else ty
 
     def reduction_update(
         self,
@@ -144,7 +144,7 @@ class SSACUDACodegen:
             raise TypeError(f"{op.opcode} requires a result")
 
         input_ty = operand.ty
-        if not isinstance(input_ty, VectorType):
+        if not isinstance(input_ty, BlockType) or input_ty.rank != 1:
             raise TypeError(f"{op.opcode} expects a vector input, got {input_ty}")
 
         value = self.expression_operand(operand)
