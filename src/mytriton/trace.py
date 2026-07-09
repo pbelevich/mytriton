@@ -272,6 +272,12 @@ class Min:
     value: Any
 
 
+@dataclass
+class ExpandDims:
+    value: Any
+    axis: int
+
+
 # ----------------------------
 # Symbolic values
 # ----------------------------
@@ -323,6 +329,23 @@ class Value:
 
     def __bool__(self) -> bool:
         raise TypeError("Python control flow over symbolic values is not supported")
+
+    def __getitem__(self, index) -> Value:
+        if index == (slice(None), None):
+            return Value(ExpandDims(self.expr, axis=1))
+
+        if index == (None, slice(None)):
+            return Value(ExpandDims(self.expr, axis=0))
+
+        raise TypeError(
+            "only x[:, None] and x[None, :] are supported for symbolic values"
+        )
+
+    def __and__(self, other: Value | bool) -> Value:
+        return Value(BinOp("&", self.expr, unwrap(other)))
+
+    def __rand__(self, other: Value | bool) -> Value:
+        return Value(BinOp("&", unwrap(other), self.expr))
 
     def __repr__(self) -> str:
         return f"Value({self.expr})"

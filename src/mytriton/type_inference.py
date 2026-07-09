@@ -9,6 +9,7 @@ from .trace import (
     BinOp,
     BlockType,
     Const,
+    ExpandDims,
     Load,
     Max,
     Maximum,
@@ -42,13 +43,26 @@ class TypeInference:
             raise TypeError(f"Cannot broadcast: {rendered}")
         return next(iter(shapes), None)
 
+    def broadcast_shapes(self, *shapes: tuple[int, ...]) -> tuple[int, ...]:
+        max_rank = max(len(shape) for shape in shapes)
+        padded = [(1,) * (max_rank - len(shape)) + shape for shape in shapes]
+        dims = []
+        for dim_values in zip(*padded, strict=True):
+            non_ones = {dim for dim in dim_values if dim != 1}
+            if len(non_ones) > 1:
+                raise TypeError(f"Cannot broadcast shapes: {shapes}")
+            dims.append(next(iter(non_ones), 1))
+        return tuple(dims)
+
     def with_shape(
         self,
         element: ScalarType | PointerType,
         *types: Type,
     ) -> Type:
-        shape = self.common_block_shape(*types)
-        return BlockType(shape, element) if shape is not None else element
+        shapes = [ty.shape for ty in types if isinstance(ty, BlockType)]
+        if not shapes:
+            return element
+        return BlockType(self.broadcast_shapes(*shapes), element)
 
     def promote(self, lhs: Type, rhs: Type) -> ScalarType:
         lhs_element = self.element_type(lhs)
@@ -120,6 +134,11 @@ class TypeInference:
 
             if expr.op == "<":
                 self.promote(lhs, rhs)
+                ty = self.with_shape(BOOL, lhs, rhs)
+
+            elif expr.op == "&":
+                if self.element_type(lhs) != BOOL or self.element_type(rhs) != BOOL:
+                    raise TypeError(f"& expects bool operands, got {lhs} and {rhs}")
                 ty = self.with_shape(BOOL, lhs, rhs)
 
             elif expr.op in self.ARITHMETIC_OPS:
@@ -200,6 +219,15 @@ class TypeInference:
             if value_ty.element not in (I32, F32):
                 raise TypeError(f"cannot reduce elements of type {value_ty.element}")
             ty = value_ty.element
+        elif isinstance(expr, ExpandDims):
+            value_ty = self.infer(expr.value)
+            if not isinstance(value_ty, BlockType):
+                raise TypeError(f"expand_dims expects block, got {value_ty}")
+            axis = expr.axis
+            if axis < 0 or axis > value_ty.rank:
+                raise TypeError(f"invalid expand_dims axis {axis} for {value_ty}")
+            shape = (*value_ty.shape[:axis], 1, *value_ty.shape[axis:])
+            ty = BlockType(shape, value_ty.element)
         else:
             raise TypeError(f"Cannot infer type of {expr}")
 
