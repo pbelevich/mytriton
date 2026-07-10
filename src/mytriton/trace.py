@@ -328,7 +328,10 @@ class Value:
         return Value(UnaryOp("neg", self.expr))
 
     def __bool__(self) -> bool:
-        raise TypeError("Python control flow over symbolic values is not supported")
+        raise TypeError(
+            "Python control flow over symbolic values is not supported; "
+            "when combining comparisons with &, wrap each comparison in parentheses"
+        )
 
     def __getitem__(self, index) -> Value:
         if index == (slice(None), None):

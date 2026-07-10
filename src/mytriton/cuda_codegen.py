@@ -98,6 +98,15 @@ class SSACUDACodegen:
 
     def expression_operand(self, operand: SSAOperand) -> str:
         value = self.operand(operand)
+        if (
+            isinstance(value, CudaArangeRef)
+            and self.is_rank2_kernel()
+            and value.width == self.threads_in_kernel_block()
+        ):
+            return (
+                "threadIdx.x" if value.start == 0 else f"({value.start} + threadIdx.x)"
+            )
+
         if not isinstance(value, str):
             raise TypeError(f"Expected CUDA scalar expression, got {value}")
         return value
@@ -257,9 +266,7 @@ class SSACUDACodegen:
             if not isinstance(start, int) or not isinstance(end, int):
                 raise TypeError(f"arange expects integer start/end, got {start}, {end}")
 
-            width = end - start
-
-            if self.is_rank2_kernel() and width != self.threads_in_kernel_block():
+            if self.is_rank2_kernel():
                 self.values[result.id] = CudaArangeRef(start=start, end=end)
             else:
                 expression = "threadIdx.x" if start == 0 else f"({start} + threadIdx.x)"

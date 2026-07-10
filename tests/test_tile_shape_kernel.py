@@ -74,6 +74,24 @@ def matrix_add_2d_kernel(x, y, out, M, N, BM: tl.constexpr, BN: tl.constexpr):
     tl.store(out + offsets, lhs + rhs, mask=mask)
 
 
+@triton.jit
+def invalid_unparenthesized_mask_kernel(
+    x,
+    out,
+    M,
+    N,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+):
+    offs_m = tl.arange(0, BM)[:, None]
+    offs_n = tl.arange(0, BN)[None, :]
+
+    mask = offs_m < M & offs_n < N
+    offsets = offs_m * N + offs_n
+
+    tl.store(out + offsets, tl.load(x + offsets, mask=mask, other=0.0), mask=mask)
+
+
 @pytest.mark.codegen
 def test_matrix_add_2d_generates_rank2_cuda_source_without_execution(monkeypatch):
     monkeypatch.setenv("MYTRITON_BACKEND", "cuda")
@@ -149,6 +167,50 @@ def test_matrix_add_2d_generates_rank2_cuda_source_without_execution(monkeypatch
     ).rstrip("\n")
 
     assert cuda_src == expected_cuda_src
+
+
+@pytest.mark.codegen
+@pytest.mark.parametrize(("BM", "BN"), [(1, 8), (4, 1)])
+def test_matrix_add_2d_generates_cuda_for_degenerate_rank2_tiles(
+    monkeypatch,
+    BM,
+    BN,
+):
+    monkeypatch.setenv("MYTRITON_BACKEND", "cuda")
+
+    M, N = 3, 7
+    x = np.zeros((M * N,), dtype=np.float32)
+    y = np.zeros((M * N,), dtype=np.float32)
+    out = np.zeros((M * N,), dtype=np.float32)
+
+    matrix_add_2d_kernel.clear_cache()
+    _, _, cuda_src = matrix_add_2d_kernel[
+        lambda meta: (
+            triton.cdiv(M, meta["BM"]),
+            triton.cdiv(N, meta["BN"]),
+        )
+    ](x, y, out, M, N, BM=BM, BN=BN)
+
+    assert f"int tile_i = threadIdx.x / {BN};" in cuda_src
+    assert f"int tile_j = threadIdx.x % {BN};" in cuda_src
+    assert "float v16 = (v15 ? x[v11] : 0.0f);" in cuda_src
+
+
+def test_unparenthesized_mask_error_mentions_parentheses():
+    M, N = 3, 7
+    x = np.zeros((M * N,), dtype=np.float32)
+    out = np.zeros((M * N,), dtype=np.float32)
+
+    invalid_unparenthesized_mask_kernel.clear_cache()
+    with pytest.raises(TypeError, match="wrap each comparison in parentheses"):
+        invalid_unparenthesized_mask_kernel[(1, 1)](
+            x,
+            out,
+            M,
+            N,
+            BM=4,
+            BN=8,
+        )
 
 
 def test_matrix_add_2d_executes_with_cupy_when_cuda_is_available():
