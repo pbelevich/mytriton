@@ -252,6 +252,13 @@ class MLIRCodegen:
         self.values = {}
         self.constants = {}
 
+        for op in ssa_ops:
+            if op.result is None:
+                continue
+            ty = op.result.ty
+            if isinstance(ty, BlockType) and ty.rank != 1:
+                raise TypeError(f"MLIR MVP supports only rank-1 blocks, got {ty}")
+
         args = [f"%{param.name}: {self.mlir_param_type(param.ty)}" for param in params]
 
         self.lines.extend(

@@ -1,5 +1,7 @@
 .PHONY: check format lint test
 
+all: format lint test
+
 format:
 	python -m ruff check --fix .
 	python -m ruff format .
@@ -10,7 +12,7 @@ lint:
 	python -m mypy
 
 test:
-	python -m pytest
+	python -m pytest -v -s
 
 check: lint test
 

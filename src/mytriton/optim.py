@@ -187,6 +187,8 @@ class CSEPass:
         "minimum",
         "addptr",
         "select",
+        "and",
+        "expand_dims",
     }
 
     def operand_key(self, operand):

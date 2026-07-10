@@ -5,6 +5,7 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import Any, Generic, Literal, ParamSpec, TypeAlias, cast
 
+from .block_shapes import cuda_threads_per_block
 from .cuda_codegen import SSACUDACodegen
 from .cuda_utils import (
     CudaKernelCache,
@@ -19,7 +20,6 @@ from .optim import ConstantFoldPass, CSEPass, DCEPass, PassManager
 from .ssa import SSALowering, SSAOp
 from .ssa_verification import SSAVerifier
 from .trace import (
-    BlockType,
     is_constexpr_annotation,
     make_runtime_params,
     trace,
@@ -33,30 +33,6 @@ CompilationResult: TypeAlias = tuple[list[Any], list[SSAOp], str]
 
 
 Backend: TypeAlias = Literal["cuda", "mlir"]
-
-
-def _cuda_threads_per_block(ssa_ops: list[SSAOp]) -> int:
-    block_sizes = {
-        op.result.ty.num_elements
-        for op in ssa_ops
-        if op.result is not None and isinstance(op.result.ty, BlockType)
-    }
-
-    if not block_sizes:
-        return 1
-
-    if len(block_sizes) != 1:
-        rendered = ", ".join(str(width) for width in sorted(block_sizes))
-        raise ValueError(f"CUDA lowering requires one vector width, got: {rendered}")
-
-    threads_per_block = next(iter(block_sizes))
-    if not 1 <= threads_per_block <= 1024:
-        raise ValueError(
-            "CUDA threads per block must be between 1 and 1024, "
-            f"got {threads_per_block}"
-        )
-
-    return threads_per_block
 
 
 def _constexpr_key(
@@ -162,7 +138,7 @@ class CompiledKernel(Generic[P]):
                     runtime_params=params,
                 )
                 ssa_ops = SSALowering().lower(ops)
-                threads_per_block = _cuda_threads_per_block(ssa_ops)
+                threads_per_block = cuda_threads_per_block(ssa_ops)
 
                 # The optimizer assumes lowering produced valid SSA.
                 verifier = SSAVerifier(threads_per_block)
@@ -181,7 +157,7 @@ class CompiledKernel(Generic[P]):
 
                 # Recompute after optimization: DCE/CSE may remove the vector
                 # ops that originally determined the CUDA block size.
-                threads_per_block = _cuda_threads_per_block(ssa_ops)
+                threads_per_block = cuda_threads_per_block(ssa_ops)
                 SSAVerifier(threads_per_block).verify(ssa_ops)
 
                 cubin = None

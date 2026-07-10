@@ -1,5 +1,6 @@
 from typing import ClassVar
 
+from .block_shapes import broadcast_shapes
 from .trace import (
     BOOL,
     F32,
@@ -36,24 +37,6 @@ class TypeInference:
     def element_type(self, ty: Type) -> ScalarType | PointerType:
         return ty.element if isinstance(ty, BlockType) else ty
 
-    def common_block_shape(self, *types: Type) -> tuple[int, ...] | None:
-        shapes = {ty.shape for ty in types if isinstance(ty, BlockType)}
-        if len(shapes) > 1:
-            rendered = ", ".join(str(ty) for ty in types)
-            raise TypeError(f"Cannot broadcast: {rendered}")
-        return next(iter(shapes), None)
-
-    def broadcast_shapes(self, *shapes: tuple[int, ...]) -> tuple[int, ...]:
-        max_rank = max(len(shape) for shape in shapes)
-        padded = [(1,) * (max_rank - len(shape)) + shape for shape in shapes]
-        dims = []
-        for dim_values in zip(*padded, strict=True):
-            non_ones = {dim for dim in dim_values if dim != 1}
-            if len(non_ones) > 1:
-                raise TypeError(f"Cannot broadcast shapes: {shapes}")
-            dims.append(next(iter(non_ones), 1))
-        return tuple(dims)
-
     def with_shape(
         self,
         element: ScalarType | PointerType,
@@ -62,7 +45,12 @@ class TypeInference:
         shapes = [ty.shape for ty in types if isinstance(ty, BlockType)]
         if not shapes:
             return element
-        return BlockType(self.broadcast_shapes(*shapes), element)
+        try:
+            shape = broadcast_shapes(*shapes)
+        except ValueError as error:
+            raise TypeError(f"Cannot broadcast shapes: {shapes}") from error
+
+        return BlockType(shape, element)
 
     def promote(self, lhs: Type, rhs: Type) -> ScalarType:
         lhs_element = self.element_type(lhs)
@@ -255,4 +243,4 @@ class TypeInference:
             self.require_mask(mask)
             operands.append(mask)
 
-        self.common_block_shape(*operands)
+        self.with_shape(ptr_element.element, *operands)

@@ -1,5 +1,6 @@
 from typing import ClassVar, NoReturn
 
+from .block_shapes import broadcast_shapes
 from .ssa import SSAOp, SSAOperand, SSAValue
 from .trace import (
     BOOL,
@@ -54,22 +55,6 @@ class SSAVerifier:
     def width(self, ty: Type) -> int | None:
         return ty.size if isinstance(ty, BlockType) else None
 
-    def broadcast_shapes(self, index: int, op: SSAOp, *shapes: tuple[int, ...]):
-        max_rank = max(len(shape) for shape in shapes)
-        padded = [(1,) * (max_rank - len(shape)) + shape for shape in shapes]
-        dims = []
-
-        for dim_values in zip(*padded, strict=True):
-            non_ones = {dim for dim in dim_values if dim != 1}
-            if len(non_ones) > 1:
-                rendered = ", ".join(
-                    "x".join(str(dim) for dim in shape) for shape in shapes
-                )
-                self.fail(index, op, f"cannot broadcast shapes: {rendered}")
-            dims.append(next(iter(non_ones), 1))
-
-        return tuple(dims)
-
     def operand_type(self, operand: SSAOperand) -> Type | None:
         if operand is None:
             return None
@@ -112,7 +97,10 @@ class SSAVerifier:
         if not shapes:
             return None
 
-        return self.broadcast_shapes(index, op, *shapes)
+        try:
+            return broadcast_shapes(*shapes)
+        except ValueError as error:
+            self.fail(index, op, str(error))
 
     def with_shape(
         self,
