@@ -232,7 +232,7 @@ class CSEPass:
 
 
 class DCEPass:
-    SIDE_EFFECTS: ClassVar[set[str]] = {"store"}
+    SIDE_EFFECTS: ClassVar[set[str]] = {"store", "barrier"}
 
     def run(self, ops):
         live = set()

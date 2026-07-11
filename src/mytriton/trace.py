@@ -18,97 +18,6 @@ else:
         pass
 
 
-def is_constexpr_annotation(annotation: object) -> bool:
-    if annotation is constexpr:
-        return True
-
-    return get_origin(annotation) is Annotated and constexpr in get_args(annotation)[1:]
-
-
-def program_id(axis: int) -> Value:
-    return Value(ProgramId(axis))
-
-
-def arange(start: int, end: int) -> Value:
-    return Value(Arange(start, end))
-
-
-def load(
-    ptr: Ptr,
-    mask: Value | bool | None = None,
-    other: Value | int | float | None = None,
-) -> Value:
-    node = Load(
-        ptr=unwrap(ptr),
-        mask=unwrap(mask) if mask is not None else None,
-        other=unwrap(other) if other is not None else None,
-    )
-    return Value(node)
-
-
-def store(
-    ptr: Ptr,
-    value: Value | int | float,
-    mask: Value | bool | None = None,
-) -> None:
-    node = Store(
-        ptr=unwrap(ptr),
-        value=unwrap(value),
-        mask=unwrap(mask) if mask is not None else None,
-    )
-    Builder.current().ops.append(node)
-
-
-def maximum(lhs: Value | int | float, rhs: Value | int | float) -> Value:
-    return Value(Maximum(unwrap(lhs), unwrap(rhs)))
-
-
-def minimum(lhs: Value | int | float, rhs: Value | int | float) -> Value:
-    return Value(Minimum(unwrap(lhs), unwrap(rhs)))
-
-
-def exp(value: Value | float) -> Value:
-    return Value(UnaryOp("exp", unwrap(value)))
-
-
-def where(
-    condition: Value | bool,
-    true_value: Value | int | float,
-    false_value: Value | int | float,
-) -> Value:
-    return Value(Where(unwrap(condition), unwrap(true_value), unwrap(false_value)))
-
-
-def sum(value: Value) -> Value:
-    return Value(Sum(unwrap(value)))
-
-
-def max(value: Value) -> Value:
-    return Value(Max(unwrap(value)))
-
-
-def min(value: Value) -> Value:
-    return Value(Min(unwrap(value)))
-
-
-def static_range(start: int, stop: int | None = None, step: int = 1) -> range:
-    if stop is None:
-        start, stop = 0, start
-
-    for name, value in (
-        ("start", start),
-        ("stop", stop),
-        ("step", step),
-    ):
-        if not isinstance(value, int):
-            raise ValueError(
-                f"static_range {name} must be compile-time int, "
-                f"got {type(value).__name__}"
-            )
-
-    return range(start, stop, step)
-
-
 # ----------------------------
 # Types
 # ----------------------------
@@ -182,6 +91,130 @@ F32 = ScalarType("f32")
 BOOL = ScalarType("bool")
 PTR_F32 = PointerType(F32)
 
+float32 = F32
+
+
+def is_constexpr_annotation(annotation: object) -> bool:
+    if annotation is constexpr:
+        return True
+
+    return get_origin(annotation) is Annotated and constexpr in get_args(annotation)[1:]
+
+
+def program_id(axis: int) -> Value:
+    return Value(ProgramId(axis))
+
+
+def arange(start: int, end: int) -> Value:
+    return Value(Arange(start, end))
+
+
+def load(
+    ptr: Ptr,
+    mask: Value | bool | None = None,
+    other: Value | int | float | None = None,
+) -> Value:
+    node = Load(
+        ptr=unwrap(ptr),
+        mask=unwrap(mask) if mask is not None else None,
+        other=unwrap(other) if other is not None else None,
+    )
+    return Value(node)
+
+
+def store(
+    ptr: Ptr,
+    value: Value | int | float,
+    mask: Value | bool | None = None,
+) -> None:
+    node = Store(
+        ptr=unwrap(ptr),
+        value=unwrap(value),
+        mask=unwrap(mask) if mask is not None else None,
+    )
+    Builder.current().ops.append(node)
+
+
+def _shared_array(shape: ShapeArg, dtype: ScalarType = F32) -> Ptr:
+    if dtype != F32:
+        raise TypeError(f"_shared_array MVP supports only float32, got {dtype}")
+
+    return Ptr(SharedAlloc(_normalize_shape(shape), dtype))
+
+
+def _barrier() -> None:
+    Builder.current().ops.append(Barrier())
+
+
+def maximum(lhs: Value | int | float, rhs: Value | int | float) -> Value:
+    return Value(Maximum(unwrap(lhs), unwrap(rhs)))
+
+
+def minimum(lhs: Value | int | float, rhs: Value | int | float) -> Value:
+    return Value(Minimum(unwrap(lhs), unwrap(rhs)))
+
+
+def exp(value: Value | float) -> Value:
+    return Value(UnaryOp("exp", unwrap(value)))
+
+
+def where(
+    condition: Value | bool,
+    true_value: Value | int | float,
+    false_value: Value | int | float,
+) -> Value:
+    return Value(Where(unwrap(condition), unwrap(true_value), unwrap(false_value)))
+
+
+def sum(value: Value) -> Value:
+    return Value(Sum(unwrap(value)))
+
+
+def max(value: Value) -> Value:
+    return Value(Max(unwrap(value)))
+
+
+def min(value: Value) -> Value:
+    return Value(Min(unwrap(value)))
+
+
+def static_range(start: int, stop: int | None = None, step: int = 1) -> range:
+    if stop is None:
+        start, stop = 0, start
+
+    for name, value in (
+        ("start", start),
+        ("stop", stop),
+        ("step", step),
+    ):
+        if not isinstance(value, int):
+            raise ValueError(
+                f"static_range {name} must be compile-time int, "
+                f"got {type(value).__name__}"
+            )
+
+    return range(start, stop, step)
+
+
+ShapeArg: TypeAlias = int | tuple[int, ...]
+
+
+def _normalize_shape(shape: ShapeArg) -> tuple[int, ...]:
+    if isinstance(shape, int):
+        shape = (shape,)
+
+    if not isinstance(shape, tuple) or not shape:
+        raise TypeError(
+            f"_shared_array shape must be int or non-empty tuple, got {shape!r}"
+        )
+
+    if any(type(dim) is not int or dim <= 0 for dim in shape):
+        raise TypeError(
+            f"_shared_array dimensions must be positive ints, got {shape!r}"
+        )
+
+    return shape
+
 
 @dataclass
 class Const:
@@ -203,6 +236,17 @@ class ProgramId:
 class Arange:
     start: int
     end: int
+
+
+@dataclass
+class SharedAlloc:
+    shape: tuple[int, ...]
+    dtype: ScalarType
+
+
+@dataclass
+class Barrier:
+    pass
 
 
 @dataclass

@@ -20,6 +20,7 @@ from .trace import (
     PointerType,
     ProgramId,
     ScalarType,
+    SharedAlloc,
     Store,
     Sum,
     Type,
@@ -135,6 +136,14 @@ class TypeInference:
 
             else:
                 raise TypeError(f"Unsupported binary operator: {expr.op!r}")
+
+        elif isinstance(expr, SharedAlloc):
+            if expr.dtype != F32:
+                raise TypeError(
+                    f"shared memory MVP supports only f32, got {expr.dtype}"
+                )
+
+            ty = PointerType(expr.dtype, address_space="shared")
 
         elif isinstance(expr, AddPtr):
             base = self.infer(expr.base)

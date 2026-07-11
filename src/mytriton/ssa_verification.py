@@ -41,6 +41,8 @@ class SSAVerifier:
         "min": 1,
         "expand_dims": 1,
         "and": 2,
+        "shared_alloc": 0,
+        "barrier": 0,
     }
 
     def __init__(self, block_size: int) -> None:
@@ -313,7 +315,7 @@ class SSAVerifier:
                     f"expected {expected_arity} operands, got {len(op.operands)}",
                 )
 
-            should_have_result = op.opcode != "store"
+            should_have_result = op.opcode not in {"store", "barrier"}
 
             if should_have_result != (op.result is not None):
                 self.fail(index, op, "invalid result declaration")
@@ -344,8 +346,10 @@ class SSAVerifier:
                 if width <= 0:
                     self.fail(index, op, f"invalid range [{start}, {end})")
 
-                expected_ty = BlockType((width,), I32)
-                self.require_type(index, op, self.result_type(index, op), expected_ty)
+                arange_expected_ty = BlockType((width,), I32)
+                self.require_type(
+                    index, op, self.result_type(index, op), arange_expected_ty
+                )
 
                 if width > self.block_size:
                     self.fail(
@@ -354,6 +358,26 @@ class SSAVerifier:
                         f"range width {width} does not match "
                         f"CUDA block size {self.block_size}",
                     )
+
+            elif op.opcode == "shared_alloc":
+                result_ty = self.result_type(index, op)
+                shape = op.attrs.get("shape")
+                dtype = op.attrs.get("dtype")
+
+                if (
+                    not isinstance(shape, tuple)
+                    or not shape
+                    or any(type(dim) is not int or dim <= 0 for dim in shape)
+                ):
+                    self.fail(index, op, f"invalid shared allocation shape {shape!r}")
+
+                if dtype != F32:
+                    self.fail(
+                        index, op, f"shared memory MVP supports only f32, got {dtype}"
+                    )
+
+                shared_expected_ty = PointerType(F32, address_space="shared")
+                self.require_type(index, op, result_ty, shared_expected_ty)
 
             elif op.opcode in ("add", "sub", "mul", "div", "cmp_lt") or op.opcode in (
                 "maximum",
@@ -373,6 +397,10 @@ class SSAVerifier:
             elif op.opcode == "store":
                 self.check_store(index, op)
 
+            elif op.opcode == "barrier":
+                if op.attrs:
+                    self.fail(index, op, "barrier must not have attrs")
+
             elif op.opcode == "select":
                 self.check_select(index, op)
 
@@ -390,11 +418,11 @@ class SSAVerifier:
                 if type(axis) is not int or axis < 0 or axis > value_ty.rank:
                     self.fail(index, op, f"invalid axis {axis}")
 
-                expected = BlockType(
+                expand_expected_ty = BlockType(
                     (*value_ty.shape[:axis], 1, *value_ty.shape[axis:]),
                     value_ty.element,
                 )
-                self.require_type(index, op, result_ty, expected)
+                self.require_type(index, op, result_ty, expand_expected_ty)
 
             elif op.opcode == "and":
                 self.check_binary_bool(index, op)

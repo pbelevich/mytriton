@@ -242,6 +242,8 @@ class MLIRCodegen:
             self.emit_load(op)
         elif op.opcode == "store":
             self.emit_store(op)
+        elif op.opcode in {"shared_alloc", "barrier"}:
+            raise TypeError(f"MLIR MVP does not support {op.opcode!r}")
         else:
             raise TypeError(f"MLIR MVP does not support {op.opcode!r}")
 

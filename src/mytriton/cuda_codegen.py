@@ -227,6 +227,9 @@ class SSACUDACodegen:
         self.assign(result, f"{shared}[0]")
 
     def emit(self, op: SSAOp) -> None:
+        if op.opcode == "barrier":
+            self.lines.append("    __syncthreads();")
+            return
         if op.opcode == "store":
             ptr = self.pointer_operand(op.operands[0])
             value = self.expression_operand(op.operands[1])
@@ -259,6 +262,24 @@ class SSACUDACodegen:
 
             component = ("x", "y", "z")[axis]
             self.assign(result, f"blockIdx.{component}")
+        elif op.opcode == "shared_alloc":
+            shape = op.attrs["shape"]
+
+            if not isinstance(shape, tuple):
+                raise TypeError(f"shared_alloc shape must be tuple, got {shape!r}")
+
+            ptr_ty = result.ty
+            if not isinstance(ptr_ty, PointerType) or ptr_ty.address_space != "shared":
+                raise TypeError(
+                    f"shared_alloc result must be shared pointer, got {ptr_ty}"
+                )
+
+            cuda_ty = self.cuda_type(ptr_ty.element)
+            name = f"smem{result.id}"
+            size = prod(shape)
+
+            self.shared_lines.append(f"    __shared__ {cuda_ty} {name}[{size}];")
+            self.values[result.id] = CudaPtrRef(name, "0")
         elif op.opcode == "arange":
             start = op.attrs["start"]
             end = op.attrs["end"]

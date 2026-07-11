@@ -1,7 +1,10 @@
 from .trace import (
+    _barrier,
+    _shared_array,
     arange,
     constexpr,
     exp,
+    float32,
     load,
     max,
     maximum,
@@ -15,9 +18,12 @@ from .trace import (
 )
 
 __all__ = [
+    "_barrier",
+    "_shared_array",
     "arange",
     "constexpr",
     "exp",
+    "float32",
     "load",
     "max",
     "maximum",

@@ -4,6 +4,7 @@ from typing import ClassVar
 from .trace import (
     AddPtr,
     Arange,
+    Barrier,
     BinOp,
     Const,
     ExpandDims,
@@ -14,6 +15,7 @@ from .trace import (
     Minimum,
     Param,
     ProgramId,
+    SharedAlloc,
     Store,
     Sum,
     Type,
@@ -129,6 +131,16 @@ class SSALowering:
                 operands=(ptr, mask, other),
             )
 
+        if isinstance(expr, SharedAlloc):
+            return self.emit(
+                "shared_alloc",
+                expr,
+                attrs={
+                    "shape": expr.shape,
+                    "dtype": expr.dtype,
+                },
+            )
+
         if isinstance(expr, AddPtr):
             base = self.lower_expr(expr.base)
             offset = self.lower_expr(expr.offset)
@@ -222,6 +234,10 @@ class SSALowering:
                         operands=(ptr, value, mask),
                     )
                 )
+                continue
+
+            if isinstance(op, Barrier):
+                self.ops.append(SSAOp(opcode="barrier"))
                 continue
 
             raise TypeError(f"Cannot lower operation: {op}")
