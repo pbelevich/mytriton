@@ -119,6 +119,7 @@ def load(
         mask=unwrap(mask) if mask is not None else None,
         other=unwrap(other) if other is not None else None,
     )
+    Builder.current().ops.append(node)
     return Value(node)
 
 

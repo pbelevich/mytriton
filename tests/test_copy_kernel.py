@@ -58,17 +58,19 @@ def test_copy_kernel_codegen(backend):
         rhs=Arange(start=0, end=256),
     )
     mask = BinOp(op="<", lhs=offsets, rhs=n_param)
+    value = Load(
+        ptr=AddPtr(base=Param(name="x", ty=f32_ptr), offset=offsets),
+        mask=mask,
+        other=Const(value=0.0),
+    )
 
     assert ops == [
+        value,
         Store(
             ptr=AddPtr(base=Param(name="out", ty=f32_ptr), offset=offsets),
-            value=Load(
-                ptr=AddPtr(base=Param(name="x", ty=f32_ptr), offset=offsets),
-                mask=mask,
-                other=Const(value=0.0),
-            ),
+            value=value,
             mask=mask,
-        )
+        ),
     ]
 
     assert SSAPrinter().print_ops(ssa_ops) == dedent(

@@ -129,11 +129,14 @@ def test_long_row_sum_kernel_trace():
     partial8 = BinOp(op="+", lhs=partial4, rhs=values8)
 
     expected_ops = [
+        values0,
+        values4,
+        values8,
         Store(
             ptr=AddPtr(base=out_param, offset=row),
             value=Sum(value=partial8),
             mask=BinOp(op="<", lhs=lanes, rhs=Const(value=1)),
-        )
+        ),
     ]
 
     assert ops == expected_ops
@@ -173,17 +176,17 @@ def test_long_row_sum_kernel_lowering():
         %5 = addptr %2, %4 : vector<4 x ptr<f32>>
         %6 = cmp_lt %4, 10 : vector<4 x bool>
         %7 = load %5, %6, 0.0 : vector<4 x f32>
-        %8 = add 0.0, %7 : vector<4 x f32>
-        %10 = add 4, %3 : vector<4 x i32>
-        %11 = addptr %2, %10 : vector<4 x ptr<f32>>
-        %12 = cmp_lt %10, 10 : vector<4 x bool>
-        %13 = load %11, %12, 0.0 : vector<4 x f32>
-        %14 = add %8, %13 : vector<4 x f32>
-        %16 = add 8, %3 : vector<4 x i32>
-        %17 = addptr %2, %16 : vector<4 x ptr<f32>>
-        %18 = cmp_lt %16, 10 : vector<4 x bool>
-        %19 = load %17, %18, 0.0 : vector<4 x f32>
-        %20 = add %14, %19 : vector<4 x f32>
+        %9 = add 4, %3 : vector<4 x i32>
+        %10 = addptr %2, %9 : vector<4 x ptr<f32>>
+        %11 = cmp_lt %9, 10 : vector<4 x bool>
+        %12 = load %10, %11, 0.0 : vector<4 x f32>
+        %14 = add 8, %3 : vector<4 x i32>
+        %15 = addptr %2, %14 : vector<4 x ptr<f32>>
+        %16 = cmp_lt %14, 10 : vector<4 x bool>
+        %17 = load %15, %16, 0.0 : vector<4 x f32>
+        %18 = add 0.0, %7 : vector<4 x f32>
+        %19 = add %18, %12 : vector<4 x f32>
+        %20 = add %19, %17 : vector<4 x f32>
         %21 = sum %20 : f32
         %22 = addptr out, %0 : ptr<f32>
         %23 = cmp_lt %3, 1 : vector<4 x bool>
@@ -203,15 +206,15 @@ def test_long_row_sum_kernel_lowering():
             int v4 = (0 + v3);
             bool v6 = (v4 < 10);
             float v7 = (v6 ? x[(v1 + v4)] : 0.0f);
-            float v8 = (0.0f + v7);
-            int v10 = (4 + v3);
-            bool v12 = (v10 < 10);
-            float v13 = (v12 ? x[(v1 + v10)] : 0.0f);
-            float v14 = (v8 + v13);
-            int v16 = (8 + v3);
-            bool v18 = (v16 < 10);
-            float v19 = (v18 ? x[(v1 + v16)] : 0.0f);
-            float v20 = (v14 + v19);
+            int v9 = (4 + v3);
+            bool v11 = (v9 < 10);
+            float v12 = (v11 ? x[(v1 + v9)] : 0.0f);
+            int v14 = (8 + v3);
+            bool v16 = (v14 < 10);
+            float v17 = (v16 ? x[(v1 + v14)] : 0.0f);
+            float v18 = (0.0f + v7);
+            float v19 = (v18 + v12);
+            float v20 = (v19 + v17);
             reduce_smem_21[threadIdx.x] = v20;
             __syncthreads();
             for (int stride_21 = 2; stride_21 > 0; stride_21 >>= 1) {

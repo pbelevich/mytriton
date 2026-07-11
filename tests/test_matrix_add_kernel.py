@@ -82,25 +82,29 @@ def test_matrix_add_kernel():
         rhs=cols_expr,
     )
     mask = BinOp(op="<", lhs=cols_expr, rhs=n_cols_param)
+    lhs = Load(
+        ptr=AddPtr(base=x_param, offset=offsets),
+        mask=mask,
+        other=Const(value=0.0),
+    )
+    rhs = Load(
+        ptr=AddPtr(base=y_param, offset=offsets),
+        mask=mask,
+        other=Const(value=0.0),
+    )
 
     expected_ops = [
+        lhs,
+        rhs,
         Store(
             ptr=AddPtr(base=out_param, offset=offsets),
             value=BinOp(
                 op="+",
-                lhs=Load(
-                    ptr=AddPtr(base=x_param, offset=offsets),
-                    mask=mask,
-                    other=Const(value=0.0),
-                ),
-                rhs=Load(
-                    ptr=AddPtr(base=y_param, offset=offsets),
-                    mask=mask,
-                    other=Const(value=0.0),
-                ),
+                lhs=lhs,
+                rhs=rhs,
             ),
             mask=mask,
-        )
+        ),
     ]
 
     assert ops == expected_ops

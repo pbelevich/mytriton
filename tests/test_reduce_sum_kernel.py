@@ -108,11 +108,12 @@ def test_reduce_sum_kernel_trace():
     )
 
     expected_ops = [
+        values,
         Store(
             ptr=AddPtr(base=out_param, offset=row),
             value=Sum(value=values),
             mask=BinOp(op="<", lhs=cols_expr, rhs=Const(value=1)),
-        )
+        ),
     ]
 
     assert ops == expected_ops

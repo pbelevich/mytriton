@@ -130,31 +130,33 @@ def test_naive_matmul_kernel_trace():
         offset=BinOp(op="*", lhs=row, rhs=Const(value=3)),
     )
 
-    def dot_term(k: int) -> BinOp:
-        return BinOp(
-            op="*",
-            lhs=Load(
-                ptr=AddPtr(base=a_row_base, offset=Const(value=k)),
-                mask=None,
-                other=None,
-            ),
-            rhs=Load(
-                ptr=AddPtr(
-                    base=b_param,
-                    offset=BinOp(
-                        op="+",
-                        lhs=BinOp(op="*", lhs=Const(value=k), rhs=n_cols_param),
-                        rhs=cols_expr,
-                    ),
-                ),
-                mask=mask,
-                other=Const(value=0.0),
-            ),
+    def dot_term(k: int) -> tuple[Load, Load, BinOp]:
+        a_value = Load(
+            ptr=AddPtr(base=a_row_base, offset=Const(value=k)),
+            mask=None,
+            other=None,
         )
+        b_value = Load(
+            ptr=AddPtr(
+                base=b_param,
+                offset=BinOp(
+                    op="+",
+                    lhs=BinOp(op="*", lhs=Const(value=k), rhs=n_cols_param),
+                    rhs=cols_expr,
+                ),
+            ),
+            mask=mask,
+            other=Const(value=0.0),
+        )
+        return a_value, b_value, BinOp(op="*", lhs=a_value, rhs=b_value)
 
-    accumulator = BinOp(op="+", lhs=Const(value=0.0), rhs=dot_term(0))
-    accumulator = BinOp(op="+", lhs=accumulator, rhs=dot_term(1))
-    accumulator = BinOp(op="+", lhs=accumulator, rhs=dot_term(2))
+    a0, b0, term0 = dot_term(0)
+    a1, b1, term1 = dot_term(1)
+    a2, b2, term2 = dot_term(2)
+
+    accumulator = BinOp(op="+", lhs=Const(value=0.0), rhs=term0)
+    accumulator = BinOp(op="+", lhs=accumulator, rhs=term1)
+    accumulator = BinOp(op="+", lhs=accumulator, rhs=term2)
     c_offsets = BinOp(
         op="+",
         lhs=BinOp(op="*", lhs=row, rhs=n_cols_param),
@@ -162,11 +164,17 @@ def test_naive_matmul_kernel_trace():
     )
 
     expected_ops = [
+        a0,
+        b0,
+        a1,
+        b1,
+        a2,
+        b2,
         Store(
             ptr=AddPtr(base=c_param, offset=c_offsets),
             value=accumulator,
             mask=mask,
-        )
+        ),
     ]
 
     assert ops == expected_ops
@@ -216,24 +224,24 @@ def test_naive_matmul_kernel_lowering():
         %11 = addptr b, %10 : vector<4 x ptr<f32>>
         %12 = cmp_lt %9, n_cols : vector<4 x bool>
         %13 = load %11, %12, 0.0 : vector<4 x f32>
-        %14 = mul %4, %13 : vector<4 x f32>
-        %15 = add 0.0, %14 : vector<4 x f32>
-        %17 = addptr %2, 1 : ptr<f32>
-        %18 = load %17, none, none : f32
-        %19 = mul 1, n_cols : i32
-        %20 = add %19, %9 : vector<4 x i32>
-        %21 = addptr b, %20 : vector<4 x ptr<f32>>
-        %22 = load %21, %12, 0.0 : vector<4 x f32>
-        %23 = mul %18, %22 : vector<4 x f32>
-        %24 = add %15, %23 : vector<4 x f32>
-        %26 = addptr %2, 2 : ptr<f32>
-        %27 = load %26, none, none : f32
-        %28 = mul 2, n_cols : i32
-        %29 = add %28, %9 : vector<4 x i32>
-        %30 = addptr b, %29 : vector<4 x ptr<f32>>
-        %31 = load %30, %12, 0.0 : vector<4 x f32>
-        %32 = mul %27, %31 : vector<4 x f32>
-        %33 = add %24, %32 : vector<4 x f32>
+        %15 = addptr %2, 1 : ptr<f32>
+        %16 = load %15, none, none : f32
+        %17 = mul 1, n_cols : i32
+        %18 = add %17, %9 : vector<4 x i32>
+        %19 = addptr b, %18 : vector<4 x ptr<f32>>
+        %20 = load %19, %12, 0.0 : vector<4 x f32>
+        %22 = addptr %2, 2 : ptr<f32>
+        %23 = load %22, none, none : f32
+        %24 = mul 2, n_cols : i32
+        %25 = add %24, %9 : vector<4 x i32>
+        %26 = addptr b, %25 : vector<4 x ptr<f32>>
+        %27 = load %26, %12, 0.0 : vector<4 x f32>
+        %28 = mul %4, %13 : vector<4 x f32>
+        %29 = add 0.0, %28 : vector<4 x f32>
+        %30 = mul %16, %20 : vector<4 x f32>
+        %31 = add %29, %30 : vector<4 x f32>
+        %32 = mul %23, %27 : vector<4 x f32>
+        %33 = add %31, %32 : vector<4 x f32>
         %34 = mul %0, n_cols : i32
         %35 = add %34, %9 : vector<4 x i32>
         %36 = addptr c, %35 : vector<4 x ptr<f32>>
@@ -256,20 +264,20 @@ def test_naive_matmul_kernel_lowering():
             int v10 = (v5 + v9);
             bool v12 = (v9 < n_cols);
             float v13 = (v12 ? b[v10] : 0.0f);
-            float v14 = (v4 * v13);
-            float v15 = (0.0f + v14);
-            float v18 = (true ? a[(v1 + 1)] : 0.0f);
-            int v19 = (1 * n_cols);
-            int v20 = (v19 + v9);
-            float v22 = (v12 ? b[v20] : 0.0f);
-            float v23 = (v18 * v22);
-            float v24 = (v15 + v23);
-            float v27 = (true ? a[(v1 + 2)] : 0.0f);
-            int v28 = (2 * n_cols);
-            int v29 = (v28 + v9);
-            float v31 = (v12 ? b[v29] : 0.0f);
-            float v32 = (v27 * v31);
-            float v33 = (v24 + v32);
+            float v16 = (true ? a[(v1 + 1)] : 0.0f);
+            int v17 = (1 * n_cols);
+            int v18 = (v17 + v9);
+            float v20 = (v12 ? b[v18] : 0.0f);
+            float v23 = (true ? a[(v1 + 2)] : 0.0f);
+            int v24 = (2 * n_cols);
+            int v25 = (v24 + v9);
+            float v27 = (v12 ? b[v25] : 0.0f);
+            float v28 = (v4 * v13);
+            float v29 = (0.0f + v28);
+            float v30 = (v16 * v20);
+            float v31 = (v29 + v30);
+            float v32 = (v23 * v27);
+            float v33 = (v31 + v32);
             int v34 = (v0 * n_cols);
             int v35 = (v34 + v9);
             if (v12) {

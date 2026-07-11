@@ -236,6 +236,10 @@ class SSALowering:
                 )
                 continue
 
+            if isinstance(op, Load):
+                self.lower_expr(op)
+                continue
+
             if isinstance(op, Barrier):
                 self.ops.append(SSAOp(opcode="barrier"))
                 continue

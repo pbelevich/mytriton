@@ -62,7 +62,56 @@ def test_add_kernel_codegen(backend):
 
     assert received_meta == {"BLOCK": BLOCK}
 
+    x_load = Load(
+        ptr=AddPtr(
+            base=Param(
+                name="x",
+                ty=PointerType(element=ScalarType(name="f32"), address_space="global"),
+            ),
+            offset=BinOp(
+                op="+",
+                lhs=BinOp(op="*", lhs=ProgramId(axis=0), rhs=Const(value=256)),
+                rhs=Arange(start=0, end=256),
+            ),
+        ),
+        mask=BinOp(
+            op="<",
+            lhs=BinOp(
+                op="+",
+                lhs=BinOp(op="*", lhs=ProgramId(axis=0), rhs=Const(value=256)),
+                rhs=Arange(start=0, end=256),
+            ),
+            rhs=Param(name="n", ty=ScalarType(name="i32")),
+        ),
+        other=Const(value=0.0),
+    )
+    y_load = Load(
+        ptr=AddPtr(
+            base=Param(
+                name="y",
+                ty=PointerType(element=ScalarType(name="f32"), address_space="global"),
+            ),
+            offset=BinOp(
+                op="+",
+                lhs=BinOp(op="*", lhs=ProgramId(axis=0), rhs=Const(value=256)),
+                rhs=Arange(start=0, end=256),
+            ),
+        ),
+        mask=BinOp(
+            op="<",
+            lhs=BinOp(
+                op="+",
+                lhs=BinOp(op="*", lhs=ProgramId(axis=0), rhs=Const(value=256)),
+                rhs=Arange(start=0, end=256),
+            ),
+            rhs=Param(name="n", ty=ScalarType(name="i32")),
+        ),
+        other=Const(value=0.0),
+    )
+
     expected_ops = [
+        x_load,
+        y_load,
         Store(
             ptr=AddPtr(
                 base=Param(
@@ -79,64 +128,8 @@ def test_add_kernel_codegen(backend):
             ),
             value=BinOp(
                 op="+",
-                lhs=Load(
-                    ptr=AddPtr(
-                        base=Param(
-                            name="x",
-                            ty=PointerType(
-                                element=ScalarType(name="f32"), address_space="global"
-                            ),
-                        ),
-                        offset=BinOp(
-                            op="+",
-                            lhs=BinOp(
-                                op="*", lhs=ProgramId(axis=0), rhs=Const(value=256)
-                            ),
-                            rhs=Arange(start=0, end=256),
-                        ),
-                    ),
-                    mask=BinOp(
-                        op="<",
-                        lhs=BinOp(
-                            op="+",
-                            lhs=BinOp(
-                                op="*", lhs=ProgramId(axis=0), rhs=Const(value=256)
-                            ),
-                            rhs=Arange(start=0, end=256),
-                        ),
-                        rhs=Param(name="n", ty=ScalarType(name="i32")),
-                    ),
-                    other=Const(value=0.0),
-                ),
-                rhs=Load(
-                    ptr=AddPtr(
-                        base=Param(
-                            name="y",
-                            ty=PointerType(
-                                element=ScalarType(name="f32"), address_space="global"
-                            ),
-                        ),
-                        offset=BinOp(
-                            op="+",
-                            lhs=BinOp(
-                                op="*", lhs=ProgramId(axis=0), rhs=Const(value=256)
-                            ),
-                            rhs=Arange(start=0, end=256),
-                        ),
-                    ),
-                    mask=BinOp(
-                        op="<",
-                        lhs=BinOp(
-                            op="+",
-                            lhs=BinOp(
-                                op="*", lhs=ProgramId(axis=0), rhs=Const(value=256)
-                            ),
-                            rhs=Arange(start=0, end=256),
-                        ),
-                        rhs=Param(name="n", ty=ScalarType(name="i32")),
-                    ),
-                    other=Const(value=0.0),
-                ),
+                lhs=x_load,
+                rhs=y_load,
             ),
             mask=BinOp(
                 op="<",
@@ -147,7 +140,7 @@ def test_add_kernel_codegen(backend):
                 ),
                 rhs=Param(name="n", ty=ScalarType(name="i32")),
             ),
-        )
+        ),
     ]
 
     assert ops == expected_ops

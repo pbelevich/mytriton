@@ -72,45 +72,45 @@ def test_matmul_2d_generates_rank2_cuda_source_without_execution(monkeypatch):
         %2 = arange {start=0, end=4} : vector<4 x i32>
         %3 = expand_dims %2 {axis=1} : block<4x1 x i32>
         %4 = add %1, %3 : block<4x1 x i32>
-        %5 = mul %4, N : block<4x1 x i32>
-        %6 = program_id {axis=1} : i32
-        %7 = mul %6, 8 : i32
-        %8 = arange {start=0, end=8} : vector<8 x i32>
-        %9 = expand_dims %8 {axis=0} : block<1x8 x i32>
-        %10 = add %7, %9 : block<1x8 x i32>
-        %11 = add %5, %10 : block<4x8 x i32>
-        %12 = mul %11, 0.0 : block<4x8 x f32>
-        %13 = mul %4, 3 : block<4x1 x i32>
-        %15 = addptr a, %13 : block<4x1 x ptr<f32>>
-        %16 = cmp_lt %4, M : block<4x1 x bool>
-        %17 = load %15, %16, 0.0 : block<4x1 x f32>
-        %18 = mul 0, N : i32
-        %19 = add %18, %10 : block<1x8 x i32>
-        %20 = addptr b, %19 : block<1x8 x ptr<f32>>
-        %21 = cmp_lt %10, N : block<1x8 x bool>
-        %22 = load %20, %21, 0.0 : block<1x8 x f32>
-        %23 = mul %17, %22 : block<4x8 x f32>
-        %24 = add %12, %23 : block<4x8 x f32>
-        %26 = add %13, 1 : block<4x1 x i32>
-        %27 = addptr a, %26 : block<4x1 x ptr<f32>>
-        %29 = load %27, %16, 0.0 : block<4x1 x f32>
-        %30 = mul 1, N : i32
-        %31 = add %30, %10 : block<1x8 x i32>
-        %32 = addptr b, %31 : block<1x8 x ptr<f32>>
-        %34 = load %32, %21, 0.0 : block<1x8 x f32>
-        %35 = mul %29, %34 : block<4x8 x f32>
-        %36 = add %24, %35 : block<4x8 x f32>
-        %38 = add %13, 2 : block<4x1 x i32>
-        %39 = addptr a, %38 : block<4x1 x ptr<f32>>
-        %41 = load %39, %16, 0.0 : block<4x1 x f32>
-        %42 = mul 2, N : i32
-        %43 = add %42, %10 : block<1x8 x i32>
-        %44 = addptr b, %43 : block<1x8 x ptr<f32>>
-        %46 = load %44, %21, 0.0 : block<1x8 x f32>
-        %47 = mul %41, %46 : block<4x8 x f32>
-        %48 = add %36, %47 : block<4x8 x f32>
-        %49 = addptr c, %11 : block<4x8 x ptr<f32>>
-        %52 = and %16, %21 : block<4x8 x bool>
+        %5 = mul %4, 3 : block<4x1 x i32>
+        %7 = addptr a, %5 : block<4x1 x ptr<f32>>
+        %8 = cmp_lt %4, M : block<4x1 x bool>
+        %9 = load %7, %8, 0.0 : block<4x1 x f32>
+        %10 = mul 0, N : i32
+        %11 = program_id {axis=1} : i32
+        %12 = mul %11, 8 : i32
+        %13 = arange {start=0, end=8} : vector<8 x i32>
+        %14 = expand_dims %13 {axis=0} : block<1x8 x i32>
+        %15 = add %12, %14 : block<1x8 x i32>
+        %16 = add %10, %15 : block<1x8 x i32>
+        %17 = addptr b, %16 : block<1x8 x ptr<f32>>
+        %18 = cmp_lt %15, N : block<1x8 x bool>
+        %19 = load %17, %18, 0.0 : block<1x8 x f32>
+        %21 = add %5, 1 : block<4x1 x i32>
+        %22 = addptr a, %21 : block<4x1 x ptr<f32>>
+        %24 = load %22, %8, 0.0 : block<4x1 x f32>
+        %25 = mul 1, N : i32
+        %26 = add %25, %15 : block<1x8 x i32>
+        %27 = addptr b, %26 : block<1x8 x ptr<f32>>
+        %29 = load %27, %18, 0.0 : block<1x8 x f32>
+        %31 = add %5, 2 : block<4x1 x i32>
+        %32 = addptr a, %31 : block<4x1 x ptr<f32>>
+        %34 = load %32, %8, 0.0 : block<4x1 x f32>
+        %35 = mul 2, N : i32
+        %36 = add %35, %15 : block<1x8 x i32>
+        %37 = addptr b, %36 : block<1x8 x ptr<f32>>
+        %39 = load %37, %18, 0.0 : block<1x8 x f32>
+        %40 = mul %4, N : block<4x1 x i32>
+        %41 = add %40, %15 : block<4x8 x i32>
+        %42 = mul %41, 0.0 : block<4x8 x f32>
+        %43 = mul %9, %19 : block<4x8 x f32>
+        %44 = add %42, %43 : block<4x8 x f32>
+        %45 = mul %24, %29 : block<4x8 x f32>
+        %46 = add %44, %45 : block<4x8 x f32>
+        %47 = mul %34, %39 : block<4x8 x f32>
+        %48 = add %46, %47 : block<4x8 x f32>
+        %49 = addptr c, %41 : block<4x8 x ptr<f32>>
+        %52 = and %8, %18 : block<4x8 x bool>
         store %49, %48, %52
         """
     ).rstrip("\n")
@@ -127,39 +127,39 @@ def test_matmul_2d_generates_rank2_cuda_source_without_execution(monkeypatch):
             int v1 = (v0 * 4);
             int v3 = tile_i;
             int v4 = (v1 + v3);
-            int v5 = (v4 * N);
-            int v6 = blockIdx.y;
-            int v7 = (v6 * 8);
-            int v9 = tile_j;
-            int v10 = (v7 + v9);
-            int v11 = (v5 + v10);
-            float v12 = (v11 * 0.0f);
-            int v13 = (v4 * 3);
-            bool v16 = (v4 < M);
-            float v17 = (v16 ? a[v13] : 0.0f);
-            int v18 = (0 * N);
-            int v19 = (v18 + v10);
-            bool v21 = (v10 < N);
-            float v22 = (v21 ? b[v19] : 0.0f);
-            float v23 = (v17 * v22);
-            float v24 = (v12 + v23);
-            int v26 = (v13 + 1);
-            float v29 = (v16 ? a[v26] : 0.0f);
-            int v30 = (1 * N);
-            int v31 = (v30 + v10);
-            float v34 = (v21 ? b[v31] : 0.0f);
-            float v35 = (v29 * v34);
-            float v36 = (v24 + v35);
-            int v38 = (v13 + 2);
-            float v41 = (v16 ? a[v38] : 0.0f);
-            int v42 = (2 * N);
-            int v43 = (v42 + v10);
-            float v46 = (v21 ? b[v43] : 0.0f);
-            float v47 = (v41 * v46);
-            float v48 = (v36 + v47);
-            bool v52 = (v16 && v21);
+            int v5 = (v4 * 3);
+            bool v8 = (v4 < M);
+            float v9 = (v8 ? a[v5] : 0.0f);
+            int v10 = (0 * N);
+            int v11 = blockIdx.y;
+            int v12 = (v11 * 8);
+            int v14 = tile_j;
+            int v15 = (v12 + v14);
+            int v16 = (v10 + v15);
+            bool v18 = (v15 < N);
+            float v19 = (v18 ? b[v16] : 0.0f);
+            int v21 = (v5 + 1);
+            float v24 = (v8 ? a[v21] : 0.0f);
+            int v25 = (1 * N);
+            int v26 = (v25 + v15);
+            float v29 = (v18 ? b[v26] : 0.0f);
+            int v31 = (v5 + 2);
+            float v34 = (v8 ? a[v31] : 0.0f);
+            int v35 = (2 * N);
+            int v36 = (v35 + v15);
+            float v39 = (v18 ? b[v36] : 0.0f);
+            int v40 = (v4 * N);
+            int v41 = (v40 + v15);
+            float v42 = (v41 * 0.0f);
+            float v43 = (v9 * v19);
+            float v44 = (v42 + v43);
+            float v45 = (v24 * v29);
+            float v46 = (v44 + v45);
+            float v47 = (v34 * v39);
+            float v48 = (v46 + v47);
+            bool v52 = (v8 && v18);
             if (v52) {
-                c[v11] = v48;
+                c[v41] = v48;
             }
         }
         """

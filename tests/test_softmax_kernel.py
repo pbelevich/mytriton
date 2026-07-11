@@ -118,11 +118,12 @@ def test_softmax_kernel_trace():
     probabilities = BinOp(op="/", lhs=numerators, rhs=denominator)
 
     expected_ops = [
+        values,
         Store(
             ptr=AddPtr(base=out_param, offset=offsets),
             value=probabilities,
             mask=mask,
-        )
+        ),
     ]
 
     assert ops == expected_ops
