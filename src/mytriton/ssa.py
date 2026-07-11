@@ -7,6 +7,7 @@ from .trace import (
     Barrier,
     BinOp,
     Const,
+    Dot,
     ExpandDims,
     Load,
     Max,
@@ -215,6 +216,16 @@ class SSALowering:
                 expr,
                 operands=(value,),
                 attrs={"axis": expr.axis},
+            )
+
+        if isinstance(expr, Dot):
+            lhs = self.lower_expr(expr.lhs)
+            rhs = self.lower_expr(expr.rhs)
+
+            return self.emit(
+                "dot",
+                expr,
+                operands=(lhs, rhs),
             )
 
         raise TypeError(f"Cannot lower expression: {expr}")

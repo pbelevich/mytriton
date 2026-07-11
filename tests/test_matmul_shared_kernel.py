@@ -93,7 +93,7 @@ def matmul_2d_shared_kernel(
             a_values = tl.load(a_tile + local_m * BK + kk)
             b_values = tl.load(b_tile + kk * BN + local_n)
 
-            acc = acc + a_values * b_values
+            acc = acc + tl.dot(a_values, b_values)
 
         # Important: do not let next k0 iteration overwrite shared memory
         # before all threads are done reading current shared tiles.

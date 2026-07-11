@@ -226,6 +226,47 @@ class SSACUDACodegen:
         )
         self.assign(result, f"{shared}[0]")
 
+    def emit_dot(self, op: SSAOp) -> None:
+        result = op.result
+        if result is None:
+            raise TypeError("dot requires a result")
+
+        lhs_operand = op.operands[0]
+        rhs_operand = op.operands[1]
+
+        if not isinstance(lhs_operand, SSAValue):
+            raise TypeError(f"dot lhs must be SSA value, got {lhs_operand}")
+        if not isinstance(rhs_operand, SSAValue):
+            raise TypeError(f"dot rhs must be SSA value, got {rhs_operand}")
+
+        lhs_ty = lhs_operand.ty
+        rhs_ty = rhs_operand.ty
+
+        if not isinstance(lhs_ty, BlockType) or lhs_ty.rank != 2:
+            raise TypeError(f"dot lhs must be rank-2 block, got {lhs_ty}")
+        if not isinstance(rhs_ty, BlockType) or rhs_ty.rank != 2:
+            raise TypeError(f"dot rhs must be rank-2 block, got {rhs_ty}")
+
+        if lhs_ty.element != F32 or rhs_ty.element != F32:
+            raise TypeError(
+                f"dot MVP supports only f32 operands, got {lhs_ty} and {rhs_ty}"
+            )
+
+        if lhs_ty.shape[1] != rhs_ty.shape[0]:
+            raise TypeError(
+                f"dot inner dimensions must match, got {lhs_ty} and {rhs_ty}"
+            )
+
+        if lhs_ty.shape[1] != 1:
+            raise TypeError(
+                f"CUDA dot MVP supports only K=1 operands; got {lhs_ty} and {rhs_ty}"
+            )
+
+        lhs = self.expression_operand(lhs_operand)
+        rhs = self.expression_operand(rhs_operand)
+
+        self.assign(result, f"({lhs} * {rhs})")
+
     def emit(self, op: SSAOp) -> None:
         if op.opcode == "barrier":
             self.lines.append("    __syncthreads();")
@@ -391,6 +432,8 @@ class SSACUDACodegen:
                 coord if arange_ref.start == 0 else f"({arange_ref.start} + {coord})"
             )
             self.assign(result, expression)
+        elif op.opcode == "dot":
+            self.emit_dot(op)
         else:
             raise TypeError(f"Unsupported SSA opcode: {op.opcode}")
 

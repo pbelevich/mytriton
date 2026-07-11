@@ -189,6 +189,7 @@ class CSEPass:
         "select",
         "and",
         "expand_dims",
+        "dot",
     }
 
     def operand_key(self, operand):

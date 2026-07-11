@@ -179,6 +179,10 @@ def min(value: Value) -> Value:
     return Value(Min(unwrap(value)))
 
 
+def dot(lhs: Value, rhs: Value) -> Value:
+    return Value(Dot(unwrap(lhs), unwrap(rhs)))
+
+
 def static_range(start: int, stop: int | None = None, step: int = 1) -> range:
     if stop is None:
         start, stop = 0, start
@@ -315,6 +319,12 @@ class Max:
 @dataclass
 class Min:
     value: Any
+
+
+@dataclass
+class Dot:
+    lhs: Any
+    rhs: Any
 
 
 @dataclass

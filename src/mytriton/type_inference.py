@@ -10,6 +10,7 @@ from .trace import (
     BinOp,
     BlockType,
     Const,
+    Dot,
     ExpandDims,
     Load,
     Max,
@@ -83,6 +84,15 @@ class TypeInference:
             return
 
         raise TypeError(f"{context} must be convertible to {destination}, got {source}")
+
+    def require_f32_block2(self, ty: Type, *, role: str) -> BlockType:
+        if not isinstance(ty, BlockType) or ty.rank != 2:
+            raise TypeError(f"dot {role} must be rank-2 block, got {ty}")
+
+        if ty.element != F32:
+            raise TypeError(f"dot {role} must have f32 elements, got {ty}")
+
+        return ty
 
     def infer(self, expr) -> Type:
         key = id(expr)
@@ -216,6 +226,25 @@ class TypeInference:
             if value_ty.element not in (I32, F32):
                 raise TypeError(f"cannot reduce elements of type {value_ty.element}")
             ty = value_ty.element
+        elif isinstance(expr, Dot):
+            lhs = self.infer(expr.lhs)
+            rhs = self.infer(expr.rhs)
+
+            lhs_block = self.require_f32_block2(lhs, role="lhs")
+            rhs_block = self.require_f32_block2(rhs, role="rhs")
+
+            m, k_lhs = lhs_block.shape
+            k_rhs, n = rhs_block.shape
+
+            if k_lhs != k_rhs:
+                raise TypeError(f"dot inner dimensions must match, got {lhs} and {rhs}")
+
+            if k_lhs != 1:
+                raise TypeError(
+                    f"dot MVP supports only K=1 operands; got {lhs} and {rhs}"
+                )
+
+            ty = BlockType((m, n), F32)
         elif isinstance(expr, ExpandDims):
             value_ty = self.infer(expr.value)
             if not isinstance(value_ty, BlockType):

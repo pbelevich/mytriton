@@ -2,7 +2,16 @@ import pytest
 
 from mytriton.ssa import SSAOp, SSAValue
 from mytriton.ssa_verification import CompileError, SSAVerifier
-from mytriton.trace import F32, I32, PTR_F32, Const, Param, PointerType, VectorType
+from mytriton.trace import (
+    F32,
+    I32,
+    PTR_F32,
+    BlockType,
+    Const,
+    Param,
+    PointerType,
+    VectorType,
+)
 
 
 def verify(ops, block_size=1):
@@ -145,3 +154,41 @@ def test_verifier_rejects_non_power_of_two_reduction_width():
 
     with pytest.raises(CompileError, match="power of two"):
         verify([*ops, op], block_size=6)
+
+
+def test_verifier_accepts_dot_k1():
+    lhs_lanes = SSAValue(0, BlockType((4,), I32))
+    lhs_ptrs = SSAValue(1, BlockType((4,), PTR_F32))
+    lhs_vec = SSAValue(2, BlockType((4,), F32))
+    lhs = SSAValue(3, BlockType((4, 1), F32))
+
+    rhs_lanes = SSAValue(4, BlockType((8,), I32))
+    rhs_ptrs = SSAValue(5, BlockType((8,), PTR_F32))
+    rhs_vec = SSAValue(6, BlockType((8,), F32))
+    rhs = SSAValue(7, BlockType((1, 8), F32))
+
+    out = SSAValue(8, BlockType((4, 8), F32))
+
+    ops = [
+        SSAOp("arange", result=lhs_lanes, attrs={"start": 0, "end": 4}),
+        SSAOp("addptr", (Param("a", PTR_F32), lhs_lanes), lhs_ptrs),
+        SSAOp("load", (lhs_ptrs, None, None), lhs_vec),
+        SSAOp("expand_dims", (lhs_vec,), lhs, attrs={"axis": 1}),
+        SSAOp("arange", result=rhs_lanes, attrs={"start": 0, "end": 8}),
+        SSAOp("addptr", (Param("b", PTR_F32), rhs_lanes), rhs_ptrs),
+        SSAOp("load", (rhs_ptrs, None, None), rhs_vec),
+        SSAOp("expand_dims", (rhs_vec,), rhs, attrs={"axis": 0}),
+        SSAOp("dot", (lhs, rhs), out),
+    ]
+
+    verify(ops, block_size=8)
+
+
+def test_verifier_rejects_dot_k_greater_than_one_for_now():
+    lhs = SSAValue(0, BlockType((4, 16), F32))
+    rhs = SSAValue(1, BlockType((16, 8), F32))
+    out = SSAValue(2, BlockType((4, 8), F32))
+    op = SSAOp("dot", (lhs, rhs), out)
+
+    with pytest.raises(CompileError, match="dot MVP supports only K=1"):
+        SSAVerifier(block_size=32).check_dot(0, op)
