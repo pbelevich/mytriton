@@ -135,15 +135,46 @@ class PointerType:
 
 
 @dataclass(frozen=True)
-class VectorType:
-    size: int
+class BlockType:
+    shape: tuple[int, ...]
     element: ScalarType | PointerType
 
+    def __post_init__(self):
+        if not self.shape:
+            raise TypeError("block shape must not be empty")
+        if any(dim <= 0 for dim in self.shape):
+            raise TypeError(f"block dimensions must be positive, got {self.shape}")
+
+    @property
+    def rank(self) -> int:
+        return len(self.shape)
+
+    @property
+    def num_elements(self) -> int:
+        result = 1
+        for dim in self.shape:
+            result *= dim
+        return result
+
+    @property
+    def size(self) -> int:
+        if self.rank != 1:
+            raise TypeError(f"rank-{self.rank} block has no single size")
+        return self.shape[0]
+
     def __str__(self):
-        return f"vector<{self.size} x {self.element}>"
+        if self.rank == 1:
+            return f"vector<{self.shape[0]} x {self.element}>"
+
+        shape = "x".join(str(dim) for dim in self.shape)
+        return f"block<{shape} x {self.element}>"
 
 
-Type = ScalarType | PointerType | VectorType
+def VectorType(size: int, element: ScalarType | PointerType) -> BlockType:
+    return BlockType((size,), element)
+
+
+Type = ScalarType | PointerType | BlockType
 
 
 I32 = ScalarType("i32")
@@ -241,6 +272,12 @@ class Min:
     value: Any
 
 
+@dataclass
+class ExpandDims:
+    value: Any
+    axis: int
+
+
 # ----------------------------
 # Symbolic values
 # ----------------------------
@@ -291,7 +328,27 @@ class Value:
         return Value(UnaryOp("neg", self.expr))
 
     def __bool__(self) -> bool:
-        raise TypeError("Python control flow over symbolic values is not supported")
+        raise TypeError(
+            "Python control flow over symbolic values is not supported; "
+            "when combining comparisons with &, wrap each comparison in parentheses"
+        )
+
+    def __getitem__(self, index) -> Value:
+        if index == (slice(None), None):
+            return Value(ExpandDims(self.expr, axis=1))
+
+        if index == (None, slice(None)):
+            return Value(ExpandDims(self.expr, axis=0))
+
+        raise TypeError(
+            "only x[:, None] and x[None, :] are supported for symbolic values"
+        )
+
+    def __and__(self, other: Value | bool) -> Value:
+        return Value(BinOp("&", self.expr, unwrap(other)))
+
+    def __rand__(self, other: Value | bool) -> Value:
+        return Value(BinOp("&", unwrap(other), self.expr))
 
     def __repr__(self) -> str:
         return f"Value({self.expr})"

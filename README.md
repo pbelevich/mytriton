@@ -3,9 +3,9 @@
 `mytriton` is a small symbolic tracer inspired by Triton's Python API.
 It traces straight-line Python kernels into an expression-tree IR, infers types,
 lowers the result into a small SSA-style IR, verifies and optimizes that IR,
-and emits backend source. The default backend emits CUDA C++; an experimental
-MLIR backend can lower a small subset of kernels through MLIR's GPU/NVVM stack
-to a cubin.
+and emits backend source. The default backend emits CUDA C++ for rank-1 vectors
+and small rank-2 tiles; an experimental MLIR backend can lower a small subset of
+rank-1 kernels through MLIR's GPU/NVVM stack to a cubin.
 
 ## Versions
 
@@ -27,6 +27,9 @@ to a cubin.
 - [ver7](https://github.com/pbelevich/mytriton/tree/ver7): an experimental
   MLIR backend for 1D elementwise kernels, backend-parametrized tests, MLIR GPU
   dialect emission, lowering to cubin, and CuPy-backed cubin execution.
+- [ver8](https://github.com/pbelevich/mytriton/tree/ver8): rank-2 block shapes,
+  `x[:, None]`/`x[None, :]` expansion, broadcasted 2D masks, CUDA lowering for
+  tiled kernels, and a simple rank-2 tiled matrix multiplication kernel.
 
 ## Example
 
@@ -106,6 +109,42 @@ void add_kernel(float* x, float* y, float* out, int n) {
 }
 ```
 
+Rank-2 tiles are expressed by expanding rank-1 ranges:
+
+```python
+@triton.jit
+def matrix_add_2d_kernel(x, y, out, M, N, BM: tl.constexpr, BN: tl.constexpr):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BM + tl.arange(0, BM)[:, None]
+    offs_n = pid_n * BN + tl.arange(0, BN)[None, :]
+
+    offsets = offs_m * N + offs_n
+    mask = (offs_m < M) & (offs_n < N)
+
+    lhs = tl.load(x + offsets, mask=mask, other=0.0)
+    rhs = tl.load(y + offsets, mask=mask, other=0.0)
+    tl.store(out + offsets, lhs + rhs, mask=mask)
+```
+
+The SSA keeps the tile shape explicit:
+
+```text
+%3 = expand_dims %2 {axis=1} : block<16x1 x i32>
+%9 = expand_dims %8 {axis=0} : block<1x32 x i32>
+%11 = add %5, %10 : block<16x32 x i32>
+%15 = and %13, %14 : block<16x32 x bool>
+%16 = load %12, %15, 0.0 : block<16x32 x f32>
+```
+
+The CUDA backend maps the tile onto one linear CUDA thread block:
+
+```cuda
+int tile_i = threadIdx.x / 32;
+int tile_j = threadIdx.x % 32;
+```
+
 The backend can be selected with `MYTRITON_BACKEND` when running your own
 script:
 
@@ -148,16 +187,17 @@ The test kernels also include a copy, 2D matrix add, ReLU through
 `tl.exp`, addition, and division, row-wise `tl.sum`/`tl.max`/`tl.min`
 reductions, a numerically stable row-wise softmax, and a long-row sum that uses
 `tl.static_range` to unroll several block-sized loads at compile time. The
-current tests also include a naive matrix multiplication kernel that combines a
-2D launch grid, `tl.static_range` over `K`, scalar-vector broadcasting, and
-masked vector stores.
+current tests also include matrix multiplication kernels: an older naive
+rank-1-vector version and a rank-2 tiled version that combines a 2D launch grid,
+2D block broadcasting, `tl.static_range` over `K`, and masked tile stores.
 
 Before CUDA code generation, the SSA IR is checked by a verifier. The verifier
 validates definition order, result declarations, operand types, broadcast
 shapes, pointer operations, memory masks, and operation-specific rules such as
-`tl.exp` requiring `f32`, `tl.where` lowering to a Boolean `select`, and
-reductions consuming one power-of-two vector whose width matches the CUDA block
-size.
+`tl.exp` requiring `f32`, `tl.where` lowering to a Boolean `select`,
+`expand_dims` preserving element types while inserting a size-1 dimension, and
+reductions consuming one power-of-two rank-1 block whose width matches the CUDA
+block size.
 
 The verified SSA then runs through a small optimization pipeline:
 
@@ -181,14 +221,16 @@ before CUDA code generation.
 - Runtime array arguments must be C-contiguous `float32` arrays.
 - The launch grid is evaluated and used for CUDA execution, but it is not
   represented in the IR.
-- CUDA execution uses the SSA vector width as the number of threads per block;
-  scalar-only kernels use one thread per block.
+- CUDA execution uses the SSA rank-1 vector width, or the product of the SSA
+  rank-2 tile shape, as the number of threads per block. Scalar-only kernels
+  use one thread per block.
 - JIT cache entries are specialized by runtime types and constexpr values. Python
   globals and closure values used by a kernel must remain unchanged; call
   `kernel.clear_cache()` after changing them.
 - CUDA lowering currently supports program IDs, ranges, basic arithmetic and
-  comparison, elementwise minimum and maximum, negation, `tl.exp`, `tl.where`,
-  pointer addition, masked loads, masked stores, block-local
+  comparison, Boolean `&`, rank-2 `expand_dims` via `x[:, None]` and
+  `x[None, :]`, elementwise minimum and maximum, negation, `tl.exp`,
+  `tl.where`, pointer addition, masked loads, masked stores, block-local
   `tl.sum`/`tl.max`/`tl.min` reductions, and compile-time `tl.static_range`
   loops. Reduction lowering internally emits the CUDA shared-memory scratch
   buffers and synchronization needed for block-local reductions. Floating-point
@@ -200,16 +242,18 @@ before CUDA code generation.
   one block-local partial vector, as in the long-row sum test, but there is no
   multi-block reduction yet.
 - Matrix multiplication support is intentionally naive so far. The current
-  matmul kernel does not tile through shared memory because there is no
+  rank-2 matmul kernel computes one output tile with one CUDA thread per output
+  element, but it does not tile through shared memory because there is no
   user-facing shared-memory API yet. It repeatedly reads from global memory and
-  uses `tl.static_range` to unroll the reduction dimension.
+  uses `tl.static_range` to unroll a constexpr reduction dimension.
 - MLIR lowering currently supports only `ptr<f32>` parameters as
   `memref<?xf32>`, scalar `i32`/`f32`/`bool`, `tl.program_id(0)`,
   `tl.arange(0, BLOCK)`, basic arithmetic and `<`, pointer addition, masked
-  loads, and masked stores. It intentionally rejects nonzero program axes and
-  nonzero `arange` starts instead of silently generating wrong code. It does
-  not yet support 2D program IDs, reductions, `tl.maximum`, `tl.minimum`,
-  `tl.where`, negation, `tl.exp`, `tl.static_range`, or matrix multiplication.
+  loads, and masked stores. It intentionally rejects nonzero program axes,
+  nonzero `arange` starts, and rank-2 block shapes instead of silently
+  generating wrong code. It does not yet support 2D program IDs, reductions,
+  `expand_dims`, Boolean `&`, `tl.maximum`, `tl.minimum`, `tl.where`, negation,
+  `tl.exp`, `tl.static_range`, or matrix multiplication.
 - MLIR execution currently supports only 1D C-contiguous CuPy arrays because it
   builds one-dimensional memref descriptors.
 - The SSA IR has no basic blocks, control-flow representation, or phi nodes yet.
