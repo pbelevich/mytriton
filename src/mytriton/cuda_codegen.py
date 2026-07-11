@@ -2,17 +2,18 @@ import math
 from dataclasses import dataclass
 from typing import ClassVar
 
+from .block_shapes import cuda_kernel_block_shape, prod
 from .ssa import SSAOp, SSAOperand, SSAValue
 from .trace import (
     BOOL,
     F32,
     I32,
+    BlockType,
     Const,
     Param,
     PointerType,
     ScalarType,
     Type,
-    VectorType,
 )
 
 
@@ -22,6 +23,16 @@ class CudaPtrRef:
     index: str
 
 
+@dataclass(frozen=True)
+class CudaArangeRef:
+    start: int
+    end: int
+
+    @property
+    def width(self) -> int:
+        return self.end - self.start
+
+
 class SSACUDACodegen:
     BINARY_OPS: ClassVar[dict[str, str]] = {
         "add": "+",
@@ -29,15 +40,17 @@ class SSACUDACodegen:
         "mul": "*",
         "div": "/",
         "cmp_lt": "<",
+        "and": "&&",
     }
 
     def __init__(self):
         self.lines: list[str] = []
-        self.values: dict[int, str | CudaPtrRef] = {}
+        self.values: dict[int, str | CudaPtrRef | CudaArangeRef] = {}
+        self.block_shape: tuple[int, ...] = (1,)
         self.shared_lines: list[str] = []
 
     def cuda_type(self, ty: Type) -> str:
-        if isinstance(ty, VectorType):
+        if isinstance(ty, BlockType):
             ty = ty.element
 
         if ty == I32:
@@ -69,7 +82,7 @@ class SSACUDACodegen:
 
         raise TypeError(f"Unsupported CUDA literal: {value!r}")
 
-    def operand(self, operand: SSAOperand) -> str | CudaPtrRef | None:
+    def operand(self, operand: SSAOperand) -> str | CudaPtrRef | CudaArangeRef | None:
         if operand is None:
             return None
         if isinstance(operand, SSAValue):
@@ -85,8 +98,17 @@ class SSACUDACodegen:
 
     def expression_operand(self, operand: SSAOperand) -> str:
         value = self.operand(operand)
+        if (
+            isinstance(value, CudaArangeRef)
+            and self.is_rank2_kernel()
+            and value.width == self.threads_in_kernel_block()
+        ):
+            return (
+                "threadIdx.x" if value.start == 0 else f"({value.start} + threadIdx.x)"
+            )
+
         if not isinstance(value, str):
-            raise TypeError(f"Expected CUDA expression, got {value}")
+            raise TypeError(f"Expected CUDA scalar expression, got {value}")
         return value
 
     def pointer_operand(self, operand: SSAOperand) -> CudaPtrRef:
@@ -104,7 +126,26 @@ class SSACUDACodegen:
         self.values[result.id] = name
 
     def scalar_type(self, ty: Type) -> ScalarType | PointerType:
-        return ty.element if isinstance(ty, VectorType) else ty
+        return ty.element if isinstance(ty, BlockType) else ty
+
+    def is_rank2_kernel(self) -> bool:
+        return len(self.block_shape) == 2
+
+    def threads_in_kernel_block(self) -> int:
+        return prod(self.block_shape)
+
+    def emit_rank2_prologue(self) -> None:
+        if not self.is_rank2_kernel():
+            return
+
+        _, cols = self.block_shape
+
+        self.lines.extend(
+            [
+                f"    int tile_i = threadIdx.x / {cols};",
+                f"    int tile_j = threadIdx.x % {cols};",
+            ]
+        )
 
     def reduction_update(
         self,
@@ -144,7 +185,7 @@ class SSACUDACodegen:
             raise TypeError(f"{op.opcode} requires a result")
 
         input_ty = operand.ty
-        if not isinstance(input_ty, VectorType):
+        if not isinstance(input_ty, BlockType) or input_ty.rank != 1:
             raise TypeError(f"{op.opcode} expects a vector input, got {input_ty}")
 
         value = self.expression_operand(operand)
@@ -220,8 +261,16 @@ class SSACUDACodegen:
             self.assign(result, f"blockIdx.{component}")
         elif op.opcode == "arange":
             start = op.attrs["start"]
-            expression = "threadIdx.x" if start == 0 else f"({start} + threadIdx.x)"
-            self.assign(result, expression)
+            end = op.attrs["end"]
+
+            if not isinstance(start, int) or not isinstance(end, int):
+                raise TypeError(f"arange expects integer start/end, got {start}, {end}")
+
+            if self.is_rank2_kernel():
+                self.values[result.id] = CudaArangeRef(start=start, end=end)
+            else:
+                expression = "threadIdx.x" if start == 0 else f"({start} + threadIdx.x)"
+                self.assign(result, expression)
         elif op.opcode in self.BINARY_OPS:
             lhs = self.expression_operand(op.operands[0])
             rhs = self.expression_operand(op.operands[1])
@@ -283,6 +332,44 @@ class SSACUDACodegen:
             )
         elif op.opcode in ("sum", "max", "min"):
             self.emit_reduction(op)
+        elif op.opcode == "expand_dims":
+            if not self.is_rank2_kernel():
+                raise TypeError(
+                    "CUDA expand_dims lowering currently requires rank-2 kernel"
+                )
+
+            operand = op.operands[0]
+            if not isinstance(operand, SSAValue):
+                raise TypeError(f"expand_dims expects SSA operand, got {operand}")
+
+            arange_ref = self.operand(operand)
+            if not isinstance(arange_ref, CudaArangeRef):
+                raise TypeError(
+                    "CUDA expand_dims MVP supports only direct arange expansion, "
+                    f"got {arange_ref}"
+                )
+
+            axis = op.attrs["axis"]
+            rows, cols = self.block_shape
+
+            if not isinstance(result.ty, BlockType):
+                raise TypeError(f"expand_dims expects block result, got {result.ty}")
+
+            result_shape = result.ty.shape
+            if axis == 1 and result_shape == (rows, 1):
+                coord = "tile_i"
+            elif axis == 0 and result_shape == (1, cols):
+                coord = "tile_j"
+            else:
+                raise TypeError(
+                    f"cannot map expand_dims result {result.ty} into CUDA tile "
+                    f"shape {self.block_shape}"
+                )
+
+            expression = (
+                coord if arange_ref.start == 0 else f"({arange_ref.start} + {coord})"
+            )
+            self.assign(result, expression)
         else:
             raise TypeError(f"Unsupported SSA opcode: {op.opcode}")
 
@@ -295,6 +382,9 @@ class SSACUDACodegen:
         self.lines = []
         self.shared_lines = []
         self.values = {}
+        self.block_shape = cuda_kernel_block_shape(ssa_ops)
+
+        self.emit_rank2_prologue()
 
         signature = ", ".join(
             f"{self.cuda_type(param.ty)} {param.name}" for param in params

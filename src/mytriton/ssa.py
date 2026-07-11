@@ -6,6 +6,7 @@ from .trace import (
     Arange,
     BinOp,
     Const,
+    ExpandDims,
     Load,
     Max,
     Maximum,
@@ -49,6 +50,7 @@ class SSALowering:
         "*": "mul",
         "/": "div",
         "<": "cmp_lt",
+        "&": "and",
     }
 
     def __init__(self):
@@ -192,6 +194,15 @@ class SSALowering:
                 "min",
                 expr,
                 operands=(value,),
+            )
+
+        if isinstance(expr, ExpandDims):
+            value = self.lower_expr(expr.value)
+            return self.emit(
+                "expand_dims",
+                expr,
+                operands=(value,),
+                attrs={"axis": expr.axis},
             )
 
         raise TypeError(f"Cannot lower expression: {expr}")

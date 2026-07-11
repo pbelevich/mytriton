@@ -8,7 +8,7 @@ from .mlir_backend import (
     run_pipeline,
 )
 from .ssa import SSAOp, SSAOperand, SSAValue
-from .trace import BOOL, F32, I32, Const, Param, PointerType, Type, VectorType
+from .trace import BOOL, F32, I32, BlockType, Const, Param, PointerType, Type
 
 
 @dataclass(frozen=True)
@@ -26,7 +26,7 @@ class MLIRCodegen:
         self.constants: dict[tuple[object, str], str] = {}
 
     def scalar_type(self, ty: Type) -> Type:
-        return ty.element if isinstance(ty, VectorType) else ty
+        return ty.element if isinstance(ty, BlockType) else ty
 
     def mlir_scalar_type(self, ty: Type) -> str:
         ty = self.scalar_type(ty)
@@ -251,6 +251,13 @@ class MLIRCodegen:
         self.lines = []
         self.values = {}
         self.constants = {}
+
+        for op in ssa_ops:
+            if op.result is None:
+                continue
+            ty = op.result.ty
+            if isinstance(ty, BlockType) and ty.rank != 1:
+                raise TypeError(f"MLIR MVP supports only rank-1 blocks, got {ty}")
 
         args = [f"%{param.name}: {self.mlir_param_type(param.ty)}" for param in params]
 
