@@ -30,6 +30,9 @@ rank-1 kernels through MLIR's GPU/NVVM stack to a cubin.
 - [ver8](https://github.com/pbelevich/mytriton/tree/ver8): rank-2 block shapes,
   `x[:, None]`/`x[None, :]` expansion, broadcasted 2D masks, CUDA lowering for
   tiled kernels, and a simple rank-2 tiled matrix multiplication kernel.
+- [ver9](https://github.com/pbelevich/mytriton/tree/ver9): `tl.dot` in SSA,
+  a temporary explicit shared-memory API, CUDA shared-memory allocation and
+  barriers, and a shared-memory tiled matrix multiplication test kernel.
 
 ## Example
 
@@ -188,8 +191,10 @@ The test kernels also include a copy, 2D matrix add, ReLU through
 reductions, a numerically stable row-wise softmax, and a long-row sum that uses
 `tl.static_range` to unroll several block-sized loads at compile time. The
 current tests also include matrix multiplication kernels: an older naive
-rank-1-vector version and a rank-2 tiled version that combines a 2D launch grid,
-2D block broadcasting, `tl.static_range` over `K`, and masked tile stores.
+rank-1-vector version, a rank-2 global-memory tiled version, a `tl.dot` version,
+and a shared-memory tiled version. The shared-memory test uses the temporary
+`tl._shared_array` hook, cooperative loads into shared memory, `tl._barrier()`,
+and `tl.dot` over small rank-2 tiles.
 
 Before CUDA code generation, the SSA IR is checked by a verifier. The verifier
 validates definition order, result declarations, operand types, broadcast
@@ -231,21 +236,25 @@ before CUDA code generation.
   comparison, Boolean `&`, rank-2 `expand_dims` via `x[:, None]` and
   `x[None, :]`, elementwise minimum and maximum, negation, `tl.exp`,
   `tl.where`, pointer addition, masked loads, masked stores, block-local
-  `tl.sum`/`tl.max`/`tl.min` reductions, and compile-time `tl.static_range`
-  loops. Reduction lowering internally emits the CUDA shared-memory scratch
-  buffers and synchronization needed for block-local reductions. Floating-point
-  elementwise extrema propagate NaNs and choose the right-hand operand when
-  values compare equal.
+  `tl.sum`/`tl.max`/`tl.min` reductions, `tl.dot` for rank-2 `f32` tiles,
+  temporary explicit shared-memory allocation via `tl._shared_array`,
+  `tl._barrier()`, and compile-time `tl.static_range` loops. Reduction lowering
+  internally emits the CUDA shared-memory scratch buffers and synchronization
+  needed for block-local reductions. Floating-point elementwise extrema
+  propagate NaNs and choose the right-hand operand when values compare equal.
 - Reductions are currently single-block reductions over the SSA vector width.
   The vector width must be a power of two and must match the CUDA thread block
   size. Larger rows can be handled by statically unrolling multiple loads into
   one block-local partial vector, as in the long-row sum test, but there is no
   multi-block reduction yet.
-- Matrix multiplication support is intentionally naive so far. The current
-  rank-2 matmul kernel computes one output tile with one CUDA thread per output
-  element, but it does not tile through shared memory because there is no
-  user-facing shared-memory API yet. It repeatedly reads from global memory and
-  uses `tl.static_range` to unroll a constexpr reduction dimension.
+- Matrix multiplication support is still intentionally small. The rank-2 CUDA
+  lowering computes one output element per CUDA thread. `tl.dot` lowers to
+  scalar multiply/add code for the current output element, not tensor cores or
+  warp-level MMA. The shared-memory matmul test tiles through shared memory and
+  handles masked edge tiles for the tested shapes, but `tl._shared_array` is a
+  temporary internal hook rather than a final Triton-compatible API. This should
+  be treated as an MVP, not a claim that arbitrary `BM`/`BN`/`BK` combinations
+  are optimized or supported like real Triton matmul kernels.
 - MLIR lowering currently supports only `ptr<f32>` parameters as
   `memref<?xf32>`, scalar `i32`/`f32`/`bool`, `tl.program_id(0)`,
   `tl.arange(0, BLOCK)`, basic arithmetic and `<`, pointer addition, masked
@@ -253,7 +262,8 @@ before CUDA code generation.
   nonzero `arange` starts, and rank-2 block shapes instead of silently
   generating wrong code. It does not yet support 2D program IDs, reductions,
   `expand_dims`, Boolean `&`, `tl.maximum`, `tl.minimum`, `tl.where`, negation,
-  `tl.exp`, `tl.static_range`, or matrix multiplication.
+  `tl.exp`, `tl.static_range`, `tl.dot`, shared memory, or matrix
+  multiplication.
 - MLIR execution currently supports only 1D C-contiguous CuPy arrays because it
   builds one-dimensional memref descriptors.
 - The SSA IR has no basic blocks, control-flow representation, or phi nodes yet.
