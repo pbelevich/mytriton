@@ -239,11 +239,6 @@ class TypeInference:
             if k_lhs != k_rhs:
                 raise TypeError(f"dot inner dimensions must match, got {lhs} and {rhs}")
 
-            if k_lhs != 1:
-                raise TypeError(
-                    f"dot MVP supports only K=1 operands; got {lhs} and {rhs}"
-                )
-
             ty = BlockType((m, n), F32)
         elif isinstance(expr, ExpandDims):
             value_ty = self.infer(expr.value)

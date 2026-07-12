@@ -2,7 +2,7 @@ import math
 from dataclasses import dataclass
 from typing import ClassVar
 
-from .block_shapes import cuda_kernel_block_shape, prod
+from .block_shapes import broadcast_shapes, cuda_kernel_block_shape, prod
 from .ssa import SSAOp, SSAOperand, SSAValue
 from .trace import (
     BOOL,
@@ -48,6 +48,7 @@ class SSACUDACodegen:
         self.values: dict[int, str | CudaPtrRef | CudaArangeRef] = {}
         self.block_shape: tuple[int, ...] = (1,)
         self.shared_lines: list[str] = []
+        self.ops_by_result: dict[int, SSAOp] = {}
 
     def cuda_type(self, ty: Type) -> str:
         if isinstance(ty, BlockType):
@@ -134,6 +135,27 @@ class SSACUDACodegen:
     def threads_in_kernel_block(self) -> int:
         return prod(self.block_shape)
 
+    def block_type(self, operand: SSAOperand) -> BlockType | None:
+        ty = getattr(operand, "ty", None)
+        return ty if isinstance(ty, BlockType) else None
+
+    def is_execution_compatible_shape(self, shape: tuple[int, ...]) -> bool:
+        if len(shape) != 2 or not self.is_rank2_kernel():
+            return True
+
+        try:
+            return broadcast_shapes(shape, self.block_shape) == self.block_shape
+        except ValueError:
+            return False
+
+    def should_defer_result(self, result: SSAValue) -> bool:
+        ty = result.ty
+        return (
+            isinstance(ty, BlockType)
+            and ty.rank == 2
+            and not self.is_execution_compatible_shape(ty.shape)
+        )
+
     def emit_rank2_prologue(self) -> None:
         if not self.is_rank2_kernel():
             return
@@ -183,6 +205,9 @@ class SSACUDACodegen:
         result = op.result
         if result is None:
             raise TypeError(f"{op.opcode} requires a result")
+
+        if self.should_defer_result(result):
+            return
 
         input_ty = operand.ty
         if not isinstance(input_ty, BlockType) or input_ty.rank != 1:
@@ -249,23 +274,208 @@ class SSACUDACodegen:
 
         if lhs_ty.element != F32 or rhs_ty.element != F32:
             raise TypeError(
-                f"dot MVP supports only f32 operands, got {lhs_ty} and {rhs_ty}"
+                f"dot supports only f32 operands, got {lhs_ty} and {rhs_ty}"
             )
 
-        if lhs_ty.shape[1] != rhs_ty.shape[0]:
+        m, k_lhs = lhs_ty.shape
+        k_rhs, n = rhs_ty.shape
+
+        if k_lhs != k_rhs:
             raise TypeError(
                 f"dot inner dimensions must match, got {lhs_ty} and {rhs_ty}"
             )
 
-        if lhs_ty.shape[1] != 1:
-            raise TypeError(
-                f"CUDA dot MVP supports only K=1 operands; got {lhs_ty} and {rhs_ty}"
+        expected = (m, n)
+        if not isinstance(result.ty, BlockType) or result.ty.shape != expected:
+            raise TypeError(f"dot result must have shape {expected}, got {result.ty}")
+
+        name = f"v{result.id}"
+        self.lines.append(f"    float {name} = 0.0f;")
+
+        for kk in range(k_lhs):
+            lhs = (
+                self.expression_operand(lhs_operand)
+                if lhs_operand.id in self.values
+                else self.render_value_at(lhs_operand, ("tile_i", str(kk)))
+            )
+            rhs = (
+                self.expression_operand(rhs_operand)
+                if rhs_operand.id in self.values
+                else self.render_value_at(rhs_operand, (str(kk), "tile_j"))
+            )
+            self.lines.append(f"    {name} += ({lhs} * {rhs});")
+
+        self.values[result.id] = name
+
+    def render_arange_at(self, op: SSAOp, index: str) -> str:
+        start = op.attrs["start"]
+        if not isinstance(start, int):
+            raise TypeError(f"arange start must be int, got {start!r}")
+
+        return index if start == 0 else f"({start} + {index})"
+
+    def map_indices(
+        self,
+        operand_ty: BlockType,
+        result_ty: BlockType,
+        result_indices: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        operand_shape = operand_ty.shape
+        result_shape = result_ty.shape
+
+        if len(operand_shape) > len(result_shape):
+            raise TypeError(f"cannot map indices from {result_ty} to {operand_ty}")
+
+        padded_operand_shape = (1,) * (
+            len(result_shape) - len(operand_shape)
+        ) + operand_shape
+        padded_indices = []
+
+        for operand_dim, result_dim, index in zip(
+            padded_operand_shape,
+            result_shape,
+            result_indices,
+            strict=True,
+        ):
+            if operand_dim == 1:
+                padded_indices.append("0")
+            elif operand_dim == result_dim:
+                padded_indices.append(index)
+            else:
+                raise TypeError(f"cannot broadcast {operand_ty} to {result_ty}")
+
+        return tuple(padded_indices[-len(operand_shape) :])
+
+    def render_value_at(self, operand: SSAOperand, indices: tuple[str, ...]) -> str:
+        if isinstance(operand, Const):
+            return self.literal(operand.value)
+
+        if isinstance(operand, Param):
+            return operand.name
+
+        if not isinstance(operand, SSAValue):
+            raise TypeError(f"expected SSA value, got {operand}")
+
+        op = self.ops_by_result[operand.id]
+        result_ty = operand.ty
+
+        if op.opcode == "program_id":
+            axis = op.attrs["axis"]
+            if not isinstance(axis, int):
+                raise TypeError(f"program_id axis must be int, got {axis!r}")
+            component = ("x", "y", "z")[axis]
+            return f"blockIdx.{component}"
+
+        if op.opcode == "arange":
+            if len(indices) != 1:
+                raise TypeError(f"arange expects one index, got {indices}")
+            return self.render_arange_at(op, indices[0])
+
+        if op.opcode == "expand_dims":
+            source = op.operands[0]
+            axis = op.attrs["axis"]
+
+            if not isinstance(axis, int):
+                raise TypeError(f"expand_dims axis must be int, got {axis!r}")
+
+            if axis == 0:
+                source_indices = (indices[1],)
+            elif axis == 1:
+                source_indices = (indices[0],)
+            else:
+                raise TypeError(f"unsupported expand_dims axis {axis}")
+
+            return self.render_value_at(source, source_indices)
+
+        if op.opcode in self.BINARY_OPS:
+            if not isinstance(result_ty, BlockType):
+                lhs = self.render_value_at(op.operands[0], ())
+                rhs = self.render_value_at(op.operands[1], ())
+            else:
+                lhs_ty = self.block_type(op.operands[0])
+                rhs_ty = self.block_type(op.operands[1])
+
+                lhs_indices = (
+                    self.map_indices(lhs_ty, result_ty, indices)
+                    if lhs_ty is not None
+                    else ()
+                )
+                rhs_indices = (
+                    self.map_indices(rhs_ty, result_ty, indices)
+                    if rhs_ty is not None
+                    else ()
+                )
+
+                lhs = self.render_value_at(op.operands[0], lhs_indices)
+                rhs = self.render_value_at(op.operands[1], rhs_indices)
+
+            symbol = self.BINARY_OPS[op.opcode]
+            return f"({lhs} {symbol} {rhs})"
+
+        if op.opcode == "addptr":
+            ptr = self.render_ptr_at(op.operands[0], indices)
+            offset = self.render_value_at(op.operands[1], indices)
+
+            if ptr.index != "0":
+                offset = f"({ptr.index} + {offset})"
+
+            return f"{ptr.base}[{offset}]"
+
+        if op.opcode == "load":
+            ptr = self.render_ptr_at(op.operands[0], indices)
+
+            mask_operand = op.operands[1]
+            other_operand = op.operands[2]
+
+            mask = (
+                "true"
+                if mask_operand is None
+                else self.render_value_at(mask_operand, indices)
             )
 
-        lhs = self.expression_operand(lhs_operand)
-        rhs = self.expression_operand(rhs_operand)
+            if other_operand is None:
+                other = "0.0f" if self.scalar_type(result_ty) == F32 else "0"
+            else:
+                other = self.render_value_at(other_operand, ())
 
-        self.assign(result, f"({lhs} * {rhs})")
+            return f"({mask} ? {ptr.base}[{ptr.index}] : {other})"
+
+        raise TypeError(f"cannot render opcode {op.opcode!r} at logical indices")
+
+    def render_ptr_at(
+        self, operand: SSAOperand, indices: tuple[str, ...]
+    ) -> CudaPtrRef:
+        if isinstance(operand, Param):
+            return CudaPtrRef(operand.name, "0")
+
+        if not isinstance(operand, SSAValue):
+            raise TypeError(f"expected pointer SSA value, got {operand}")
+
+        if operand.id in self.values:
+            value = self.values[operand.id]
+            if isinstance(value, CudaPtrRef):
+                return value
+            if isinstance(value, str):
+                return CudaPtrRef(value, "0")
+
+        op = self.ops_by_result[operand.id]
+
+        if op.opcode == "shared_alloc":
+            shared_value = self.values.get(operand.id)
+            if not isinstance(shared_value, CudaPtrRef):
+                raise TypeError(f"shared allocation {operand} was not emitted")
+            return shared_value
+
+        if op.opcode == "addptr":
+            base = self.render_ptr_at(op.operands[0], indices)
+            offset = self.render_value_at(op.operands[1], indices)
+
+            if base.index != "0":
+                offset = f"({base.index} + {offset})"
+
+            return CudaPtrRef(base.base, offset)
+
+        raise TypeError(f"cannot render pointer from opcode {op.opcode!r}")
 
     def emit(self, op: SSAOp) -> None:
         if op.opcode == "barrier":
@@ -294,6 +504,12 @@ class SSACUDACodegen:
         result = op.result
         if result is None:
             raise TypeError(f"SSA opcode {op.opcode!r} requires a result")
+
+        if self.should_defer_result(result) and (
+            op.opcode in self.BINARY_OPS
+            or op.opcode in {"addptr", "load", "expand_dims"}
+        ):
+            return
 
         if op.opcode == "program_id":
             axis = op.attrs["axis"]
@@ -404,13 +620,6 @@ class SSACUDACodegen:
             if not isinstance(operand, SSAValue):
                 raise TypeError(f"expand_dims expects SSA operand, got {operand}")
 
-            arange_ref = self.operand(operand)
-            if not isinstance(arange_ref, CudaArangeRef):
-                raise TypeError(
-                    "CUDA expand_dims MVP supports only direct arange expansion, "
-                    f"got {arange_ref}"
-                )
-
             axis = op.attrs["axis"]
             rows, cols = self.block_shape
 
@@ -418,6 +627,17 @@ class SSACUDACodegen:
                 raise TypeError(f"expand_dims expects block result, got {result.ty}")
 
             result_shape = result.ty.shape
+
+            if self.should_defer_result(result):
+                return
+
+            arange_ref = self.operand(operand)
+            if not isinstance(arange_ref, CudaArangeRef):
+                raise TypeError(
+                    "CUDA expand_dims MVP supports only direct arange expansion, "
+                    f"got {arange_ref}"
+                )
+
             if axis == 1 and result_shape == (rows, 1):
                 coord = "tile_i"
             elif axis == 0 and result_shape == (1, cols):
@@ -447,6 +667,9 @@ class SSACUDACodegen:
         self.shared_lines = []
         self.values = {}
         self.block_shape = cuda_kernel_block_shape(ssa_ops)
+        self.ops_by_result = {
+            op.result.id: op for op in ssa_ops if op.result is not None
+        }
 
         self.emit_rank2_prologue()
 

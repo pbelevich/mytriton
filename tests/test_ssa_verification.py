@@ -182,13 +182,3 @@ def test_verifier_accepts_dot_k1():
     ]
 
     verify(ops, block_size=8)
-
-
-def test_verifier_rejects_dot_k_greater_than_one_for_now():
-    lhs = SSAValue(0, BlockType((4, 16), F32))
-    rhs = SSAValue(1, BlockType((16, 8), F32))
-    out = SSAValue(2, BlockType((4, 8), F32))
-    op = SSAOp("dot", (lhs, rhs), out)
-
-    with pytest.raises(CompileError, match="dot MVP supports only K=1"):
-        SSAVerifier(block_size=32).check_dot(0, op)

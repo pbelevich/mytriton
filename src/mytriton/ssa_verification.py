@@ -327,13 +327,6 @@ class SSAVerifier:
                 f"dot inner dimensions must match, got {lhs_ty} and {rhs_ty}",
             )
 
-        if k_lhs != 1:
-            self.fail(
-                index,
-                op,
-                f"dot MVP supports only K=1 operands, got {lhs_ty} and {rhs_ty}",
-            )
-
         expected_ty = BlockType((m, n), F32)
         self.require_type(index, op, result_ty, expected_ty)
 

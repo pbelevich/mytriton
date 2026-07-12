@@ -3,6 +3,7 @@ import pytest
 
 import mytriton as triton
 import mytriton.language as tl
+from mytriton.ssa import SSAValue
 
 
 @triton.jit
@@ -96,3 +97,49 @@ def test_matmul_2d_dot_executes_with_cupy_when_cuda_is_available():
 
     expected = a @ b
     cp.testing.assert_allclose(c, expected, rtol=1e-5, atol=1e-5)
+
+
+@triton.jit
+def dot_full_shape_kernel(
+    a, b, c, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr
+):
+    m = tl.arange(0, BM)[:, None]
+    n = tl.arange(0, BN)[None, :]
+    k = tl.arange(0, BK)
+
+    lhs = tl.load(a + m * BK + k[None, :])
+    rhs = tl.load(b + k[:, None] * BN + n)
+
+    out = tl.dot(lhs, rhs)
+    tl.store(c + m * BN + n, out)
+
+
+@pytest.mark.codegen
+def test_dot_full_k_generates_single_dot_op(monkeypatch):
+    monkeypatch.setenv("MYTRITON_BACKEND", "cuda")
+
+    BM, BN, BK = 4, 8, 16
+
+    a = np.zeros((BM, BK), dtype=np.float32)
+    b = np.zeros((BK, BN), dtype=np.float32)
+    c = np.zeros((BM, BN), dtype=np.float32)
+
+    dot_full_shape_kernel.clear_cache()
+    _, ssa_ops, cuda_src = dot_full_shape_kernel[lambda meta: (1, 1)](
+        a, b, c, BM=BM, BN=BN, BK=BK
+    )
+
+    dot_ops = [op for op in ssa_ops if op.opcode == "dot"]
+    assert len(dot_ops) == 1
+
+    dot = dot_ops[0]
+    assert dot.result is not None
+    assert isinstance(dot.operands[0], SSAValue)
+    assert isinstance(dot.operands[1], SSAValue)
+    assert str(dot.operands[0].ty) == "block<4x16 x f32>"
+    assert str(dot.operands[1].ty) == "block<16x8 x f32>"
+    assert str(dot.result.ty) == "block<4x8 x f32>"
+
+    assert "int tile_i = threadIdx.x / 8;" in cuda_src
+    assert "int tile_j = threadIdx.x % 8;" in cuda_src
+    assert cuda_src.count(" += ") >= BK

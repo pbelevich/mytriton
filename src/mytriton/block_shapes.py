@@ -44,7 +44,35 @@ def result_block_shapes(ssa_ops: list[SSAOp]) -> list[tuple[int, ...]]:
     ]
 
 
+def operand_block_shapes(operands) -> list[tuple[int, ...]]:
+    shapes = []
+    for operand in operands:
+        ty = getattr(operand, "ty", None)
+        if isinstance(ty, BlockType):
+            shapes.append(ty.shape)
+    return shapes
+
+
+def store_block_shapes(ssa_ops: list[SSAOp]) -> list[tuple[int, ...]]:
+    shapes = []
+    for op in ssa_ops:
+        if op.opcode == "store":
+            shapes.extend(operand_block_shapes(op.operands))
+    return shapes
+
+
 def cuda_kernel_block_shape(ssa_ops: list[SSAOp]) -> tuple[int, ...]:
+    store_shapes = store_block_shapes(ssa_ops)
+    store_rank2_shapes = [shape for shape in store_shapes if len(shape) == 2]
+
+    if store_rank2_shapes:
+        block_shape = broadcast_shapes(*store_rank2_shapes)
+
+        if len(block_shape) != 2:
+            raise ValueError(f"expected rank-2 CUDA block shape, got {block_shape}")
+
+        return block_shape
+
     shapes = result_block_shapes(ssa_ops)
 
     if not shapes:
@@ -64,24 +92,6 @@ def cuda_kernel_block_shape(ssa_ops: list[SSAOp]) -> tuple[int, ...]:
 
         if len(block_shape) != 2:
             raise ValueError(f"expected rank-2 CUDA block shape, got {block_shape}")
-
-        # In a rank-2 kernel it is normal to have rank-1 aranges:
-        #   arange(0, BM) -> vector<BM>
-        #   arange(0, BN) -> vector<BN>
-        #
-        # They are coordinate vectors, not execution width.
-        allowed_rank1_widths = {block_shape[0], block_shape[1], prod(block_shape)}
-
-        bad_widths = [
-            shape[0] for shape in rank1_shapes if shape[0] not in allowed_rank1_widths
-        ]
-
-        if bad_widths:
-            raise ValueError(
-                "rank-1 block widths in a rank-2 CUDA kernel must match "
-                f"one tile dimension or full tile size; got {bad_widths}, "
-                f"tile shape is {block_shape}"
-            )
 
         return block_shape
 
