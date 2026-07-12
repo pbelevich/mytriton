@@ -255,7 +255,7 @@ def test_naive_matmul_kernel_lowering():
         void naive_matmul_kernel(float* a, float* b, float* c, int n_cols) {
             int v0 = blockIdx.x;
             int v1 = (v0 * 3);
-            float v4 = (true ? a[(v1 + 0)] : 0.0f);
+            float v4 = a[(v1 + 0)];
             int v5 = (0 * n_cols);
             int v6 = blockIdx.y;
             int v7 = (v6 * 4);
@@ -264,11 +264,11 @@ def test_naive_matmul_kernel_lowering():
             int v10 = (v5 + v9);
             bool v12 = (v9 < n_cols);
             float v13 = (v12 ? b[v10] : 0.0f);
-            float v16 = (true ? a[(v1 + 1)] : 0.0f);
+            float v16 = a[(v1 + 1)];
             int v17 = (1 * n_cols);
             int v18 = (v17 + v9);
             float v20 = (v12 ? b[v18] : 0.0f);
-            float v23 = (true ? a[(v1 + 2)] : 0.0f);
+            float v23 = a[(v1 + 2)];
             int v24 = (2 * n_cols);
             int v25 = (v24 + v9);
             float v27 = (v12 ? b[v25] : 0.0f);

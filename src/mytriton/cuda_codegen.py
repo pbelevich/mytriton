@@ -427,11 +427,10 @@ class SSACUDACodegen:
             mask_operand = op.operands[1]
             other_operand = op.operands[2]
 
-            mask = (
-                "true"
-                if mask_operand is None
-                else self.render_value_at(mask_operand, indices)
-            )
+            if mask_operand is None:
+                return f"{ptr.base}[{ptr.index}]"
+
+            mask = self.render_value_at(mask_operand, indices)
 
             if other_operand is None:
                 other = "0.0f" if self.scalar_type(result_ty) == F32 else "0"
@@ -568,11 +567,11 @@ class SSACUDACodegen:
             ptr = self.pointer_operand(op.operands[0])
             mask_operand = op.operands[1]
             other_operand = op.operands[2]
-            mask = (
-                "true"
-                if mask_operand is None
-                else self.expression_operand(mask_operand)
-            )
+            if mask_operand is None:
+                self.assign(result, f"{ptr.base}[{ptr.index}]")
+                return
+
+            mask = self.expression_operand(mask_operand)
             if other_operand is None:
                 other = "0.0f" if self.scalar_type(result.ty) == F32 else "0"
             else:

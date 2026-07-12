@@ -75,7 +75,7 @@ def test_scalar_unmasked_load_and_store():
 
     _, _, cuda_src = scalar_copy_kernel[(1,)](source, out)
 
-    assert "float v0 = (true ? source[0] : 0.0f);" in cuda_src
+    assert "float v0 = source[0];" in cuda_src
     assert "out[0] = v0;" in cuda_src
 
 

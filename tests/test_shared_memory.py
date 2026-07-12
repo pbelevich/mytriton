@@ -112,7 +112,7 @@ def test_shared_roundtrip_2d_generates_cuda_source_without_execution(monkeypatch
             int v19 = (v18 + v9);
             smem17[v19] = v16;
             __syncthreads();
-            float v22 = (true ? smem17[v19] : 0.0f);
+            float v22 = smem17[v19];
             if (v15) {
                 out[v11] = v22;
             }
