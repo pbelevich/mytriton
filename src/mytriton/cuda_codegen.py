@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from typing import ClassVar
 
 from .block_shapes import cuda_kernel_block_shape, prod
-from .ssa import SSAOp, SSAOperand, SSAValue
+from .ssa import SSAForRange, SSAItem, SSAOp, SSAOperand, SSAValue
 from .trace import (
     BOOL,
     F32,
@@ -226,6 +226,53 @@ class SSACUDACodegen:
         )
         self.assign(result, f"{shared}[0]")
 
+    def emit_for_range(self, loop: SSAForRange) -> None:
+        start = self.expression_operand(loop.start)
+        stop = self.expression_operand(loop.stop)
+        step = self.expression_operand(loop.step)
+
+        index_name = f"v{loop.index.id}"
+
+        carried_names = []
+
+        for carried_input, carried_arg, result in zip(
+            loop.carried_inputs,
+            loop.carried_args,
+            loop.results,
+            strict=True,
+        ):
+            init = self.expression_operand(carried_input)
+            name = f"v{result.id}"
+            cuda_ty = self.cuda_type(result.ty)
+
+            self.lines.append(f"    {cuda_ty} {name} = {init};")
+            self.values[carried_arg.id] = name
+            self.values[result.id] = name
+            carried_names.append(name)
+
+        self.lines.append(
+            f"    for (int {index_name} = {start}; {index_name} < {stop}; {index_name} += {step}) {{"
+        )
+
+        self.values[loop.index.id] = index_name
+
+        body_start = len(self.lines)
+
+        for body_op in loop.body:
+            if isinstance(body_op, SSAForRange):
+                self.emit_for_range(body_op)
+            else:
+                self.emit(body_op)
+
+        for yielded, carried_name in zip(loop.yields, carried_names, strict=True):
+            value = self.expression_operand(yielded)
+            self.lines.append(f"    {carried_name} = {value};")
+
+        body_lines = self.lines[body_start:]
+        self.lines[body_start:] = [f"    {line}" for line in body_lines]
+
+        self.lines.append("    }")
+
     def emit(self, op: SSAOp) -> None:
         if op.opcode == "store":
             ptr = self.pointer_operand(op.operands[0])
@@ -376,7 +423,7 @@ class SSACUDACodegen:
     def generate(
         self,
         kernel_name: str,
-        ssa_ops: list[SSAOp],
+        ssa_ops: list[SSAItem],
         params: list[Param],
     ) -> str:
         self.lines = []
@@ -391,7 +438,10 @@ class SSACUDACodegen:
         )
 
         for op in ssa_ops:
-            self.emit(op)
+            if isinstance(op, SSAForRange):
+                self.emit_for_range(op)
+            else:
+                self.emit(op)
 
         body = [
             'extern "C" __global__',
