@@ -1,7 +1,7 @@
 from typing import ClassVar, NoReturn
 
 from .block_shapes import broadcast_shapes
-from .ssa import SSAOp, SSAOperand, SSAValue
+from .ssa import SSAForRange, SSAItem, SSAOp, SSAOperand, SSAValue
 from .trace import (
     BOOL,
     F32,
@@ -297,10 +297,211 @@ class SSAVerifier:
         expected_ty = self.with_shape(index, op, BOOL, lhs_ty, rhs_ty)
         self.require_type(index, op, result_ty, expected_ty)
 
-    def verify(self, ops: list[SSAOp]) -> list[SSAOp]:
-        defined: set[int] = set()
+    def require_defined(
+        self,
+        index: int,
+        op: SSAOp,
+        operand: SSAOperand,
+        role: str,
+        defined: set[int],
+    ) -> None:
+        if isinstance(operand, SSAValue) and operand.id not in defined:
+            self.fail(index, op, f"{role} {operand} used before definition")
 
+    def require_fresh_id(
+        self,
+        index: int,
+        op: SSAOp,
+        value: SSAValue,
+        role: str,
+        defined: set[int],
+    ) -> None:
+        if value.id in defined:
+            self.fail(index, op, f"duplicate definition of {role} {value}")
+        defined.add(value.id)
+
+    def check_loop_bound(
+        self,
+        index: int,
+        operand: SSAOperand,
+        role: str,
+        defined: set[int],
+    ) -> None:
+        fake_op = SSAOp("for")
+        self.require_defined(index, fake_op, operand, role, defined)
+        ty = self.require_operand_type(index, fake_op, operand, role)
+
+        if ty != I32:
+            self.fail(index, fake_op, f"{role} must be scalar i32, got {ty}")
+
+    def check_for_range(
+        self,
+        index: int,
+        loop: SSAForRange,
+        defined: set[int],
+    ) -> None:
+        fake_op = SSAOp("for")
+
+        self.check_loop_bound(index, loop.start, "loop start", defined)
+        self.check_loop_bound(index, loop.stop, "loop stop", defined)
+        self.check_loop_bound(index, loop.step, "loop step", defined)
+
+        if loop.index.ty != I32:
+            self.fail(index, fake_op, f"loop index must be i32, got {loop.index.ty}")
+
+        if not isinstance(loop.step, Const) or type(loop.step.value) is not int:
+            self.fail(index, fake_op, "loop step must be a constant integer")
+
+        if loop.step.value <= 0:
+            self.fail(index, fake_op, "loop step must be positive")
+
+        if len(loop.carried_inputs) != len(loop.carried_args):
+            self.fail(index, fake_op, "mismatched carried inputs/args")
+
+        if len(loop.yields) != len(loop.results):
+            self.fail(index, fake_op, "mismatched yields/results")
+
+        if len(loop.carried_inputs) != len(loop.results):
+            self.fail(index, fake_op, "mismatched carried inputs/results")
+
+        body_defined = set(defined)
+        self.require_fresh_id(
+            index,
+            fake_op,
+            loop.index,
+            "loop index",
+            body_defined,
+        )
+
+        for carried_input, carried_arg in zip(
+            loop.carried_inputs,
+            loop.carried_args,
+            strict=True,
+        ):
+            self.require_defined(
+                index,
+                fake_op,
+                carried_input,
+                "carried input",
+                defined,
+            )
+            input_ty = self.require_operand_type(
+                index, fake_op, carried_input, "carried input"
+            )
+            if carried_arg.ty != input_ty:
+                self.fail(
+                    index,
+                    fake_op,
+                    f"carried arg expected {input_ty}, got {carried_arg.ty}",
+                )
+            self.require_fresh_id(
+                index,
+                fake_op,
+                carried_arg,
+                "carried argument",
+                body_defined,
+            )
+
+        self._verify_ops(loop.body, body_defined)
+
+        for carried_input, carried_arg, yielded, result in zip(
+            loop.carried_inputs,
+            loop.carried_args,
+            loop.yields,
+            loop.results,
+            strict=True,
+        ):
+            self.require_defined(index, fake_op, yielded, "yield", body_defined)
+            input_ty = self.require_operand_type(
+                index, fake_op, carried_input, "carried input"
+            )
+            yield_ty = self.require_operand_type(index, fake_op, yielded, "yield")
+            if yield_ty != carried_arg.ty:
+                self.fail(
+                    index,
+                    fake_op,
+                    f"yield expected {carried_arg.ty}, got {yield_ty}",
+                )
+            if result.ty != yield_ty:
+                self.fail(
+                    index,
+                    fake_op,
+                    f"loop result expected {yield_ty}, got {result.ty}",
+                )
+            if result.ty != input_ty:
+                self.fail(
+                    index,
+                    fake_op,
+                    f"loop result expected carried type {input_ty}, got {result.ty}",
+                )
+
+        for result in loop.results:
+            self.require_fresh_id(
+                index,
+                fake_op,
+                result,
+                "loop result",
+                body_defined,
+            )
+            defined.add(result.id)
+
+    def check_program_id(self, index, op):
+        axis = op.attrs.get("axis")
+        if axis not in (0, 1, 2):
+            self.fail(index, op, f"invalid axis {axis}")
+        self.require_type(index, op, self.result_type(index, op), I32)
+
+    def check_arange(self, index, op):
+        start = op.attrs.get("start")
+        end = op.attrs.get("end")
+
+        if type(start) is not int or type(end) is not int:
+            self.fail(index, op, "arange start and end must be integers")
+
+        assert isinstance(start, int)
+        assert isinstance(end, int)
+        width = end - start
+
+        if width <= 0:
+            self.fail(index, op, f"invalid range [{start}, {end})")
+
+        expected_ty = BlockType((width,), I32)
+        self.require_type(index, op, self.result_type(index, op), expected_ty)
+
+        if width > self.block_size:
+            self.fail(
+                index,
+                op,
+                f"range width {width} does not match CUDA block size {self.block_size}",
+            )
+
+    def check_expand_dims(self, index, op):
+        value_ty = self.require_operand_type(index, op, op.operands[0], "value")
+        result_ty = self.result_type(index, op)
+        axis = op.attrs.get("axis")
+
+        if not isinstance(value_ty, BlockType):
+            self.fail(index, op, f"expand_dims expects block, got {value_ty}")
+
+        if type(axis) is not int or axis < 0 or axis > value_ty.rank:
+            self.fail(index, op, f"invalid axis {axis}")
+
+        expected = BlockType(
+            (*value_ty.shape[:axis], 1, *value_ty.shape[axis:]),
+            value_ty.element,
+        )
+        self.require_type(index, op, result_ty, expected)
+
+    def verify(self, ops: list[SSAItem]) -> list[SSAItem]:
+        self._verify_ops(ops, defined=set())
+        return ops
+
+    def _verify_ops(self, ops: list[SSAItem], defined: set[int]) -> None:
         for index, op in enumerate(ops):
+            if isinstance(op, SSAForRange):
+                self.check_for_range(index, op, defined)
+                continue
+
             if op.opcode not in self.ARITY:
                 self.fail(index, op, "unsupported operation")
 
@@ -313,96 +514,46 @@ class SSAVerifier:
                     f"expected {expected_arity} operands, got {len(op.operands)}",
                 )
 
-            should_have_result = op.opcode != "store"
+            should_have_result = op.opcode not in {"store"}
 
-            if should_have_result != (op.result is not None):
-                self.fail(index, op, "invalid result declaration")
+            if should_have_result and op.result is None:
+                self.fail(index, op, "missing result")
+
+            if not should_have_result and op.result is not None:
+                self.fail(index, op, "unexpected result")
 
             for operand in op.operands:
                 if isinstance(operand, SSAValue) and operand.id not in defined:
                     self.fail(index, op, f"{operand} used before definition")
 
-            if op.opcode == "program_id":
-                axis = op.attrs.get("axis")
-
-                if axis not in (0, 1, 2):
-                    self.fail(index, op, f"invalid axis {axis}")
-
-                self.require_type(index, op, self.result_type(index, op), I32)
-
-            elif op.opcode == "arange":
-                start = op.attrs.get("start")
-                end = op.attrs.get("end")
-
-                if type(start) is not int or type(end) is not int:
-                    self.fail(index, op, "arange start and end must be integers")
-
-                assert isinstance(start, int)
-                assert isinstance(end, int)
-                width = end - start
-
-                if width <= 0:
-                    self.fail(index, op, f"invalid range [{start}, {end})")
-
-                expected_ty = BlockType((width,), I32)
-                self.require_type(index, op, self.result_type(index, op), expected_ty)
-
-                if width > self.block_size:
-                    self.fail(
-                        index,
-                        op,
-                        f"range width {width} does not match "
-                        f"CUDA block size {self.block_size}",
-                    )
-
-            elif op.opcode in ("add", "sub", "mul", "div", "cmp_lt") or op.opcode in (
-                "maximum",
-                "minimum",
-            ):
+            if op.opcode in {"add", "sub", "mul", "div", "cmp_lt"}:
                 self.check_binary_numeric(index, op)
-
-            elif op.opcode in ("neg", "exp"):
-                self.check_unary(index, op)
-
-            elif op.opcode == "addptr":
-                self.check_addptr(index, op)
-
-            elif op.opcode == "load":
-                self.check_load(index, op)
-
-            elif op.opcode == "store":
-                self.check_store(index, op)
-
-            elif op.opcode == "select":
-                self.check_select(index, op)
-
-            elif op.opcode in ("sum", "max", "min"):
-                self.check_reduction(index, op)
-
-            elif op.opcode == "expand_dims":
-                value_ty = self.require_operand_type(index, op, op.operands[0], "value")
-                result_ty = self.result_type(index, op)
-                axis = op.attrs.get("axis")
-
-                if not isinstance(value_ty, BlockType):
-                    self.fail(index, op, f"expand_dims expects block, got {value_ty}")
-
-                if type(axis) is not int or axis < 0 or axis > value_ty.rank:
-                    self.fail(index, op, f"invalid axis {axis}")
-
-                expected = BlockType(
-                    (*value_ty.shape[:axis], 1, *value_ty.shape[axis:]),
-                    value_ty.element,
-                )
-                self.require_type(index, op, result_ty, expected)
-
             elif op.opcode == "and":
                 self.check_binary_bool(index, op)
+            elif op.opcode in {"neg", "exp"}:
+                self.check_unary(index, op)
+            elif op.opcode == "addptr":
+                self.check_addptr(index, op)
+            elif op.opcode == "load":
+                self.check_load(index, op)
+            elif op.opcode == "store":
+                self.check_store(index, op)
+            elif op.opcode == "select":
+                self.check_select(index, op)
+            elif op.opcode in {"sum", "max", "min"}:
+                self.check_reduction(index, op)
+            elif op.opcode == "expand_dims":
+                self.check_expand_dims(index, op)
+            elif op.opcode == "program_id":
+                self.check_program_id(index, op)
+            elif op.opcode == "arange":
+                self.check_arange(index, op)
+            elif op.opcode in {"maximum", "minimum"}:
+                self.check_binary_numeric(index, op)
+            else:
+                self.fail(index, op, "missing verifier rule")
 
             if op.result is not None:
                 if op.result.id in defined:
                     self.fail(index, op, f"duplicate definition of {op.result}")
-
                 defined.add(op.result.id)
-
-        return ops

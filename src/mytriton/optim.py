@@ -2,7 +2,7 @@ import math
 from collections.abc import Mapping
 from typing import ClassVar
 
-from .ssa import SSAOp, SSAOperand, SSAValue
+from .ssa import SSAForRange, SSAOp, SSAOperand, SSAValue
 from .trace import BOOL, F32, I32, BlockType, Const, Param
 
 # Optimization passes assume their input SSA has already passed SSAVerifier.
@@ -264,6 +264,10 @@ class PassManager:
         self.verifier = verifier
 
     def run(self, ops):
+        if any(isinstance(op, SSAForRange) for op in ops):
+            self.verifier.verify(ops)
+            return ops
+
         for compiler_pass in self.passes:
             ops = compiler_pass.run(ops)
             self.verifier.verify(ops)

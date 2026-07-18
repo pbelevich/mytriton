@@ -6,6 +6,7 @@ import pytest
 import mytriton as triton
 import mytriton.language as tl
 from mytriton.cuda_codegen import SSACUDACodegen
+from mytriton.ssa import SSAOp
 from mytriton.trace import Const
 
 
@@ -248,14 +249,18 @@ def test_cached_results_cannot_mutate_artifact():
     out = np.empty(1, dtype=np.float32)
     ops, ssa_ops, _ = immutable_kernel[(1,)](out)
     ops[0].value = Const(9.0)
-    ssa_ops[-1].operands = ()
+    last_ssa_op = ssa_ops[-1]
+    assert isinstance(last_ssa_op, SSAOp)
+    last_ssa_op.operands = ()
     ops.clear()
     ssa_ops.clear()
 
     cached_ops, cached_ssa_ops, _ = immutable_kernel[(1,)](out)
 
     assert cached_ops[0].value == Const(1.0)
-    assert cached_ssa_ops[-1].operands
+    last_cached_ssa_op = cached_ssa_ops[-1]
+    assert isinstance(last_cached_ssa_op, SSAOp)
+    assert last_cached_ssa_op.operands
 
 
 def test_constexpr_cache_distinguishes_python_types():

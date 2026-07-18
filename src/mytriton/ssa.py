@@ -2,12 +2,17 @@ from dataclasses import dataclass, field
 from typing import ClassVar
 
 from .trace import (
+    I32,
     AddPtr,
     Arange,
     BinOp,
     Const,
     ExpandDims,
+    ForRange,
     Load,
+    LoopCarry,
+    LoopIndex,
+    LoopResult,
     Max,
     Maximum,
     Min,
@@ -43,6 +48,22 @@ class SSAOp:
     attrs: dict[str, object] = field(default_factory=dict)
 
 
+@dataclass
+class SSAForRange:
+    index: SSAValue
+    start: SSAOperand
+    stop: SSAOperand
+    step: SSAOperand
+    carried_inputs: tuple[SSAOperand, ...]
+    carried_args: tuple[SSAValue, ...]
+    body: list["SSAItem"]
+    yields: tuple[SSAOperand, ...]
+    results: tuple[SSAValue, ...]
+
+
+SSAItem = SSAOp | SSAForRange
+
+
 class SSALowering:
     BINOPS: ClassVar[dict[str, str]] = {
         "+": "add",
@@ -59,13 +80,16 @@ class SSALowering:
         self.next_id = 0
         self.type_inference = TypeInference()
 
-    def new_result(self, expr):
+    def new_value(self, ty: Type) -> SSAValue:
         result = SSAValue(
             id=self.next_id,
-            ty=self.type_inference.infer(expr),
+            ty=ty,
         )
         self.next_id += 1
         return result
+
+    def new_result(self, expr):
+        return self.new_value(self.type_inference.infer(expr))
 
     def emit(self, opcode, expr, operands=(), attrs=None):
         result = self.new_result(expr)
@@ -85,6 +109,11 @@ class SSALowering:
     def lower_expr(self, expr):
         if isinstance(expr, (Const, Param)):
             return expr
+
+        if isinstance(expr, (LoopIndex, LoopCarry)):
+            if id(expr) not in self.memo:
+                raise TypeError(f"loop value used outside of loop body: {expr}")
+            return self.memo[id(expr)]
 
         if id(expr) in self.memo:
             return self.memo[id(expr)]
@@ -205,26 +234,122 @@ class SSALowering:
                 attrs={"axis": expr.axis},
             )
 
+        if isinstance(expr, LoopResult):
+            if id(expr) not in self.memo:
+                raise TypeError("loop result used before loop was lowered")
+            return self.memo[id(expr)]
+
         raise TypeError(f"Cannot lower expression: {expr}")
+
+    def lower_for_range(self, loop: ForRange) -> None:
+        old_ops = self.ops
+        old_memo = self.memo.copy()
+        old_next_id = self.next_id
+        old_inferred_types = self.type_inference.types.copy()
+        old_memo_values: dict[int, SSAOperand] = {}
+
+        def set_loop_memo(expr, value: SSAOperand) -> None:
+            key = id(expr)
+            if key in self.memo:
+                old_memo_values[key] = self.memo[key]
+            self.memo[key] = value
+
+        try:
+            start = self.lower_expr(loop.start)
+            stop = self.lower_expr(loop.stop)
+            step = self.lower_expr(loop.step)
+            for capture in loop.captures:
+                self.lower_expr(capture)
+            carried_inputs = tuple(
+                self.lower_expr(value) for value in loop.carried_inputs
+            )
+
+            index_value = self.new_value(I32)
+            carried_args = tuple(
+                self.new_value(self.type_inference.infer(arg.initial))
+                for arg in loop.carried_args
+            )
+
+            set_loop_memo(loop.index, index_value)
+            for carried_arg, ssa_arg in zip(
+                loop.carried_args,
+                carried_args,
+                strict=True,
+            ):
+                set_loop_memo(carried_arg, ssa_arg)
+
+            self.ops = []
+            for body_op in loop.body:
+                self._lower_top_level_op(body_op)
+
+            yields = tuple(self.lower_expr(value) for value in loop.carried_outputs)
+            body_ops = self.ops
+
+            results = tuple(
+                self.new_value(self.type_inference.infer(result))
+                for result in loop.results
+            )
+
+            for loop_result, ssa_result in zip(loop.results, results, strict=True):
+                self.memo[id(loop_result)] = ssa_result
+
+            self.ops = old_ops
+
+            # Restore memo entries for loop-local placeholders.
+            for expr in (loop.index, *loop.carried_args):
+                key = id(expr)
+                if key in old_memo_values:
+                    self.memo[key] = old_memo_values[key]
+                else:
+                    del self.memo[key]
+
+            self.ops.append(
+                SSAForRange(
+                    index=index_value,
+                    start=start,
+                    stop=stop,
+                    step=step,
+                    carried_inputs=carried_inputs,
+                    carried_args=carried_args,
+                    body=body_ops,
+                    yields=yields,
+                    results=results,
+                )
+            )
+        except BaseException:
+            self.ops = old_ops
+            self.memo.clear()
+            self.memo.update(old_memo)
+            self.next_id = old_next_id
+            self.type_inference.types.clear()
+            self.type_inference.types.update(old_inferred_types)
+            raise
+
+    def _lower_top_level_op(self, op) -> None:
+        if isinstance(op, Store):
+            self.type_inference.check_store(op)
+
+            value = self.lower_expr(op.value)
+            ptr = self.lower_expr(op.ptr)
+            mask = self.lower_expr(op.mask) if op.mask is not None else None
+
+            self.ops.append(
+                SSAOp(
+                    opcode="store",
+                    operands=(ptr, value, mask),
+                )
+            )
+            return
+
+        if isinstance(op, ForRange):
+            self.lower_for_range(op)
+            return
+
+        raise TypeError(f"Cannot lower operation: {op}")
 
     def lower(self, top_level_ops):
         for op in top_level_ops:
-            if isinstance(op, Store):
-                self.type_inference.check_store(op)
-
-                value = self.lower_expr(op.value)
-                ptr = self.lower_expr(op.ptr)
-                mask = self.lower_expr(op.mask) if op.mask is not None else None
-
-                self.ops.append(
-                    SSAOp(
-                        opcode="store",
-                        operands=(ptr, value, mask),
-                    )
-                )
-                continue
-
-            raise TypeError(f"Cannot lower operation: {op}")
+            self._lower_top_level_op(op)
 
         return self.ops
 
@@ -245,23 +370,60 @@ class SSAPrinter:
 
         raise TypeError(f"Unknown SSA operand: {value}")
 
-    def print_ops(self, ops):
+    def print_op(self, op: SSAOp) -> str:
+        operands = ", ".join(self.operand(x) for x in op.operands)
+        attrs = ", ".join(f"{key}={value}" for key, value in op.attrs.items())
+
+        suffix = f" {{{attrs}}}" if attrs else ""
+        operation = op.opcode
+        if operands:
+            operation += f" {operands}"
+        operation += suffix
+
+        if op.result is None:
+            return operation
+        return f"{op.result} = {operation} : {op.result.ty}"
+
+    def print_for_range(self, loop: SSAForRange) -> list[str]:
+        results = ", ".join(str(result) for result in loop.results)
+        result_prefix = f"{results} = " if results else ""
+        carried = ", ".join(
+            f"{arg} = {self.operand(initial)}"
+            for arg, initial in zip(
+                loop.carried_args,
+                loop.carried_inputs,
+                strict=True,
+            )
+        )
+        iter_args = f" iter_args({carried})" if carried else ""
+        result_types = ", ".join(str(result.ty) for result in loop.results)
+        type_suffix = f" : {result_types}" if result_types else ""
+        lines = [
+            f"{result_prefix}for {loop.index} in range("
+            f"{self.operand(loop.start)}, {self.operand(loop.stop)}, "
+            f"{self.operand(loop.step)}){iter_args}{type_suffix} {{"
+        ]
+
+        for body_op in loop.body:
+            body_lines = (
+                self.print_for_range(body_op)
+                if isinstance(body_op, SSAForRange)
+                else [self.print_op(body_op)]
+            )
+            lines.extend(f"  {line}" for line in body_lines)
+
+        yields = ", ".join(self.operand(value) for value in loop.yields)
+        lines.append(f"  yield {yields}" if yields else "  yield")
+        lines.append("}")
+        return lines
+
+    def print_ops(self, ops: list[SSAItem]) -> str:
         lines = []
 
         for op in ops:
-            operands = ", ".join(self.operand(x) for x in op.operands)
-
-            attrs = ", ".join(f"{key}={value}" for key, value in op.attrs.items())
-
-            suffix = f" {{{attrs}}}" if attrs else ""
-            operation = op.opcode
-            if operands:
-                operation += f" {operands}"
-            operation += suffix
-
-            if op.result is None:
-                lines.append(operation)
+            if isinstance(op, SSAForRange):
+                lines.extend(self.print_for_range(op))
             else:
-                lines.append(f"{op.result} = {operation} : {op.result.ty}")
+                lines.append(self.print_op(op))
 
         return "\n".join(lines)

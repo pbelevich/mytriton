@@ -278,6 +278,60 @@ class ExpandDims:
     axis: int
 
 
+@dataclass
+class LoopIndex:
+    name: str
+
+
+@dataclass
+class LoopCarry:
+    index: int
+    initial: Expression
+
+
+@dataclass
+class LoopResult:
+    loop: ForRange
+    index: int
+
+
+@dataclass
+class ForRange:
+    index: LoopIndex
+    start: Expression
+    stop: Expression
+    step: Expression
+    captures: tuple[Expression, ...]
+    body: list[TopLevelOp]
+    carried_inputs: tuple[Expression, ...]
+    carried_args: tuple[LoopCarry, ...]
+    carried_outputs: tuple[Expression, ...]
+    results: tuple[LoopResult, ...] = ()
+
+
+Expression: TypeAlias = (
+    Const
+    | Param
+    | ProgramId
+    | Arange
+    | BinOp
+    | AddPtr
+    | Load
+    | Maximum
+    | Minimum
+    | UnaryOp
+    | Where
+    | Sum
+    | Max
+    | Min
+    | ExpandDims
+    | LoopIndex
+    | LoopCarry
+    | LoopResult
+)
+TopLevelOp: TypeAlias = Store | ForRange
+
+
 # ----------------------------
 # Symbolic values
 # ----------------------------
@@ -370,13 +424,15 @@ class Builder:
 
     def __init__(self):
         self.ops = []
+        self._previous = None
 
     def __enter__(self):
+        self._previous = Builder._current
         Builder._current = self
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        Builder._current = None
+        Builder._current = self._previous
 
     @staticmethod
     def current():

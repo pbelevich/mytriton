@@ -18,7 +18,7 @@ from .cuda_utils import (
 )
 from .mlir_codegen import MLIRCodegen, compile_mlir_source_to_cubin
 from .optim import ConstantFoldPass, CSEPass, DCEPass, PassManager
-from .ssa import SSALowering, SSAOp
+from .ssa import SSAItem, SSALowering
 from .ssa_verification import SSAVerifier
 from .trace import (
     is_constexpr_annotation,
@@ -29,7 +29,7 @@ P = ParamSpec("P")
 Meta: TypeAlias = dict[str, Any]
 LaunchDimensions: TypeAlias = int | Sequence[int]
 Grid: TypeAlias = LaunchDimensions | Callable[[Meta], LaunchDimensions]
-CompilationResult: TypeAlias = tuple[list[Any], list[SSAOp], str]
+CompilationResult: TypeAlias = tuple[list[Any], list[SSAItem], str]
 
 
 Backend: TypeAlias = Literal["cuda", "mlir"]
@@ -53,7 +53,7 @@ def _constexpr_key(
 @dataclass(frozen=True)
 class _CompilationArtifact:
     ops: tuple[Any, ...]
-    ssa_ops: tuple[SSAOp, ...]
+    ssa_ops: tuple[SSAItem, ...]
     src: str
     threads_per_block: int
     cubin: bytes | None = None
