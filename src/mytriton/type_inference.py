@@ -10,7 +10,9 @@ from .trace import (
     BinOp,
     BlockType,
     Const,
+    Empty,
     ExpandDims,
+    Full,
     Load,
     LoopCarry,
     LoopIndex,
@@ -28,6 +30,7 @@ from .trace import (
     Type,
     UnaryOp,
     Where,
+    Zeros,
 )
 
 
@@ -127,6 +130,20 @@ class TypeInference:
                 )
 
             ty = BlockType((size,), I32)
+
+        elif isinstance(expr, (Empty, Zeros)):
+            ty = BlockType(expr.shape, expr.dtype)
+
+        elif isinstance(expr, Full):
+            value_ty = self.infer(expr.value)
+            if isinstance(value_ty, BlockType):
+                raise TypeError(f"full value must be scalar, got {value_ty}")
+            self.require_convertible(
+                value_ty,
+                expr.dtype,
+                context="full value",
+            )
+            ty = BlockType(expr.shape, expr.dtype)
 
         elif isinstance(expr, BinOp):
             lhs = self.infer(expr.lhs)

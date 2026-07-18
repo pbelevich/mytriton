@@ -28,8 +28,7 @@ def matmul_2d_kernel(
     c_offsets = offs_m * N + offs_n
     c_mask = (offs_m < M) & (offs_n < N)
 
-    # symbolic zero tile: block<BM x BN x f32>
-    acc = c_offsets * 0.0
+    acc = tl.zeros((BM, BN), tl.float32)
 
     for k in tl.static_range(0, K):
         a_offsets = offs_m * K + k
@@ -67,51 +66,51 @@ def test_matmul_2d_generates_rank2_cuda_source_without_execution(monkeypatch):
 
     expected_ssa = dedent(
         """\
-        %0 = program_id {axis=0} : i32
-        %1 = mul %0, 4 : i32
-        %2 = arange {start=0, end=4} : vector<4 x i32>
-        %3 = expand_dims %2 {axis=1} : block<4x1 x i32>
-        %4 = add %1, %3 : block<4x1 x i32>
-        %5 = mul %4, N : block<4x1 x i32>
-        %6 = program_id {axis=1} : i32
-        %7 = mul %6, 8 : i32
-        %8 = arange {start=0, end=8} : vector<8 x i32>
-        %9 = expand_dims %8 {axis=0} : block<1x8 x i32>
-        %10 = add %7, %9 : block<1x8 x i32>
-        %11 = add %5, %10 : block<4x8 x i32>
-        %12 = mul %11, 0.0 : block<4x8 x f32>
-        %13 = mul %4, 3 : block<4x1 x i32>
-        %15 = addptr a, %13 : block<4x1 x ptr<f32>>
-        %16 = cmp_lt %4, M : block<4x1 x bool>
-        %17 = load %15, %16, 0.0 : block<4x1 x f32>
-        %18 = mul 0, N : i32
-        %19 = add %18, %10 : block<1x8 x i32>
-        %20 = addptr b, %19 : block<1x8 x ptr<f32>>
-        %21 = cmp_lt %10, N : block<1x8 x bool>
-        %22 = load %20, %21, 0.0 : block<1x8 x f32>
-        %23 = mul %17, %22 : block<4x8 x f32>
-        %24 = add %12, %23 : block<4x8 x f32>
-        %26 = add %13, 1 : block<4x1 x i32>
-        %27 = addptr a, %26 : block<4x1 x ptr<f32>>
-        %29 = load %27, %16, 0.0 : block<4x1 x f32>
-        %30 = mul 1, N : i32
-        %31 = add %30, %10 : block<1x8 x i32>
-        %32 = addptr b, %31 : block<1x8 x ptr<f32>>
-        %34 = load %32, %21, 0.0 : block<1x8 x f32>
-        %35 = mul %29, %34 : block<4x8 x f32>
-        %36 = add %24, %35 : block<4x8 x f32>
-        %38 = add %13, 2 : block<4x1 x i32>
-        %39 = addptr a, %38 : block<4x1 x ptr<f32>>
-        %41 = load %39, %16, 0.0 : block<4x1 x f32>
-        %42 = mul 2, N : i32
-        %43 = add %42, %10 : block<1x8 x i32>
-        %44 = addptr b, %43 : block<1x8 x ptr<f32>>
-        %46 = load %44, %21, 0.0 : block<1x8 x f32>
-        %47 = mul %41, %46 : block<4x8 x f32>
-        %48 = add %36, %47 : block<4x8 x f32>
-        %49 = addptr c, %11 : block<4x8 x ptr<f32>>
-        %52 = and %16, %21 : block<4x8 x bool>
-        store %49, %48, %52
+        %0 = zeros {shape=(4, 8), dtype=f32} : block<4x8 x f32>
+        %1 = program_id {axis=0} : i32
+        %2 = mul %1, 4 : i32
+        %3 = arange {start=0, end=4} : vector<4 x i32>
+        %4 = expand_dims %3 {axis=1} : block<4x1 x i32>
+        %5 = add %2, %4 : block<4x1 x i32>
+        %6 = mul %5, 3 : block<4x1 x i32>
+        %8 = addptr a, %6 : block<4x1 x ptr<f32>>
+        %9 = cmp_lt %5, M : block<4x1 x bool>
+        %10 = load %8, %9, 0.0 : block<4x1 x f32>
+        %11 = mul 0, N : i32
+        %12 = program_id {axis=1} : i32
+        %13 = mul %12, 8 : i32
+        %14 = arange {start=0, end=8} : vector<8 x i32>
+        %15 = expand_dims %14 {axis=0} : block<1x8 x i32>
+        %16 = add %13, %15 : block<1x8 x i32>
+        %17 = add %11, %16 : block<1x8 x i32>
+        %18 = addptr b, %17 : block<1x8 x ptr<f32>>
+        %19 = cmp_lt %16, N : block<1x8 x bool>
+        %20 = load %18, %19, 0.0 : block<1x8 x f32>
+        %21 = mul %10, %20 : block<4x8 x f32>
+        %22 = add %0, %21 : block<4x8 x f32>
+        %24 = add %6, 1 : block<4x1 x i32>
+        %25 = addptr a, %24 : block<4x1 x ptr<f32>>
+        %27 = load %25, %9, 0.0 : block<4x1 x f32>
+        %28 = mul 1, N : i32
+        %29 = add %28, %16 : block<1x8 x i32>
+        %30 = addptr b, %29 : block<1x8 x ptr<f32>>
+        %32 = load %30, %19, 0.0 : block<1x8 x f32>
+        %33 = mul %27, %32 : block<4x8 x f32>
+        %34 = add %22, %33 : block<4x8 x f32>
+        %36 = add %6, 2 : block<4x1 x i32>
+        %37 = addptr a, %36 : block<4x1 x ptr<f32>>
+        %39 = load %37, %9, 0.0 : block<4x1 x f32>
+        %40 = mul 2, N : i32
+        %41 = add %40, %16 : block<1x8 x i32>
+        %42 = addptr b, %41 : block<1x8 x ptr<f32>>
+        %44 = load %42, %19, 0.0 : block<1x8 x f32>
+        %45 = mul %39, %44 : block<4x8 x f32>
+        %46 = add %34, %45 : block<4x8 x f32>
+        %47 = mul %5, N : block<4x1 x i32>
+        %48 = add %47, %16 : block<4x8 x i32>
+        %49 = addptr c, %48 : block<4x8 x ptr<f32>>
+        %52 = and %9, %19 : block<4x8 x bool>
+        store %49, %46, %52
         """
     ).rstrip("\n")
 
@@ -123,43 +122,43 @@ def test_matmul_2d_generates_rank2_cuda_source_without_execution(monkeypatch):
         void matmul_2d_kernel(float* a, float* b, float* c, int M, int N) {
             int tile_i = threadIdx.x / 8;
             int tile_j = threadIdx.x % 8;
-            int v0 = blockIdx.x;
-            int v1 = (v0 * 4);
-            int v3 = tile_i;
-            int v4 = (v1 + v3);
-            int v5 = (v4 * N);
-            int v6 = blockIdx.y;
-            int v7 = (v6 * 8);
-            int v9 = tile_j;
-            int v10 = (v7 + v9);
-            int v11 = (v5 + v10);
-            float v12 = (v11 * 0.0f);
-            int v13 = (v4 * 3);
-            bool v16 = (v4 < M);
-            float v17 = (v16 ? a[v13] : 0.0f);
-            int v18 = (0 * N);
-            int v19 = (v18 + v10);
-            bool v21 = (v10 < N);
-            float v22 = (v21 ? b[v19] : 0.0f);
-            float v23 = (v17 * v22);
-            float v24 = (v12 + v23);
-            int v26 = (v13 + 1);
-            float v29 = (v16 ? a[v26] : 0.0f);
-            int v30 = (1 * N);
-            int v31 = (v30 + v10);
-            float v34 = (v21 ? b[v31] : 0.0f);
-            float v35 = (v29 * v34);
-            float v36 = (v24 + v35);
-            int v38 = (v13 + 2);
-            float v41 = (v16 ? a[v38] : 0.0f);
-            int v42 = (2 * N);
-            int v43 = (v42 + v10);
-            float v46 = (v21 ? b[v43] : 0.0f);
-            float v47 = (v41 * v46);
-            float v48 = (v36 + v47);
-            bool v52 = (v16 && v21);
+            float v0 = 0.0f;
+            int v1 = blockIdx.x;
+            int v2 = (v1 * 4);
+            int v4 = tile_i;
+            int v5 = (v2 + v4);
+            int v6 = (v5 * 3);
+            bool v9 = (v5 < M);
+            float v10 = (v9 ? a[v6] : 0.0f);
+            int v11 = (0 * N);
+            int v12 = blockIdx.y;
+            int v13 = (v12 * 8);
+            int v15 = tile_j;
+            int v16 = (v13 + v15);
+            int v17 = (v11 + v16);
+            bool v19 = (v16 < N);
+            float v20 = (v19 ? b[v17] : 0.0f);
+            float v21 = (v10 * v20);
+            float v22 = (v0 + v21);
+            int v24 = (v6 + 1);
+            float v27 = (v9 ? a[v24] : 0.0f);
+            int v28 = (1 * N);
+            int v29 = (v28 + v16);
+            float v32 = (v19 ? b[v29] : 0.0f);
+            float v33 = (v27 * v32);
+            float v34 = (v22 + v33);
+            int v36 = (v6 + 2);
+            float v39 = (v9 ? a[v36] : 0.0f);
+            int v40 = (2 * N);
+            int v41 = (v40 + v16);
+            float v44 = (v19 ? b[v41] : 0.0f);
+            float v45 = (v39 * v44);
+            float v46 = (v34 + v45);
+            int v47 = (v5 * N);
+            int v48 = (v47 + v16);
+            bool v52 = (v9 && v19);
             if (v52) {
-                c[v11] = v48;
+                c[v48] = v46;
             }
         }
         """

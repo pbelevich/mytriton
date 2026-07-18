@@ -125,6 +125,11 @@ class SSACUDACodegen:
         self.lines.append(f"    {cuda_ty} {name} = {expression};")
         self.values[result.id] = name
 
+    def declare(self, result: SSAValue) -> None:
+        name = f"v{result.id}"
+        self.lines.append(f"    {self.cuda_type(result.ty)} {name};")
+        self.values[result.id] = name
+
     def scalar_type(self, ty: Type) -> ScalarType | PointerType:
         return ty.element if isinstance(ty, BlockType) else ty
 
@@ -318,6 +323,14 @@ class SSACUDACodegen:
             else:
                 expression = "threadIdx.x" if start == 0 else f"({start} + threadIdx.x)"
                 self.assign(result, expression)
+        elif op.opcode == "empty":
+            self.declare(result)
+        elif op.opcode == "full":
+            self.assign(result, self.expression_operand(op.operands[0]))
+        elif op.opcode == "zeros":
+            element_ty = self.scalar_type(result.ty)
+            zero = False if element_ty == BOOL else 0.0 if element_ty == F32 else 0
+            self.assign(result, self.literal(zero))
         elif op.opcode in self.BINARY_OPS:
             lhs = self.expression_operand(op.operands[0])
             rhs = self.expression_operand(op.operands[1])

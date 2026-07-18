@@ -33,6 +33,55 @@ def arange(start: int, end: int) -> Value:
     return Value(Arange(start, end))
 
 
+def _normalize_block_shape(shape: int | tuple[int, ...] | list[int]) -> tuple[int, ...]:
+    if type(shape) is int:
+        shape = (shape,)
+    elif isinstance(shape, list):
+        shape = tuple(shape)
+
+    if not isinstance(shape, tuple) or not shape:
+        raise TypeError(f"block shape must be a non-empty int sequence, got {shape!r}")
+
+    if any(type(dim) is not int or dim <= 0 for dim in shape):
+        raise TypeError(f"block dimensions must be positive integers, got {shape}")
+
+    return shape
+
+
+def _require_block_dtype(dtype: ScalarType) -> ScalarType:
+    if dtype not in (BOOL, I32, F32):
+        raise TypeError(f"block dtype must be int1, int32, or float32, got {dtype}")
+    return dtype
+
+
+def empty(
+    shape: int | tuple[int, ...] | list[int],
+    dtype: ScalarType,
+) -> Value:
+    return Value(Empty(_normalize_block_shape(shape), _require_block_dtype(dtype)))
+
+
+def full(
+    shape: int | tuple[int, ...] | list[int],
+    value: Value | bool | int | float,
+    dtype: ScalarType,
+) -> Value:
+    return Value(
+        Full(
+            _normalize_block_shape(shape),
+            unwrap(value),
+            _require_block_dtype(dtype),
+        )
+    )
+
+
+def zeros(
+    shape: int | tuple[int, ...] | list[int],
+    dtype: ScalarType,
+) -> Value:
+    return Value(Zeros(_normalize_block_shape(shape), _require_block_dtype(dtype)))
+
+
 def load(
     ptr: Ptr,
     mask: Value | bool | None = None,
@@ -182,6 +231,10 @@ F32 = ScalarType("f32")
 BOOL = ScalarType("bool")
 PTR_F32 = PointerType(F32)
 
+int1 = BOOL
+int32 = I32
+float32 = F32
+
 
 @dataclass
 class Const:
@@ -203,6 +256,25 @@ class ProgramId:
 class Arange:
     start: int
     end: int
+
+
+@dataclass
+class Empty:
+    shape: tuple[int, ...]
+    dtype: ScalarType
+
+
+@dataclass
+class Full:
+    shape: tuple[int, ...]
+    value: Expression
+    dtype: ScalarType
+
+
+@dataclass
+class Zeros:
+    shape: tuple[int, ...]
+    dtype: ScalarType
 
 
 @dataclass
@@ -314,6 +386,9 @@ Expression: TypeAlias = (
     | Param
     | ProgramId
     | Arange
+    | Empty
+    | Full
+    | Zeros
     | BinOp
     | AddPtr
     | Load

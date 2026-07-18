@@ -23,6 +23,9 @@ class SSAVerifier:
     ARITY: ClassVar[dict[str, int]] = {
         "program_id": 0,
         "arange": 0,
+        "empty": 0,
+        "full": 1,
+        "zeros": 0,
         "add": 2,
         "sub": 2,
         "mul": 2,
@@ -492,6 +495,40 @@ class SSAVerifier:
         )
         self.require_type(index, op, result_ty, expected)
 
+    def check_block_constructor(self, index: int, op: SSAOp) -> None:
+        shape = op.attrs.get("shape")
+        dtype = op.attrs.get("dtype")
+
+        if (
+            not isinstance(shape, tuple)
+            or not shape
+            or any(type(dim) is not int or dim <= 0 for dim in shape)
+        ):
+            self.fail(index, op, f"invalid block shape {shape}")
+
+        if dtype not in (BOOL, I32, F32):
+            self.fail(index, op, f"invalid block dtype {dtype}")
+
+        assert isinstance(dtype, ScalarType)
+        result_ty = self.result_type(index, op)
+        self.require_type(index, op, result_ty, BlockType(shape, dtype))
+
+        if op.opcode == "full":
+            value_ty = self.require_operand_type(
+                index,
+                op,
+                op.operands[0],
+                "fill value",
+            )
+            if isinstance(value_ty, BlockType):
+                self.fail(index, op, f"fill value must be scalar, got {value_ty}")
+            if not self.is_convertible(value_ty, dtype):
+                self.fail(
+                    index,
+                    op,
+                    f"fill value must be convertible to {dtype}, got {value_ty}",
+                )
+
     def verify(self, ops: list[SSAItem]) -> list[SSAItem]:
         self._verify_ops(ops, defined=set())
         return ops
@@ -548,6 +585,8 @@ class SSAVerifier:
                 self.check_program_id(index, op)
             elif op.opcode == "arange":
                 self.check_arange(index, op)
+            elif op.opcode in {"empty", "full", "zeros"}:
+                self.check_block_constructor(index, op)
             elif op.opcode in {"maximum", "minimum"}:
                 self.check_binary_numeric(index, op)
             else:
