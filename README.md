@@ -1,11 +1,12 @@
 # mytriton
 
-`mytriton` is a small symbolic tracer inspired by Triton's Python API.
-It traces straight-line Python kernels into an expression-tree IR, infers types,
-lowers the result into a small SSA-style IR, verifies and optimizes that IR,
-and emits backend source. The default backend emits CUDA C++ for rank-1 vectors
-and small rank-2 tiles; an experimental MLIR backend can lower a small subset of
-rank-1 kernels through MLIR's GPU/NVVM stack to a cubin.
+`mytriton` is a small compiler inspired by Triton's Python API. It parses a
+supported subset of Python kernel source with an AST frontend, builds a symbolic
+expression-tree IR, infers types, lowers the result into a small SSA-style IR,
+verifies and optimizes that IR, and emits backend source. The default backend
+emits CUDA C++ for rank-1 vectors and small rank-2 tiles; an experimental MLIR
+backend can lower a small subset of rank-1 kernels through MLIR's GPU/NVVM stack
+to a cubin.
 
 ## Versions
 
@@ -30,6 +31,43 @@ rank-1 kernels through MLIR's GPU/NVVM stack to a cubin.
 - [ver8](https://github.com/pbelevich/mytriton/tree/ver8): rank-2 block shapes,
   `x[:, None]`/`x[None, :]` expansion, broadcasted 2D masks, CUDA lowering for
   tiled kernels, and a simple rank-2 tiled matrix multiplication kernel.
+- [ver9](https://github.com/pbelevich/mytriton/tree/ver9): an AST-based Python
+  frontend that replaces direct execution of kernels with symbolic arguments,
+  resolves runtime and `constexpr` names, handles the Python syntax used by the
+  existing kernels, and unrolls compile-time `range`/`tl.static_range` loops.
+
+## AST frontend
+
+On a JIT cache miss, `mytriton` obtains the decorated function's source with
+`inspect`, parses it with Python's `ast` module, and visits the function body.
+The frontend does not call the kernel as a regular Python function during
+tracing. Instead, it creates an environment in which runtime scalar and pointer
+parameters are symbolic values while `tl.constexpr` parameters retain their
+concrete Python values.
+
+The AST frontend supports the syntax used by the current kernels: expression
+statements, simple and annotated assignments, augmented arithmetic assignments,
+function calls, tuples and lists, arithmetic and Boolean `&`, unary signs,
+simple `<` and `is` comparisons, constexpr conditional expressions, and the
+subscripts needed for `x[:, None]` and `x[None, :]`. Names from globals and
+closures are resolved alongside Python builtins, so `tl`, `range`, and helper
+functions referenced by a kernel remain available while its AST is visited.
+
+Both Python `range` and `tl.static_range` are accepted when their start, stop,
+and step are compile-time integers. Their bodies are expanded by the frontend,
+so no loop reaches the expression-tree or SSA IR in this version. For example:
+
+```python
+accumulator = 0.0
+
+for k in tl.static_range(0, K):
+    accumulator += tl.load(a + k) * tl.load(b + k)
+```
+
+Here `K` must be a `tl.constexpr` parameter. Unsupported syntax is rejected with
+an `ASTFrontendError` instead of being accidentally evaluated by the Python
+interpreter. This explicit source representation also provides the foundation
+for adding runtime loops to the IR in a later version.
 
 ## Example
 
@@ -71,13 +109,13 @@ print(SSAPrinter().print_ops(ssa_ops))
 print(src)
 ```
 
-The first result contains the captured expression-tree operations. The second
-contains optimized typed SSA operations, and the third contains generated source
-for the selected backend. The default backend is CUDA, so `src` is CUDA C++.
-With NumPy arguments, compilation stops there. If the arguments are CuPy arrays
-and a CUDA GPU is available, the generated kernel is also compiled and launched.
-Shared expressions such as `offsets` and `mask` are lowered once and referenced
-by their SSA values wherever they are reused.
+The first result contains the expression-tree operations built by the AST
+frontend. The second contains optimized typed SSA operations, and the third
+contains generated source for the selected backend. The default backend is
+CUDA, so `src` is CUDA C++. With NumPy arguments, compilation stops there. If
+the arguments are CuPy arrays and a CUDA GPU is available, the generated kernel
+is also compiled and launched. Shared expressions such as `offsets` and `mask`
+are lowered once and referenced by their SSA values wherever they are reused.
 
 For example, part of the resulting SSA looks like this:
 
@@ -217,7 +255,13 @@ before CUDA code generation.
   and supports the full current mytriton test language. The MLIR backend is an
   experimental MVP for 1D elementwise kernels. MLIR source generation does not
   require MLIR Python bindings, but MLIR cubin execution does.
-- Only straight-line kernels are supported. Symbolic Python control flow is rejected.
+- Kernel functions must have source available to `inspect.getsource`; functions
+  created dynamically or entered only in an interactive session may not be
+  recoverable by the AST frontend.
+- Compile-time `range` and `tl.static_range` loops are unrolled by the AST
+  frontend. Runtime range bounds, `if`/`while`, `break`/`continue`, `for/else`,
+  non-simple assignment targets, and other symbolic Python control flow are not
+  supported.
 - Runtime array arguments must be C-contiguous `float32` arrays.
 - The launch grid is evaluated and used for CUDA execution, but it is not
   represented in the IR.
@@ -227,7 +271,7 @@ before CUDA code generation.
 - JIT cache entries are specialized by runtime types and constexpr values. Python
   globals and closure values used by a kernel must remain unchanged; call
   `kernel.clear_cache()` after changing them.
-- CUDA lowering currently supports program IDs, ranges, basic arithmetic and
+- CUDA lowering currently supports program IDs, `tl.arange`, basic arithmetic and
   comparison, Boolean `&`, rank-2 `expand_dims` via `x[:, None]` and
   `x[None, :]`, elementwise minimum and maximum, negation, `tl.exp`,
   `tl.where`, pointer addition, masked loads, masked stores, block-local

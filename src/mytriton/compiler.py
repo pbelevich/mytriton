@@ -5,6 +5,7 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import Any, Generic, Literal, ParamSpec, TypeAlias, cast
 
+from .ast_frontend import trace
 from .block_shapes import cuda_threads_per_block
 from .cuda_codegen import SSACUDACodegen
 from .cuda_utils import (
@@ -22,7 +23,6 @@ from .ssa_verification import SSAVerifier
 from .trace import (
     is_constexpr_annotation,
     make_runtime_params,
-    trace,
 )
 
 P = ParamSpec("P")
@@ -131,7 +131,8 @@ class CompiledKernel(Generic[P]):
 
             artifact = self.compilation_cache.get(cache_key)
             if artifact is None:
-                ops, params = trace(
+                trace_fn = trace
+                ops, params = trace_fn(
                     self.fn,
                     self.signature,
                     bound.arguments,

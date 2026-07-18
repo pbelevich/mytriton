@@ -407,32 +407,3 @@ def make_runtime_params(signature, bound_args):
         for name, parameter in signature.parameters.items()
         if not is_constexpr_annotation(parameter.annotation)
     ]
-
-
-def trace(fn, signature, bound_args, runtime_params=None):
-    symbolic_arguments = {}
-    if runtime_params is None:
-        runtime_params = make_runtime_params(signature, bound_args)
-    params_by_name = {param.name: param for param in runtime_params}
-
-    for name, parameter in signature.parameters.items():
-        value = bound_args[name]
-
-        if is_constexpr_annotation(parameter.annotation):
-            symbolic_arguments[name] = value
-            continue
-
-        param = params_by_name[name]
-
-        if isinstance(param.ty, PointerType):
-            symbolic_arguments[name] = Ptr(param)
-        else:
-            symbolic_arguments[name] = Value(param)
-
-    symbolic_bound = signature.bind_partial()
-    symbolic_bound.arguments.update(symbolic_arguments)
-
-    with Builder() as builder:
-        fn(*symbolic_bound.args, **symbolic_bound.kwargs)
-
-    return builder.ops, runtime_params

@@ -6,9 +6,10 @@ import pytest
 
 import mytriton as triton
 import mytriton.language as tl
+from mytriton.ast_frontend import trace
 from mytriton.ssa import SSALowering, SSAPrinter
 from mytriton.ssa_verification import SSAVerifier
-from mytriton.trace import I32, PTR_F32, Param, trace
+from mytriton.trace import I32, PTR_F32, Param
 
 
 def tile_shape_kernel(out, M, N, BM: tl.constexpr, BN: tl.constexpr):
