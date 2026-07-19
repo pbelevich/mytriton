@@ -8,6 +8,7 @@ import pytest
 
 import mytriton as triton
 import mytriton.language as tl
+from mytriton.ast_frontend import trace
 from mytriton.ssa import SSAPrinter
 from mytriton.trace import (
     AddPtr,
@@ -21,7 +22,6 @@ from mytriton.trace import (
     ScalarType,
     Store,
     Sum,
-    trace,
 )
 
 
