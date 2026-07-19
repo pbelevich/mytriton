@@ -39,7 +39,7 @@ def matmul_runtime_k_kernel(
     c_offsets = offs_m * N + offs_n
     c_mask = (offs_m < M) & (offs_n < N)
 
-    acc = c_offsets * 0.0
+    acc = tl.zeros((BM, BN), tl.float32)  # acc = c_offsets * 0.0
 
     for k in range(K):
         a_offsets = offs_m * K + k
@@ -400,29 +400,29 @@ def test_ast_frontend_lowers_runtime_range_to_cuda_for_loop(monkeypatch):
         %7 = arange {start=0, end=8} : vector<8 x i32>
         %8 = expand_dims %7 {axis=0} : block<1x8 x i32>
         %9 = add %6, %8 : block<1x8 x i32>
-        %10 = mul %4, N : block<4x1 x i32>
-        %11 = add %10, %9 : block<4x8 x i32>
-        %12 = mul %11, 0.0 : block<4x8 x f32>
-        %27 = for %13 in range(0, K, 1) iter_args(%14 = %12) : block<4x8 x f32> {
-          %15 = mul %4, K : block<4x1 x i32>
-          %16 = add %15, %13 : block<4x1 x i32>
-          %17 = addptr a, %16 : block<4x1 x ptr<f32>>
-          %18 = cmp_lt %4, M : block<4x1 x bool>
-          %19 = load %17, %18, 0.0 : block<4x1 x f32>
-          %20 = mul %13, N : i32
-          %21 = add %20, %9 : block<1x8 x i32>
-          %22 = addptr b, %21 : block<1x8 x ptr<f32>>
-          %23 = cmp_lt %9, N : block<1x8 x bool>
-          %24 = load %22, %23, 0.0 : block<1x8 x f32>
-          %25 = mul %19, %24 : block<4x8 x f32>
-          %26 = add %14, %25 : block<4x8 x f32>
-          yield %26
+        %10 = zeros {shape=(4, 8), dtype=f32} : block<4x8 x f32>
+        %25 = for %11 in range(0, K, 1) iter_args(%12 = %10) : block<4x8 x f32> {
+          %13 = mul %4, K : block<4x1 x i32>
+          %14 = add %13, %11 : block<4x1 x i32>
+          %15 = addptr a, %14 : block<4x1 x ptr<f32>>
+          %16 = cmp_lt %4, M : block<4x1 x bool>
+          %17 = load %15, %16, 0.0 : block<4x1 x f32>
+          %18 = mul %11, N : i32
+          %19 = add %18, %9 : block<1x8 x i32>
+          %20 = addptr b, %19 : block<1x8 x ptr<f32>>
+          %21 = cmp_lt %9, N : block<1x8 x bool>
+          %22 = load %20, %21, 0.0 : block<1x8 x f32>
+          %23 = mul %17, %22 : block<4x8 x f32>
+          %24 = add %12, %23 : block<4x8 x f32>
+          yield %24
         }
-        %28 = addptr c, %11 : block<4x8 x ptr<f32>>
+        %26 = mul %4, N : block<4x1 x i32>
+        %27 = add %26, %9 : block<4x8 x i32>
+        %28 = addptr c, %27 : block<4x8 x ptr<f32>>
         %29 = cmp_lt %4, M : block<4x1 x bool>
         %30 = cmp_lt %9, N : block<1x8 x bool>
         %31 = and %29, %30 : block<4x8 x bool>
-        store %28, %27, %31
+        store %28, %25, %31
         """
     ).rstrip("\n")
 
@@ -442,28 +442,28 @@ def test_ast_frontend_lowers_runtime_range_to_cuda_for_loop(monkeypatch):
             int v6 = (v5 * 8);
             int v8 = tile_j;
             int v9 = (v6 + v8);
-            int v10 = (v4 * N);
-            int v11 = (v10 + v9);
-            float v12 = (v11 * 0.0f);
-            float v27 = v12;
-            for (int v13 = 0; v13 < K; v13 += 1) {
-                int v15 = (v4 * K);
-                int v16 = (v15 + v13);
-                bool v18 = (v4 < M);
-                float v19 = (v18 ? a[v16] : 0.0f);
-                int v20 = (v13 * N);
-                int v21 = (v20 + v9);
-                bool v23 = (v9 < N);
-                float v24 = (v23 ? b[v21] : 0.0f);
-                float v25 = (v19 * v24);
-                float v26 = (v27 + v25);
-                v27 = v26;
+            float v10 = 0.0f;
+            float v25 = v10;
+            for (int v11 = 0; v11 < K; v11 += 1) {
+                int v13 = (v4 * K);
+                int v14 = (v13 + v11);
+                bool v16 = (v4 < M);
+                float v17 = (v16 ? a[v14] : 0.0f);
+                int v18 = (v11 * N);
+                int v19 = (v18 + v9);
+                bool v21 = (v9 < N);
+                float v22 = (v21 ? b[v19] : 0.0f);
+                float v23 = (v17 * v22);
+                float v24 = (v25 + v23);
+                v25 = v24;
             }
+            int v26 = (v4 * N);
+            int v27 = (v26 + v9);
             bool v29 = (v4 < M);
             bool v30 = (v9 < N);
             bool v31 = (v29 && v30);
             if (v31) {
-                c[v11] = v27;
+                c[v27] = v25;
             }
         }
         """

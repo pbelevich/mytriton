@@ -176,6 +176,8 @@ class CSEPass:
     PURE_OPS: ClassVar[set[str]] = {
         "program_id",
         "arange",
+        "full",
+        "zeros",
         "add",
         "sub",
         "mul",

@@ -7,8 +7,10 @@ from .trace import (
     Arange,
     BinOp,
     Const,
+    Empty,
     ExpandDims,
     ForRange,
+    Full,
     Load,
     LoopCarry,
     LoopIndex,
@@ -24,6 +26,7 @@ from .trace import (
     Type,
     UnaryOp,
     Where,
+    Zeros,
 )
 from .type_inference import TypeInference
 
@@ -133,6 +136,29 @@ class SSALowering:
                     "start": expr.start,
                     "end": expr.end,
                 },
+            )
+
+        if isinstance(expr, Empty):
+            return self.emit(
+                "empty",
+                expr,
+                attrs={"shape": expr.shape, "dtype": expr.dtype},
+            )
+
+        if isinstance(expr, Full):
+            value = self.lower_expr(expr.value)
+            return self.emit(
+                "full",
+                expr,
+                operands=(value,),
+                attrs={"shape": expr.shape, "dtype": expr.dtype},
+            )
+
+        if isinstance(expr, Zeros):
+            return self.emit(
+                "zeros",
+                expr,
+                attrs={"shape": expr.shape, "dtype": expr.dtype},
             )
 
         if isinstance(expr, BinOp):

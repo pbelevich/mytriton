@@ -220,6 +220,46 @@ class MLIRCodegen:
                 ]
             )
 
+    def emit_block_constructor(self, op: SSAOp) -> None:
+        result = op.result
+        assert result is not None
+        result_ty = self.mlir_scalar_type(result.ty)
+
+        if op.opcode == "empty":
+            raise TypeError("MLIR MVP does not support tl.empty")
+
+        if op.opcode == "zeros":
+            zero = False if result_ty == "i1" else 0
+            self.values[result.id] = self.constant(zero, result_ty)
+            return
+
+        operand = op.operands[0]
+        operand_ty = self.operand_type(operand)
+        value = self.operand(
+            operand,
+            result_ty if isinstance(operand, Const) else operand_ty,
+        )
+        assert isinstance(value, str)
+
+        if operand_ty == result_ty or isinstance(operand, Const):
+            self.values[result.id] = value
+            return
+
+        conversion = {
+            ("i32", "f32"): "arith.sitofp",
+            ("f32", "i32"): "arith.fptosi",
+        }.get((operand_ty, result_ty))
+        if conversion is None:
+            raise TypeError(
+                f"cannot convert full value from {operand_ty} to {result_ty}"
+            )
+
+        name = f"%v{result.id}"
+        self.lines.append(
+            f"{self.indent}{name} = {conversion} {value} : {operand_ty} to {result_ty}"
+        )
+        self.values[result.id] = name
+
     def emit(self, op: SSAOp) -> None:
         result = op.result
 
@@ -235,6 +275,8 @@ class MLIRCodegen:
             if start != 0:
                 raise TypeError(f"MLIR MVP supports only arange(0, N), got {start}")
             self.values[result.id] = "%thread_id_x"
+        elif op.opcode in {"empty", "full", "zeros"}:
+            self.emit_block_constructor(op)
         elif op.opcode in {"add", "sub", "mul", "div", "cmp_lt"}:
             self.emit_binary(op)
         elif op.opcode == "addptr":

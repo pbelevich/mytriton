@@ -39,6 +39,11 @@ MLIR's GPU/NVVM stack to a cubin.
   `range` loops with captured outer values, loop-carried variables,
   `iter_args`/`yield` SSA semantics, nested-loop verification, and CUDA `for`
   generation.
+- [ver11](https://github.com/pbelevich/mytriton/tree/ver11): `tl.empty`,
+  `tl.full`, and `tl.zeros` block factory functions, public `tl.int1`,
+  `tl.int32`, and `tl.float32` dtype objects, typed SSA lowering and
+  verification for constructed blocks, CUDA backend support, and MLIR lowering
+  for `tl.full`/`tl.zeros`.
 
 ## AST frontend
 
@@ -113,6 +118,40 @@ Here `%1` denotes the accumulator at the start of the current iteration,
 `yield %4` supplies its value for the next iteration, and `%5` is the value
 available after the loop. CUDA lowering turns this region into a normal C++
 `for` loop while preserving the same carried-value semantics.
+
+## Block factory functions
+
+Blocks with a known shape and element type can be constructed without deriving
+their shape from another expression:
+
+```python
+accumulator = tl.zeros((BM, BN), tl.float32)
+twos = tl.full([BM, BN], 2.0, tl.float32)
+temporary = tl.empty(BLOCK, tl.float32)
+```
+
+The shape may be a positive integer or a non-empty tuple/list of positive
+integers. The supported public dtype objects are `tl.int1`, `tl.int32`, and
+`tl.float32`. `tl.full` accepts a scalar Boolean, integer, floating-point, or
+symbolic runtime value and converts numeric values to the requested numeric
+dtype. A block value cannot be used as the fill value.
+
+The constructors remain explicit in SSA, including their normalized shape and
+dtype:
+
+```text
+%0 = zeros {shape=(8,), dtype=f32} : vector<8 x f32>
+%1 = full 2.5 {shape=(8,), dtype=f32} : vector<8 x f32>
+%2 = add %0, %1 : vector<8 x f32>
+```
+
+In the current CUDA execution model, each element of a distributed block is
+represented by one scalar in its CUDA thread. Consequently `tl.zeros` emits a
+zero-initialized per-thread value, `tl.full` emits the fill value in each
+thread, and `tl.empty` declares an uninitialized per-thread value. These factory
+functions describe logical blocks; they do not allocate CUDA shared memory.
+Any computation that consumes a value produced by `tl.empty` observes undefined
+contents.
 
 ## Example
 
@@ -274,7 +313,8 @@ current tests also include matrix multiplication kernels: an older naive
 rank-1-vector version and a rank-2 tiled version that combines a 2D launch grid,
 2D block broadcasting, and masked tile stores. The rank-2 matmul is covered both
 with a compile-time-unrolled `K` and with a runtime `range(K)` that becomes a
-CUDA loop.
+CUDA loop. Both versions initialize their rank-2 accumulator directly with
+`tl.zeros((BM, BN), tl.float32)`.
 
 Before CUDA code generation, the SSA IR is checked by a verifier. The verifier
 validates definition order, result declarations, operand types, broadcast
@@ -284,7 +324,10 @@ shapes, pointer operations, memory masks, and operation-specific rules such as
 reductions consuming one power-of-two rank-1 block whose width matches the CUDA
 block size. For runtime loops it also validates region scoping, scalar bounds,
 the positive constant step, definition order, and matching types and counts for
-carried inputs, region arguments, yielded values, and loop results.
+carried inputs, region arguments, yielded values, and loop results. For block
+factory functions it checks that shapes are non-empty and positive, dtypes are
+supported, result block types match the declared shape/dtype, and `tl.full` has
+a scalar fill value convertible to the requested dtype.
 
 Straight-line verified SSA then runs through a small optimization pipeline:
 
@@ -329,10 +372,11 @@ these rewrite passes because they are not region-aware yet.
   `tl.where`, pointer addition, masked loads, masked stores, block-local
   `tl.sum`/`tl.max`/`tl.min` reductions, compile-time `tl.static_range` loops,
   and structured runtime `range` loops, including nested loops and multiple
-  carried values. Reduction lowering internally emits the CUDA shared-memory
-  scratch buffers and synchronization needed for block-local reductions.
-  Floating-point elementwise extrema propagate NaNs and choose the right-hand
-  operand when values compare equal.
+  carried values. It also supports `tl.empty`, `tl.full`, and `tl.zeros` for
+  rank-1 and rank-2 logical blocks. Reduction lowering internally emits the
+  CUDA shared-memory scratch buffers and synchronization needed for block-local
+  reductions. Floating-point elementwise extrema propagate NaNs and choose the
+  right-hand operand when values compare equal.
 - Reductions are currently single-block reductions over the SSA vector width.
   The vector width must be a power of two and must match the CUDA thread block
   size. Larger rows can be handled by statically unrolling multiple loads into
@@ -341,17 +385,19 @@ these rewrite passes because they are not region-aware yet.
 - Matrix multiplication support is intentionally naive so far. The current
   rank-2 matmul kernel computes one output tile with one CUDA thread per output
   element, but it does not tile through shared memory because there is no
-  user-facing shared-memory API yet. It repeatedly reads from global memory and
-  can traverse the reduction dimension with either an unrolled
-  `tl.static_range` or a runtime CUDA loop.
+  shared-memory lowering for logical block factory values. It repeatedly reads
+  from global memory and can traverse the reduction dimension with either an
+  unrolled `tl.static_range` or a runtime CUDA loop. In particular, `tl.empty`,
+  `tl.full`, and `tl.zeros` do not allocate shared-memory tiles.
 - MLIR lowering currently supports only `ptr<f32>` parameters as
   `memref<?xf32>`, scalar `i32`/`f32`/`bool`, `tl.program_id(0)`,
   `tl.arange(0, BLOCK)`, basic arithmetic and `<`, pointer addition, masked
-  loads, and masked stores. It intentionally rejects nonzero program axes,
-  nonzero `arange` starts, and rank-2 block shapes instead of silently
-  generating wrong code. It does not yet support 2D program IDs, reductions,
-  `expand_dims`, Boolean `&`, `tl.maximum`, `tl.minimum`, `tl.where`, negation,
-  `tl.exp`, `tl.static_range`, runtime `range`, or matrix multiplication.
+  loads, masked stores, and scalarized `tl.full`/`tl.zeros` values for rank-1
+  blocks. It intentionally rejects `tl.empty`, nonzero program axes, nonzero
+  `arange` starts, and rank-2 block shapes instead of silently generating wrong
+  code. It does not yet support 2D program IDs, reductions, `expand_dims`,
+  Boolean `&`, `tl.maximum`, `tl.minimum`, `tl.where`, negation, `tl.exp`,
+  `tl.static_range`, runtime `range`, or matrix multiplication.
 - MLIR execution currently supports only 1D C-contiguous CuPy arrays because it
   builds one-dimensional memref descriptors.
 - The SSA IR has structured `for` regions and loop-carried `iter_args`/`yield`

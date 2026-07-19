@@ -1,7 +1,12 @@
 from .trace import (
     arange,
     constexpr,
+    empty,
     exp,
+    float32,
+    full,
+    int1,
+    int32,
     load,
     max,
     maximum,
@@ -12,12 +17,18 @@ from .trace import (
     store,
     sum,
     where,
+    zeros,
 )
 
 __all__ = [
     "arange",
     "constexpr",
+    "empty",
     "exp",
+    "float32",
+    "full",
+    "int1",
+    "int32",
     "load",
     "max",
     "maximum",
@@ -28,4 +39,5 @@ __all__ = [
     "store",
     "sum",
     "where",
+    "zeros",
 ]
