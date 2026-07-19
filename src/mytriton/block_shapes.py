@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 from .trace import BlockType
 
 if TYPE_CHECKING:
-    from .ssa import SSAOp
+    from .ssa import SSAItem
 
 
 def prod(shape: tuple[int, ...]) -> int:
@@ -36,15 +36,23 @@ def broadcast_shapes(*shapes: tuple[int, ...]) -> tuple[int, ...]:
     return tuple(dims)
 
 
-def result_block_shapes(ssa_ops: list[SSAOp]) -> list[tuple[int, ...]]:
-    return [
-        op.result.ty.shape
-        for op in ssa_ops
-        if op.result is not None and isinstance(op.result.ty, BlockType)
-    ]
+def result_block_shapes(ssa_ops: list[SSAItem]) -> list[tuple[int, ...]]:
+    from .ssa import SSAForRange
+
+    shapes = []
+
+    for op in ssa_ops:
+        if isinstance(op, SSAForRange):
+            shapes.extend(result_block_shapes(op.body))
+            continue
+
+        if op.result is not None and isinstance(op.result.ty, BlockType):
+            shapes.append(op.result.ty.shape)
+
+    return shapes
 
 
-def cuda_kernel_block_shape(ssa_ops: list[SSAOp]) -> tuple[int, ...]:
+def cuda_kernel_block_shape(ssa_ops: list[SSAItem]) -> tuple[int, ...]:
     shapes = result_block_shapes(ssa_ops)
 
     if not shapes:
@@ -93,7 +101,7 @@ def cuda_kernel_block_shape(ssa_ops: list[SSAOp]) -> tuple[int, ...]:
     return (next(iter(widths)),)
 
 
-def cuda_threads_per_block(ssa_ops: list[SSAOp]) -> int:
+def cuda_threads_per_block(ssa_ops: list[SSAItem]) -> int:
     block_shape = cuda_kernel_block_shape(ssa_ops)
     threads_per_block = prod(block_shape)
 

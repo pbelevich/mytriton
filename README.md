@@ -3,10 +3,10 @@
 `mytriton` is a small compiler inspired by Triton's Python API. It parses a
 supported subset of Python kernel source with an AST frontend, builds a symbolic
 expression-tree IR, infers types, lowers the result into a small SSA-style IR,
-verifies and optimizes that IR, and emits backend source. The default backend
-emits CUDA C++ for rank-1 vectors and small rank-2 tiles; an experimental MLIR
-backend can lower a small subset of rank-1 kernels through MLIR's GPU/NVVM stack
-to a cubin.
+verifies the IR, runs the available optimizations, and emits backend source. The
+default backend emits CUDA C++ for rank-1 vectors and small rank-2 tiles; an
+experimental MLIR backend can lower a small subset of rank-1 kernels through
+MLIR's GPU/NVVM stack to a cubin.
 
 ## Versions
 
@@ -35,6 +35,10 @@ to a cubin.
   frontend that replaces direct execution of kernels with symbolic arguments,
   resolves runtime and `constexpr` names, handles the Python syntax used by the
   existing kernels, and unrolls compile-time `range`/`tl.static_range` loops.
+- [ver10](https://github.com/pbelevich/mytriton/tree/ver10): structured runtime
+  `range` loops with captured outer values, loop-carried variables,
+  `iter_args`/`yield` SSA semantics, nested-loop verification, and CUDA `for`
+  generation.
 
 ## AST frontend
 
@@ -53,9 +57,8 @@ subscripts needed for `x[:, None]` and `x[None, :]`. Names from globals and
 closures are resolved alongside Python builtins, so `tl`, `range`, and helper
 functions referenced by a kernel remain available while its AST is visited.
 
-Both Python `range` and `tl.static_range` are accepted when their start, stop,
-and step are compile-time integers. Their bodies are expanded by the frontend,
-so no loop reaches the expression-tree or SSA IR in this version. For example:
+When all bounds are compile-time integers, both Python `range` and
+`tl.static_range` are expanded by the frontend. For example:
 
 ```python
 accumulator = 0.0
@@ -64,10 +67,52 @@ for k in tl.static_range(0, K):
     accumulator += tl.load(a + k) * tl.load(b + k)
 ```
 
-Here `K` must be a `tl.constexpr` parameter. Unsupported syntax is rejected with
-an `ASTFrontendError` instead of being accidentally evaluated by the Python
-interpreter. This explicit source representation also provides the foundation
-for adding runtime loops to the IR in a later version.
+Here `K` must be a `tl.constexpr` parameter, so no loop reaches the
+expression-tree or SSA IR. Unsupported syntax is rejected with an
+`ASTFrontendError` instead of being accidentally evaluated by the Python
+interpreter.
+
+## Runtime `for` loops
+
+When a Python `range` has a symbolic start or stop, the AST frontend builds a
+structured `ForRange` operation instead of unrolling the body. Runtime loop
+bounds must lower to scalar `i32` values, and the step must be a positive
+compile-time integer. Sequential and nested runtime loops are supported.
+
+Variables that existed before the loop and are assigned in its body become
+loop-carried values. Values from the surrounding scope that are only read by
+the body are recorded as captures and lowered before entering the loop region.
+Names created only inside the loop do not escape it. For example:
+
+```python
+@triton.jit
+def runtime_sum_kernel(x, out, K):
+    accumulator = 0.0
+
+    for k in range(K):
+        accumulator += tl.load(x + k)
+
+    tl.store(out, accumulator)
+```
+
+The corresponding SSA uses an induction variable, a region argument initialized
+from the value before the loop, and `yield` to carry the updated value into the
+next iteration:
+
+```text
+%5 = for %0 in range(0, K, 1) iter_args(%1 = 0.0) : f32 {
+  %2 = addptr x, %0 : ptr<f32>
+  %3 = load %2, none, none : f32
+  %4 = add %1, %3 : f32
+  yield %4
+}
+store out, %5, none
+```
+
+Here `%1` denotes the accumulator at the start of the current iteration,
+`yield %4` supplies its value for the next iteration, and `%5` is the value
+available after the loop. CUDA lowering turns this region into a normal C++
+`for` loop while preserving the same carried-value semantics.
 
 ## Example
 
@@ -227,7 +272,9 @@ reductions, a numerically stable row-wise softmax, and a long-row sum that uses
 `tl.static_range` to unroll several block-sized loads at compile time. The
 current tests also include matrix multiplication kernels: an older naive
 rank-1-vector version and a rank-2 tiled version that combines a 2D launch grid,
-2D block broadcasting, `tl.static_range` over `K`, and masked tile stores.
+2D block broadcasting, and masked tile stores. The rank-2 matmul is covered both
+with a compile-time-unrolled `K` and with a runtime `range(K)` that becomes a
+CUDA loop.
 
 Before CUDA code generation, the SSA IR is checked by a verifier. The verifier
 validates definition order, result declarations, operand types, broadcast
@@ -235,16 +282,19 @@ shapes, pointer operations, memory masks, and operation-specific rules such as
 `tl.exp` requiring `f32`, `tl.where` lowering to a Boolean `select`,
 `expand_dims` preserving element types while inserting a size-1 dimension, and
 reductions consuming one power-of-two rank-1 block whose width matches the CUDA
-block size.
+block size. For runtime loops it also validates region scoping, scalar bounds,
+the positive constant step, definition order, and matching types and counts for
+carried inputs, region arguments, yielded values, and loop results.
 
-The verified SSA then runs through a small optimization pipeline:
+Straight-line verified SSA then runs through a small optimization pipeline:
 
 - constant folding and local simplifications such as `select(true, x, y) -> x`;
 - common subexpression elimination for pure operations;
 - dead-code elimination.
 
 The verifier runs after every optimization pass so malformed rewrites fail
-before CUDA code generation.
+before CUDA code generation. The runtime-loop MVP is fully verified but skips
+these rewrite passes because they are not region-aware yet.
 
 ## Current limitations
 
@@ -259,8 +309,10 @@ before CUDA code generation.
   created dynamically or entered only in an interactive session may not be
   recoverable by the AST frontend.
 - Compile-time `range` and `tl.static_range` loops are unrolled by the AST
-  frontend. Runtime range bounds, `if`/`while`, `break`/`continue`, `for/else`,
-  non-simple assignment targets, and other symbolic Python control flow are not
+  frontend. Runtime `range` supports scalar `i32` bounds and a positive constant
+  step. Its induction variable and assignment targets must be simple names, and
+  assigning to the induction variable is rejected. `if`/`while`,
+  `break`/`continue`, `for/else`, and other symbolic Python control flow are not
   supported.
 - Runtime array arguments must be C-contiguous `float32` arrays.
 - The launch grid is evaluated and used for CUDA execution, but it is not
@@ -275,11 +327,12 @@ before CUDA code generation.
   comparison, Boolean `&`, rank-2 `expand_dims` via `x[:, None]` and
   `x[None, :]`, elementwise minimum and maximum, negation, `tl.exp`,
   `tl.where`, pointer addition, masked loads, masked stores, block-local
-  `tl.sum`/`tl.max`/`tl.min` reductions, and compile-time `tl.static_range`
-  loops. Reduction lowering internally emits the CUDA shared-memory scratch
-  buffers and synchronization needed for block-local reductions. Floating-point
-  elementwise extrema propagate NaNs and choose the right-hand operand when
-  values compare equal.
+  `tl.sum`/`tl.max`/`tl.min` reductions, compile-time `tl.static_range` loops,
+  and structured runtime `range` loops, including nested loops and multiple
+  carried values. Reduction lowering internally emits the CUDA shared-memory
+  scratch buffers and synchronization needed for block-local reductions.
+  Floating-point elementwise extrema propagate NaNs and choose the right-hand
+  operand when values compare equal.
 - Reductions are currently single-block reductions over the SSA vector width.
   The vector width must be a power of two and must match the CUDA thread block
   size. Larger rows can be handled by statically unrolling multiple loads into
@@ -289,7 +342,8 @@ before CUDA code generation.
   rank-2 matmul kernel computes one output tile with one CUDA thread per output
   element, but it does not tile through shared memory because there is no
   user-facing shared-memory API yet. It repeatedly reads from global memory and
-  uses `tl.static_range` to unroll a constexpr reduction dimension.
+  can traverse the reduction dimension with either an unrolled
+  `tl.static_range` or a runtime CUDA loop.
 - MLIR lowering currently supports only `ptr<f32>` parameters as
   `memref<?xf32>`, scalar `i32`/`f32`/`bool`, `tl.program_id(0)`,
   `tl.arange(0, BLOCK)`, basic arithmetic and `<`, pointer addition, masked
@@ -297,13 +351,16 @@ before CUDA code generation.
   nonzero `arange` starts, and rank-2 block shapes instead of silently
   generating wrong code. It does not yet support 2D program IDs, reductions,
   `expand_dims`, Boolean `&`, `tl.maximum`, `tl.minimum`, `tl.where`, negation,
-  `tl.exp`, `tl.static_range`, or matrix multiplication.
+  `tl.exp`, `tl.static_range`, runtime `range`, or matrix multiplication.
 - MLIR execution currently supports only 1D C-contiguous CuPy arrays because it
   builds one-dimensional memref descriptors.
-- The SSA IR has no basic blocks, control-flow representation, or phi nodes yet.
+- The SSA IR has structured `for` regions and loop-carried `iter_args`/`yield`
+  values, but it has no general basic blocks, conditional control flow, or phi
+  nodes outside this loop representation.
 - The optimizer is intentionally small. It does local simplification, constant
   folding, common subexpression elimination, and dead-code elimination, but it
-  has no control-flow or memory-aware optimization passes yet.
+  has no control-flow or memory-aware optimization passes yet. Kernels containing
+  runtime loops currently bypass the rewrite pipeline after verification.
 
 ## Development
 

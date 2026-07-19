@@ -1,6 +1,6 @@
 import pytest
 
-from mytriton.ssa import SSAOp, SSAValue
+from mytriton.ssa import SSAForRange, SSAOp, SSAValue
 from mytriton.ssa_verification import CompileError, SSAVerifier
 from mytriton.trace import F32, I32, PTR_F32, Const, Param, PointerType, VectorType
 
@@ -27,15 +27,23 @@ def test_verifier_rejects_use_before_definition():
         verify([SSAOp("store", (out, SSAValue(0, F32), None))])
 
 
-@pytest.mark.parametrize(
-    "op",
-    [
-        SSAOp("store", (Param("out", PTR_F32), Const(1.0), None), SSAValue(0, F32)),
-        SSAOp("add", (Const(1), Const(2)), None),
-    ],
-)
-def test_verifier_rejects_invalid_result_declaration(op):
-    with pytest.raises(CompileError, match="invalid result declaration"):
+def test_verifier_rejects_unexpected_result():
+    op = SSAOp(
+        "store",
+        (Param("out", PTR_F32), Const(1.0), None),
+        SSAValue(0, F32),
+    )
+
+    with pytest.raises(
+        CompileError, match="ssa-verifier: op #0 'store': unexpected result"
+    ):
+        verify([op])
+
+
+def test_verifier_rejects_missing_result():
+    op = SSAOp("add", (Const(1), Const(2)), None)
+
+    with pytest.raises(CompileError, match="ssa-verifier: op #0 'add': missing result"):
         verify([op])
 
 
@@ -145,3 +153,100 @@ def test_verifier_rejects_non_power_of_two_reduction_width():
 
     with pytest.raises(CompileError, match="power of two"):
         verify([*ops, op], block_size=6)
+
+
+def scalar_for_range(
+    *,
+    start=None,
+    stop=None,
+    step=None,
+    carried_input=None,
+    index_id=1,
+    carried_arg_id=2,
+    yielded=None,
+    result_id=4,
+    result_ty=I32,
+):
+    start = Const(0) if start is None else start
+    stop = Param("stop", I32) if stop is None else stop
+    step = Const(1) if step is None else step
+    initial = SSAValue(0, I32)
+    carried_input = initial if carried_input is None else carried_input
+    index = SSAValue(index_id, I32)
+    carried_arg = SSAValue(carried_arg_id, I32)
+    body_result = SSAValue(3, I32)
+    yielded = body_result if yielded is None else yielded
+    result = SSAValue(result_id, result_ty)
+    loop = SSAForRange(
+        index=index,
+        start=start,
+        stop=stop,
+        step=step,
+        carried_inputs=(carried_input,),
+        carried_args=(carried_arg,),
+        body=[SSAOp("add", (carried_arg, index), body_result)],
+        yields=(yielded,),
+        results=(result,),
+    )
+    return [SSAOp("add", (Const(0), Const(0)), initial), loop]
+
+
+def test_verifier_accepts_valid_for_range():
+    ops = scalar_for_range()
+
+    assert verify(ops) == ops
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"stop": SSAValue(99, I32)}, "loop stop %99 used before definition"),
+        (
+            {"carried_input": SSAValue(99, I32)},
+            "carried input %99 used before definition",
+        ),
+        ({"yielded": SSAValue(99, I32)}, "yield %99 used before definition"),
+    ],
+)
+def test_verifier_rejects_for_range_use_before_definition(kwargs, message):
+    with pytest.raises(CompileError, match=message):
+        verify(scalar_for_range(**kwargs))
+
+
+def test_verifier_rejects_for_range_carried_type_change():
+    with pytest.raises(CompileError, match="yield expected i32, got f32"):
+        verify(scalar_for_range(yielded=Const(1.0), result_ty=F32))
+
+
+def test_verifier_rejects_non_i32_for_range_index():
+    ops = scalar_for_range()
+    loop = ops[-1]
+    assert isinstance(loop, SSAForRange)
+    loop.index = SSAValue(loop.index.id, F32)
+
+    with pytest.raises(CompileError, match="loop index must be i32, got f32"):
+        verify(ops)
+
+
+@pytest.mark.parametrize("step", [Const(0), Const(-1)])
+def test_verifier_rejects_non_positive_for_range_step(step):
+    with pytest.raises(CompileError, match="loop step must be positive"):
+        verify(scalar_for_range(step=step))
+
+
+def test_verifier_rejects_dynamic_for_range_step():
+    with pytest.raises(CompileError, match="loop step must be a constant integer"):
+        verify(scalar_for_range(step=Param("step", I32)))
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"index_id": 0}, "duplicate definition of loop index %0"),
+        ({"carried_arg_id": 1}, "duplicate definition of carried argument %1"),
+        ({"result_id": 3}, "duplicate definition of loop result %3"),
+    ],
+)
+def test_verifier_rejects_duplicate_for_range_value_ids(kwargs, message):
+    with pytest.raises(CompileError, match=message):
+        verify(scalar_for_range(**kwargs))

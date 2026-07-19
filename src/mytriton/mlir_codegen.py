@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from .mlir_backend import (
@@ -7,7 +8,7 @@ from .mlir_backend import (
     mlir_available,
     run_pipeline,
 )
-from .ssa import SSAOp, SSAOperand, SSAValue
+from .ssa import SSAForRange, SSAItem, SSAOp, SSAOperand, SSAValue
 from .trace import BOOL, F32, I32, BlockType, Const, Param, PointerType, Type
 
 
@@ -246,13 +247,15 @@ class MLIRCodegen:
             raise TypeError(f"MLIR MVP does not support {op.opcode!r}")
 
     def generate(
-        self, kernel_name: str, ssa_ops: list[SSAOp], params: list[Param]
+        self, kernel_name: str, ssa_ops: Sequence[SSAItem], params: list[Param]
     ) -> str:
         self.lines = []
         self.values = {}
         self.constants = {}
 
         for op in ssa_ops:
+            if isinstance(op, SSAForRange):
+                raise TypeError("MLIR MVP does not support runtime for loops")
             if op.result is None:
                 continue
             ty = op.result.ty
@@ -271,6 +274,7 @@ class MLIRCodegen:
         )
 
         for op in ssa_ops:
+            assert isinstance(op, SSAOp)
             self.emit(op)
 
         body = [

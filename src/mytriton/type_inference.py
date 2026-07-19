@@ -12,6 +12,9 @@ from .trace import (
     Const,
     ExpandDims,
     Load,
+    LoopCarry,
+    LoopIndex,
+    LoopResult,
     Max,
     Maximum,
     Min,
@@ -103,8 +106,17 @@ class TypeInference:
         elif isinstance(expr, Param):
             ty = expr.ty
 
-        elif isinstance(expr, ProgramId):
+        elif isinstance(expr, ProgramId):  # noqa: SIM114
             ty = I32
+
+        elif isinstance(expr, LoopIndex):
+            ty = I32
+
+        elif isinstance(expr, LoopCarry):
+            ty = self.infer(expr.initial)
+
+        elif isinstance(expr, LoopResult):
+            ty = self.infer(expr.loop.carried_outputs[expr.index])
 
         elif isinstance(expr, Arange):
             size = expr.end - expr.start

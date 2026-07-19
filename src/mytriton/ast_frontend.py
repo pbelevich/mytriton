@@ -9,11 +9,17 @@ from typing import Any
 from . import language as tl
 from .trace import (
     Builder,
+    Expression,
+    ForRange,
+    LoopCarry,
+    LoopIndex,
+    LoopResult,
     PointerType,
     Ptr,
     Value,
     is_constexpr_annotation,
     make_runtime_params,
+    unwrap,
 )
 
 
@@ -56,10 +62,87 @@ def _make_symbolic_env(
     return env
 
 
+class AssignedNameCollector(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.names: list[str] = []
+        self._seen: set[str] = set()
+
+    def add_name(self, name: str) -> None:
+        if name not in self._seen:
+            self._seen.add(name)
+            self.names.append(name)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                self.add_name(target.id)
+            else:
+                raise ASTFrontendError(
+                    "loop MVP supports only assignment to simple names"
+                )
+        self.generic_visit(node.value)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        if not isinstance(node.target, ast.Name):
+            raise ASTFrontendError(
+                "loop MVP supports only annotated assignment to simple names"
+            )
+        self.add_name(node.target.id)
+        if node.value is not None:
+            self.visit(node.value)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        if not isinstance(node.target, ast.Name):
+            raise ASTFrontendError(
+                "loop MVP supports only augmented assignment to simple names"
+            )
+        self.add_name(node.target.id)
+        self.generic_visit(node.value)
+
+
+def _assigned_names(body: list[ast.stmt]) -> list[str]:
+    collector = AssignedNameCollector()
+    for stmt in body:
+        collector.visit(stmt)
+    return collector.names
+
+
 class ASTTracer(ast.NodeVisitor):
-    def __init__(self, env: dict[str, Any], external_env: Mapping[str, Any]) -> None:
+    def __init__(
+        self,
+        env: dict[str, Any],
+        external_env: Mapping[str, Any],
+        capture_env: Mapping[str, Any] | None = None,
+    ) -> None:
         self.env = env
         self.external_env = external_env
+        self._capture_ids = {
+            id(unwrap(value))
+            for value in (capture_env or {}).values()
+            if isinstance(value, (Ptr, Value))
+        }
+        self._seen_capture_ids: set[int] = set()
+        self.captures: list[Expression] = []
+
+    def _record_capture(self, value: Any) -> None:
+        if not isinstance(value, (Ptr, Value)):
+            return
+
+        expr = unwrap(value)
+        key = id(expr)
+        if key not in self._capture_ids or key in self._seen_capture_ids:
+            return
+
+        self._seen_capture_ids.add(key)
+        self.captures.append(expr)
+
+    def _propagate_capture(self, expr: Expression) -> None:
+        key = id(expr)
+        if key not in self._capture_ids or key in self._seen_capture_ids:
+            return
+
+        self._seen_capture_ids.add(key)
+        self.captures.append(expr)
 
     def visit_stmt_list(self, body: list[ast.stmt]) -> None:
         for stmt in body:
@@ -137,20 +220,115 @@ class ASTTracer(ast.NodeVisitor):
         if node.orelse:
             raise ASTFrontendError("for/else is not supported")
 
-        loop_range = self._eval_range_iterator(node.iter)
+        start, stop, step = self._eval_range_parts(node.iter)
 
-        name = node.target.id
-        old_value = self.env.get(name)
-        had_old_value = name in self.env
+        # Fast path: all bounds are Python ints => frontend unroll.
+        if type(start) is int and type(stop) is int and type(step) is int:
+            name = node.target.id
+            old_value = self.env.get(name)
+            had_old_value = name in self.env
 
-        for value in loop_range:
-            self.env[name] = value
-            self.visit_stmt_list(node.body)
+            for value in range(start, stop, step):
+                self.env[name] = value
+                self.visit_stmt_list(node.body)
 
-        if had_old_value:
-            self.env[name] = old_value
-        else:
-            del self.env[name]
+            if had_old_value:
+                self.env[name] = old_value
+            else:
+                del self.env[name]
+
+            return
+
+        # Runtime loop MVP.
+        self._visit_runtime_for(node, start=start, stop=stop, step=step)
+
+    def _visit_runtime_for(
+        self,
+        node: ast.For,
+        *,
+        start: Any,
+        stop: Any,
+        step: Any,
+    ) -> None:
+        target = node.target
+        if not isinstance(target, ast.Name):
+            raise ASTFrontendError(
+                "only for loops with a simple induction variable are supported"
+            )
+
+        if type(step) is not int:
+            raise ASTFrontendError("runtime for MVP requires integer constant step")
+
+        if step <= 0:
+            raise ASTFrontendError("runtime for MVP supports only positive step")
+
+        assigned = _assigned_names(node.body)
+
+        if target.id in assigned:
+            raise ASTFrontendError(
+                "assignment to runtime loop induction variable is not supported"
+            )
+
+        # Only variables that existed before the loop and are reassigned inside
+        # become loop-carried variables. This captures `acc` in matmul.
+        carried_names = tuple(name for name in assigned if name in self.env)
+
+        loop_index = LoopIndex(target.id)
+        carried_inputs = tuple(unwrap(self.env[name]) for name in carried_names)
+        carried_args = tuple(
+            LoopCarry(index=i, initial=initial)
+            for i, initial in enumerate(carried_inputs)
+        )
+
+        body_env = dict(self.env)
+        body_env[target.id] = Value(loop_index)
+
+        for name, carried_arg in zip(carried_names, carried_args, strict=True):
+            body_env[name] = Value(carried_arg)
+
+        capture_env = {
+            name: value
+            for name, value in self.env.items()
+            if name not in carried_names and name != target.id
+        }
+
+        with Builder() as body_builder:
+            body_tracer = ASTTracer(
+                body_env,
+                self.external_env,
+                capture_env=capture_env,
+            )
+            body_tracer.visit_stmt_list(node.body)
+
+        for capture in body_tracer.captures:
+            self._propagate_capture(capture)
+
+        carried_outputs = tuple(unwrap(body_env[name]) for name in carried_names)
+
+        loop = ForRange(
+            index=loop_index,
+            start=unwrap(start),
+            stop=unwrap(stop),
+            step=unwrap(step),
+            captures=tuple(body_tracer.captures),
+            body=body_builder.ops,
+            carried_inputs=carried_inputs,
+            carried_args=carried_args,
+            carried_outputs=carried_outputs,
+        )
+
+        results = tuple(
+            LoopResult(loop=loop, index=i) for i in range(len(carried_names))
+        )
+        loop.results = results
+
+        Builder.current().ops.append(loop)
+
+        # After the loop, carried variables refer to loop results.
+        for name, result in zip(carried_names, results, strict=True):
+            self.env[name] = Value(result)
+
+        # Names created only inside the loop do not leak in this MVP.
 
     def visit_Return(self, node: ast.Return) -> None:
         raise ASTFrontendError("return statements are not supported in kernels")
@@ -162,7 +340,9 @@ class ASTTracer(ast.NodeVisitor):
     def visit_Name(self, node: ast.Name) -> Any:
         if isinstance(node.ctx, ast.Load):
             if node.id in self.env:
-                return self.env[node.id]
+                value = self.env[node.id]
+                self._record_capture(value)
+                return value
 
             if node.id in self.external_env:
                 return self.external_env[node.id]
@@ -280,7 +460,7 @@ class ASTTracer(ast.NodeVisitor):
 
         return self.visit(node)
 
-    def _eval_range_iterator(self, node: ast.AST) -> range:
+    def _eval_range_parts(self, node: ast.AST) -> tuple[Any, Any, Any]:
         if not isinstance(node, ast.Call):
             raise ASTFrontendError("only for ... in range(...) is supported")
 
@@ -293,27 +473,15 @@ class ASTTracer(ast.NodeVisitor):
             )
 
         if len(args) == 1:
-            start, stop, step = 0, args[0], 1
-        elif len(args) == 2:
-            start, stop = args
-            step = 1
-        elif len(args) == 3:
-            start, stop, step = args
-        else:
-            raise ASTFrontendError("range expects 1, 2, or 3 arguments")
+            return 0, args[0], 1
 
-        for name, value in (
-            ("start", start),
-            ("stop", stop),
-            ("step", step),
-        ):
-            if type(value) is not int:
-                raise ASTFrontendError(
-                    "dynamic range bounds are not supported by AST frontend MVP; "
-                    f"{name} is {value!r}"
-                )
+        if len(args) == 2:
+            return args[0], args[1], 1
 
-        return range(start, stop, step)
+        if len(args) == 3:
+            return args[0], args[1], args[2]
+
+        raise ASTFrontendError("range expects 1, 2, or 3 arguments")
 
 
 def trace(fn, signature, bound_args, runtime_params=None):
