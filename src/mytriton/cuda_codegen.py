@@ -2,7 +2,7 @@ import math
 from dataclasses import dataclass
 from typing import ClassVar
 
-from .block_shapes import cuda_kernel_block_shape, prod
+from .block_shapes import CudaKernelLayout, cuda_kernel_layout
 from .ssa import SSAForRange, SSAItem, SSAOp, SSAOperand, SSAValue
 from .trace import (
     BOOL,
@@ -46,7 +46,10 @@ class SSACUDACodegen:
     def __init__(self):
         self.lines: list[str] = []
         self.values: dict[int, str | CudaPtrRef | CudaArangeRef] = {}
-        self.block_shape: tuple[int, ...] = (1,)
+        self.layout = CudaKernelLayout(
+            output_tile_shape=(1,),
+            thread_shape=(1,),
+        )
         self.shared_lines: list[str] = []
 
     def cuda_type(self, ty: Type) -> str:
@@ -134,16 +137,32 @@ class SSACUDACodegen:
         return ty.element if isinstance(ty, BlockType) else ty
 
     def is_rank2_kernel(self) -> bool:
-        return len(self.block_shape) == 2
+        return self.layout.is_rank2
 
     def threads_in_kernel_block(self) -> int:
-        return prod(self.block_shape)
+        return self.layout.threads_per_block
+
+    def thread_coordinate(self, thread_axis: int) -> str:
+        if self.layout.rank == 1:
+            if thread_axis != 0:
+                raise ValueError(
+                    f"invalid thread axis {thread_axis} for rank-1 CUDA layout"
+                )
+            return "threadIdx.x"
+
+        coordinates = ("tile_i", "tile_j")
+        if thread_axis < 0 or thread_axis >= len(coordinates):
+            raise ValueError(
+                f"invalid thread axis {thread_axis} for {self.layout.thread_shape}"
+            )
+
+        return coordinates[thread_axis]
 
     def emit_rank2_prologue(self) -> None:
         if not self.is_rank2_kernel():
             return
 
-        _, cols = self.block_shape
+        _, cols = self.layout.thread_shape
 
         self.lines.extend(
             [
@@ -409,22 +428,41 @@ class SSACUDACodegen:
                     f"got {arange_ref}"
                 )
 
-            axis = op.attrs["axis"]
-            rows, cols = self.block_shape
+            axis = op.attrs.get("axis")
+            if type(axis) is not int:
+                raise TypeError(f"expand_dims axis must be an integer, got {axis}")
+
+            assert isinstance(axis, int)
 
             if not isinstance(result.ty, BlockType):
                 raise TypeError(f"expand_dims expects block result, got {result.ty}")
 
             result_shape = result.ty.shape
-            if axis == 1 and result_shape == (rows, 1):
-                coord = "tile_i"
-            elif axis == 0 and result_shape == (1, cols):
-                coord = "tile_j"
-            else:
+
+            try:
+                tile_layout = self.layout.tile_layout(
+                    result_shape,
+                    broadcast_axes=(axis,),
+                )
+            except ValueError as error:
                 raise TypeError(
                     f"cannot map expand_dims result {result.ty} into CUDA tile "
-                    f"shape {self.block_shape}"
+                    f"shape {self.layout.thread_shape}"
+                ) from error
+
+            mapped_axes = [
+                thread_axis
+                for thread_axis in tile_layout.thread_axes
+                if thread_axis is not None
+            ]
+
+            if len(mapped_axes) != 1:
+                raise TypeError(
+                    "expanded arange must map to exactly one CUDA thread axis, "
+                    f"got {tile_layout}"
                 )
+
+            coord = self.thread_coordinate(mapped_axes[0])
 
             expression = (
                 coord if arange_ref.start == 0 else f"({arange_ref.start} + {coord})"
@@ -442,7 +480,7 @@ class SSACUDACodegen:
         self.lines = []
         self.shared_lines = []
         self.values = {}
-        self.block_shape = cuda_kernel_block_shape(ssa_ops)
+        self.layout = cuda_kernel_layout(ssa_ops)
 
         self.emit_rank2_prologue()
 
