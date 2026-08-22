@@ -44,6 +44,11 @@ MLIR's GPU/NVVM stack to a cubin.
   `tl.int32`, and `tl.float32` dtype objects, typed SSA lowering and
   verification for constructed blocks, CUDA backend support, and MLIR lowering
   for `tl.full`/`tl.zeros`.
+- [ver12](https://github.com/pbelevich/mytriton/tree/ver12): explicit CUDA tile
+  layouts that separate logical output shapes from physical thread
+  organization, store-rooted output-layout inference, reduction-aware thread
+  layouts, projected layouts for per-thread values, and cooperative layouts
+  for distributing arbitrary rank-2 tiles across a CUDA thread block.
 
 ## AST frontend
 
@@ -152,6 +157,57 @@ thread, and `tl.empty` declares an uninitialized per-thread value. These factory
 functions describe logical blocks; they do not allocate CUDA shared memory.
 Any computation that consumes a value produced by `tl.empty` observes undefined
 contents.
+
+## CUDA tile layouts
+
+Logical block shapes are separate from their physical CUDA execution layouts.
+A `BlockType` describes the shape and element type visible in SSA, while
+`CudaKernelLayout` records both the logical output tile and the organization of
+CUDA threads assigned to it:
+
+```python
+layout = CudaKernelLayout(
+    output_tile_shape=(64, 64),
+    thread_shape=(8, 32),
+)
+```
+
+This layout represents a 64-by-64 output tile executed by 256 CUDA threads.
+The current elementwise lowering still uses one output element per thread, so
+the automatically inferred thread shape equals the output tile shape. Keeping
+the two shapes explicit prepares the backend for kernels in which each thread
+owns several output elements. Reductions already use this separation: a scalar
+output tile can retain the wider thread shape required by the reduction input.
+
+A projected `CudaTileLayout` maps logical dimensions directly to CUDA thread
+dimensions. Singleton dimensions may be broadcast:
+
+```text
+logical (4, 8) -> thread axes (0, 1)
+logical (4, 1) -> thread axes (0, none)
+logical (1, 8) -> thread axes (none, 1)
+```
+
+A `CudaCooperativeTileLayout` describes a different mapping in which all
+threads collectively traverse a logical tile. Thread `t` processes linear
+indices:
+
+```text
+t
+t + threads_per_block
+t + 2 * threads_per_block
+...
+```
+
+The linear indices are converted to logical coordinates according to the
+layout order. For a row-major rank-2 tile the order is `(1, 0)`, meaning that
+the column dimension changes fastest. This cooperative mapping can represent
+matrix multiplication operands such as A `[BM, BK]` and B `[BK, BN]` even when
+their shapes do not match the output tile or CUDA thread shape.
+
+Version 12 introduces the layout model and its validation. It does not yet emit
+cooperative shared-memory loads or implement `tl.dot`; those are the next
+lowering stages.
 
 ## Example
 
@@ -360,9 +416,13 @@ these rewrite passes because they are not region-aware yet.
 - Runtime array arguments must be C-contiguous `float32` arrays.
 - The launch grid is evaluated and used for CUDA execution, but it is not
   represented in the IR.
-- CUDA execution uses the SSA rank-1 vector width, or the product of the SSA
-  rank-2 tile shape, as the number of threads per block. Scalar-only kernels
-  use one thread per block.
+- The CUDA kernel layout is inferred from block-shaped operands of observable
+  `store` operations and from the input widths required by reductions. The
+  current elementwise policy assigns one CUDA thread to each output element;
+  reductions may retain a wider thread shape for a scalar output. Scalar-only
+  kernels use one thread per block. The layout model can represent fewer
+  threads than output elements, but CUDA code generation does not use that
+  mapping yet.
 - JIT cache entries are specialized by runtime types and constexpr values. Python
   globals and closure values used by a kernel must remain unchanged; call
   `kernel.clear_cache()` after changing them.
@@ -384,11 +444,13 @@ these rewrite passes because they are not region-aware yet.
   multi-block reduction yet.
 - Matrix multiplication support is intentionally naive so far. The current
   rank-2 matmul kernel computes one output tile with one CUDA thread per output
-  element, but it does not tile through shared memory because there is no
-  shared-memory lowering for logical block factory values. It repeatedly reads
-  from global memory and can traverse the reduction dimension with either an
-  unrolled `tl.static_range` or a runtime CUDA loop. In particular, `tl.empty`,
-  `tl.full`, and `tl.zeros` do not allocate shared-memory tiles.
+  element and repeatedly reads from global memory. It can traverse the
+  reduction dimension with either an unrolled `tl.static_range` or a runtime
+  CUDA loop. Cooperative tile layouts can now describe A `[BM, BK]` and
+  B `[BK, BN]` independently of C `[BM, BN]`, but there is not yet a `tl.dot`
+  operation or CUDA lowering that stages these operands in shared memory.
+  `tl.empty`, `tl.full`, and `tl.zeros` continue to represent logical
+  per-thread values rather than shared-memory allocations.
 - MLIR lowering currently supports only `ptr<f32>` parameters as
   `memref<?xf32>`, scalar `i32`/`f32`/`bool`, `tl.program_id(0)`,
   `tl.arange(0, BLOCK)`, basic arithmetic and `<`, pointer addition, masked
