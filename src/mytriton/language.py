@@ -1,6 +1,7 @@
 from .trace import (
     arange,
     constexpr,
+    dot,
     empty,
     exp,
     float32,
@@ -23,6 +24,7 @@ from .trace import (
 __all__ = [
     "arange",
     "constexpr",
+    "dot",
     "empty",
     "exp",
     "float32",

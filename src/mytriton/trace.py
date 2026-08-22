@@ -82,6 +82,10 @@ def zeros(
     return Value(Zeros(_normalize_block_shape(shape), _require_block_dtype(dtype)))
 
 
+def dot(lhs: Value, rhs: Value) -> Value:
+    return Value(Dot(unwrap(lhs), unwrap(rhs)))
+
+
 def load(
     ptr: Ptr,
     mask: Value | bool | None = None,
@@ -278,6 +282,12 @@ class Zeros:
 
 
 @dataclass
+class Dot:
+    lhs: Expression
+    rhs: Expression
+
+
+@dataclass
 class BinOp:
     op: str
     lhs: Any
@@ -389,6 +399,7 @@ Expression: TypeAlias = (
     | Empty
     | Full
     | Zeros
+    | Dot
     | BinOp
     | AddPtr
     | Load

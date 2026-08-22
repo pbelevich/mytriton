@@ -350,6 +350,8 @@ class SSACUDACodegen:
             element_ty = self.scalar_type(result.ty)
             zero = False if element_ty == BOOL else 0.0 if element_ty == F32 else 0
             self.assign(result, self.literal(zero))
+        elif op.opcode == "dot":
+            raise TypeError("CUDA lowering for tl.dot is not implemented")
         elif op.opcode in self.BINARY_OPS:
             lhs = self.expression_operand(op.operands[0])
             rhs = self.expression_operand(op.operands[1])
