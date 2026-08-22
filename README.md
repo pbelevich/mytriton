@@ -49,6 +49,11 @@ MLIR's GPU/NVVM stack to a cubin.
   organization, store-rooted output-layout inference, reduction-aware thread
   layouts, projected layouts for per-thread values, and cooperative layouts
   for distributing arbitrary rank-2 tiles across a CUDA thread block.
+- [ver13](https://github.com/pbelevich/mytriton/tree/ver13): public `tl.dot`
+  semantics for rank-2 `f32` blocks, expression-tree and typed SSA operations,
+  `[M, K] x [K, N] -> [M, N]` type inference, independent SSA verification,
+  optimizer purity rules, and an explicit diagnostic for the not-yet-implemented
+  CUDA lowering.
 
 ## AST frontend
 
@@ -206,8 +211,37 @@ matrix multiplication operands such as A `[BM, BK]` and B `[BK, BN]` even when
 their shapes do not match the output tile or CUDA thread shape.
 
 Version 12 introduces the layout model and its validation. It does not yet emit
-cooperative shared-memory loads or implement `tl.dot`; those are the next
-lowering stages.
+cooperative shared-memory loads; those are the next CUDA lowering stage.
+
+## `tl.dot` semantics
+
+Rank-2 `f32` blocks can be combined with the public `tl.dot` operation:
+
+```python
+lhs = tl.zeros((BM, BK), tl.float32)
+rhs = tl.zeros((BK, BN), tl.float32)
+result = tl.dot(lhs, rhs)
+```
+
+The operands must have shapes `[M, K]` and `[K, N]`. Their inner dimensions
+must match, and the result has shape `[M, N]`:
+
+```text
+%0 = zeros {shape=(4, 16), dtype=f32} : block<4x16 x f32>
+%1 = zeros {shape=(16, 8), dtype=f32} : block<16x8 x f32>
+%2 = dot %0, %1 : block<4x8 x f32>
+```
+
+The expression-tree type inference and SSA verifier independently check operand
+rank, `f32` element types, matching reduction dimensions, and the exact result
+type. `dot` is a pure SSA operation, so duplicate operations are eligible for
+common subexpression elimination and unused operations can be removed by
+dead-code elimination.
+
+Version 13 defines the language and IR semantics only. CUDA lowering for
+`tl.dot` is intentionally not implemented yet. The next versions will introduce
+cooperative shared-memory tiles and then lower `dot` to an ordinary CUDA-core
+multiply-accumulate loop.
 
 ## Example
 
@@ -383,7 +417,9 @@ the positive constant step, definition order, and matching types and counts for
 carried inputs, region arguments, yielded values, and loop results. For block
 factory functions it checks that shapes are non-empty and positive, dtypes are
 supported, result block types match the declared shape/dtype, and `tl.full` has
-a scalar fill value convertible to the requested dtype.
+a scalar fill value convertible to the requested dtype. For `tl.dot`, it
+requires two rank-2 `f32` operands, matching inner dimensions, and an exact
+`[M, N]` rank-2 `f32` result.
 
 Straight-line verified SSA then runs through a small optimization pipeline:
 
@@ -436,7 +472,9 @@ these rewrite passes because they are not region-aware yet.
   rank-1 and rank-2 logical blocks. Reduction lowering internally emits the
   CUDA shared-memory scratch buffers and synchronization needed for block-local
   reductions. Floating-point elementwise extrema propagate NaNs and choose the
-  right-hand operand when values compare equal.
+  right-hand operand when values compare equal. `tl.dot` is represented and
+  verified in SSA, but the CUDA backend intentionally rejects it until
+  shared-memory tile lowering is implemented.
 - Reductions are currently single-block reductions over the SSA vector width.
   The vector width must be a power of two and must match the CUDA thread block
   size. Larger rows can be handled by statically unrolling multiple loads into
@@ -446,9 +484,10 @@ these rewrite passes because they are not region-aware yet.
   rank-2 matmul kernel computes one output tile with one CUDA thread per output
   element and repeatedly reads from global memory. It can traverse the
   reduction dimension with either an unrolled `tl.static_range` or a runtime
-  CUDA loop. Cooperative tile layouts can now describe A `[BM, BK]` and
-  B `[BK, BN]` independently of C `[BM, BN]`, but there is not yet a `tl.dot`
-  operation or CUDA lowering that stages these operands in shared memory.
+  CUDA loop. Cooperative tile layouts can describe A `[BM, BK]` and B
+  `[BK, BN]` independently of C `[BM, BN]`. The `tl.dot` operation now has
+  expression-tree, typed SSA, verification, and optimization semantics, but it
+  does not yet have CUDA lowering or shared-memory staging for its operands.
   `tl.empty`, `tl.full`, and `tl.zeros` continue to represent logical
   per-thread values rather than shared-memory allocations.
 - MLIR lowering currently supports only `ptr<f32>` parameters as

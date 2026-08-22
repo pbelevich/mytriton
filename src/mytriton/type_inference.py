@@ -10,6 +10,7 @@ from .trace import (
     BinOp,
     BlockType,
     Const,
+    Dot,
     Empty,
     ExpandDims,
     Full,
@@ -89,6 +90,33 @@ class TypeInference:
 
         raise TypeError(f"{context} must be convertible to {destination}, got {source}")
 
+    def infer_dot(self, expr: Dot) -> BlockType:
+        lhs_ty = self.infer(expr.lhs)
+        rhs_ty = self.infer(expr.rhs)
+
+        if not isinstance(lhs_ty, BlockType) or lhs_ty.rank != 2:
+            raise TypeError(f"dot lhs must be a rank-2 block, got {lhs_ty}")
+
+        if not isinstance(rhs_ty, BlockType) or rhs_ty.rank != 2:
+            raise TypeError(f"dot rhs must be a rank-2 block, got {rhs_ty}")
+
+        if lhs_ty.element != F32:
+            raise TypeError(f"dot lhs must have f32 elements, got {lhs_ty}")
+
+        if rhs_ty.element != F32:
+            raise TypeError(f"dot rhs must have f32 elements, got {rhs_ty}")
+
+        lhs_m, lhs_k = lhs_ty.shape
+        rhs_k, rhs_n = rhs_ty.shape
+
+        if lhs_k != rhs_k:
+            raise TypeError(
+                "dot inner dimensions must match, "
+                f"got {lhs_ty.shape} and {rhs_ty.shape}"
+            )
+
+        return BlockType((lhs_m, rhs_n), F32)
+
     def infer(self, expr) -> Type:
         key = id(expr)
         ty: Type
@@ -144,6 +172,9 @@ class TypeInference:
                 context="full value",
             )
             ty = BlockType(expr.shape, expr.dtype)
+
+        elif isinstance(expr, Dot):
+            ty = self.infer_dot(expr)
 
         elif isinstance(expr, BinOp):
             lhs = self.infer(expr.lhs)

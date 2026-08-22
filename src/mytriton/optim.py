@@ -178,6 +178,7 @@ class CSEPass:
         "arange",
         "full",
         "zeros",
+        "dot",
         "add",
         "sub",
         "mul",

@@ -7,6 +7,7 @@ from .trace import (
     Arange,
     BinOp,
     Const,
+    Dot,
     Empty,
     ExpandDims,
     ForRange,
@@ -159,6 +160,16 @@ class SSALowering:
                 "zeros",
                 expr,
                 attrs={"shape": expr.shape, "dtype": expr.dtype},
+            )
+
+        if isinstance(expr, Dot):
+            lhs = self.lower_expr(expr.lhs)
+            rhs = self.lower_expr(expr.rhs)
+
+            return self.emit(
+                "dot",
+                expr,
+                operands=(lhs, rhs),
             )
 
         if isinstance(expr, BinOp):

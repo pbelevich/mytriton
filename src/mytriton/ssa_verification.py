@@ -26,6 +26,7 @@ class SSAVerifier:
         "empty": 0,
         "full": 1,
         "zeros": 0,
+        "dot": 2,
         "add": 2,
         "sub": 2,
         "mul": 2,
@@ -145,6 +146,37 @@ class SSAVerifier:
             element = BOOL
 
         expected_ty = self.with_shape(index, op, element, lhs_ty, rhs_ty)
+        self.require_type(index, op, result_ty, expected_ty)
+
+    def check_dot(self, index: int, op: SSAOp) -> None:
+        lhs_ty = self.require_operand_type(index, op, op.operands[0], "lhs")
+        rhs_ty = self.require_operand_type(index, op, op.operands[1], "rhs")
+        result_ty = self.result_type(index, op)
+
+        if not isinstance(lhs_ty, BlockType) or lhs_ty.rank != 2:
+            self.fail(index, op, f"dot lhs must be a rank-2 block, got {lhs_ty}")
+
+        if not isinstance(rhs_ty, BlockType) or rhs_ty.rank != 2:
+            self.fail(index, op, f"dot rhs must be a rank-2 block, got {rhs_ty}")
+
+        if lhs_ty.element != F32:
+            self.fail(index, op, f"dot lhs must have f32 elements, got {lhs_ty}")
+
+        if rhs_ty.element != F32:
+            self.fail(index, op, f"dot rhs must have f32 elements, got {rhs_ty}")
+
+        lhs_m, lhs_k = lhs_ty.shape
+        rhs_k, rhs_n = rhs_ty.shape
+
+        if lhs_k != rhs_k:
+            self.fail(
+                index,
+                op,
+                "dot inner dimensions must match, "
+                f"got {lhs_ty.shape} and {rhs_ty.shape}",
+            )
+
+        expected_ty = BlockType((lhs_m, rhs_n), F32)
         self.require_type(index, op, result_ty, expected_ty)
 
     def check_unary(self, index: int, op: SSAOp) -> None:
@@ -565,6 +597,8 @@ class SSAVerifier:
 
             if op.opcode in {"add", "sub", "mul", "div", "cmp_lt"}:
                 self.check_binary_numeric(index, op)
+            elif op.opcode == "dot":
+                self.check_dot(index, op)
             elif op.opcode == "and":
                 self.check_binary_bool(index, op)
             elif op.opcode in {"neg", "exp"}:
