@@ -54,6 +54,11 @@ MLIR's GPU/NVVM stack to a cubin.
   `[M, K] x [K, N] -> [M, N]` type inference, independent SSA verification,
   optimizer purity rules, and an explicit diagnostic for the not-yet-implemented
   CUDA lowering.
+- [ver14](https://github.com/pbelevich/mytriton/tree/ver14): CUDA shared-memory
+  tile buffers, SSA pattern matching for canonical masked matrix loads,
+  cooperative staging of `tl.dot` operands, zero-filled boundary handling,
+  block synchronization, and an explicit diagnostic for the deferred
+  CUDA-core dot computation.
 
 ## AST frontend
 
@@ -242,6 +247,52 @@ Version 13 defines the language and IR semantics only. CUDA lowering for
 `tl.dot` is intentionally not implemented yet. The next versions will introduce
 cooperative shared-memory tiles and then lower `dot` to an ordinary CUDA-core
 multiply-accumulate loop.
+
+## Shared-memory dot staging
+
+The CUDA backend recognizes canonical matrix tiles loaded for `tl.dot`:
+
+```python
+a_values = tl.load(
+    a + a_rows * K + a_columns,
+    mask=(a_rows < M) & (a_columns < K),
+    other=0.0,
+)
+b_values = tl.load(
+    b + b_rows * N + b_columns,
+    mask=(b_rows < K) & (b_columns < N),
+    other=0.0,
+)
+result = tl.dot(a_values, b_values)
+```
+
+The supported pointer form is `base + rows * row_stride + columns`. Rows and
+columns must be built from a scalar tile offset plus an expanded
+`tl.arange(0, size)`. Each load must use a two-dimensional bounds mask and
+`other=0.0`.
+
+The CUDA staging analysis follows the SSA use-def graph backwards from both
+`dot` operands. Operations used only to describe the matrix tiles are removed
+from ordinary per-thread scalar lowering, while scalar tile origins and values
+shared with the output address remain available.
+
+Each CUDA thread copies linear shared-memory positions
+
+```text
+threadIdx.x
+threadIdx.x + threads_per_block
+threadIdx.x + 2 * threads_per_block
+...
+```
+
+until the complete A `[BM, BK]` or B `[BK, BN]` tile has been covered. Logical
+row and column coordinates determine the global matrix address. Out-of-bounds
+positions receive `0.0`, so edge tiles are safe without divergent barriers.
+After both cooperative loads, the backend emits one `__syncthreads()`.
+
+Version 14 intentionally stops after staging and reports that CUDA computation
+for `tl.dot` is not implemented. Version 15 will read the shared buffers,
+perform the ordinary CUDA-core FMA loop over `BK`, and store the result tile.
 
 ## Example
 
@@ -472,9 +523,11 @@ these rewrite passes because they are not region-aware yet.
   rank-1 and rank-2 logical blocks. Reduction lowering internally emits the
   CUDA shared-memory scratch buffers and synchronization needed for block-local
   reductions. Floating-point elementwise extrema propagate NaNs and choose the
-  right-hand operand when values compare equal. `tl.dot` is represented and
-  verified in SSA, but the CUDA backend intentionally rejects it until
-  shared-memory tile lowering is implemented.
+  right-hand operand when values compare equal. For canonical matrix-load
+  operands, `tl.dot` lowering emits shared-memory declarations, cooperative
+  masked loads with zero-filled boundaries, and a block barrier. It then
+  intentionally rejects the missing CUDA-core dot computation instead of
+  returning an incorrect kernel.
 - Reductions are currently single-block reductions over the SSA vector width.
   The vector width must be a power of two and must match the CUDA thread block
   size. Larger rows can be handled by statically unrolling multiple loads into
@@ -487,7 +540,8 @@ these rewrite passes because they are not region-aware yet.
   CUDA loop. Cooperative tile layouts can describe A `[BM, BK]` and B
   `[BK, BN]` independently of C `[BM, BN]`. The `tl.dot` operation now has
   expression-tree, typed SSA, verification, and optimization semantics, but it
-  does not yet have CUDA lowering or shared-memory staging for its operands.
+  can only stage canonical load operands cooperatively in CUDA shared memory;
+  the multiply-accumulate computation remains deferred to Version 15.
   `tl.empty`, `tl.full`, and `tl.zeros` continue to represent logical
   per-thread values rather than shared-memory allocations.
 - MLIR lowering currently supports only `ptr<f32>` parameters as
