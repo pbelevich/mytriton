@@ -3,6 +3,17 @@ from dataclasses import dataclass
 from typing import ClassVar
 
 from .block_shapes import CudaKernelLayout, cuda_kernel_layout
+from .cuda_dot_staging import (
+    CudaDotSharedBuffers,
+    CudaDotStagingAnalysis,
+    CudaDotStagingAnalyzer,
+    CudaDotStagingPlan,
+    CudaGlobalTile,
+    CudaGlobalTilePlan,
+    CudaSharedBuffer,
+    SSADefinitions,
+    cuda_scalar_nbytes,
+)
 from .ssa import SSAForRange, SSAItem, SSAOp, SSAOperand, SSAValue
 from .trace import (
     BOOL,
@@ -34,6 +45,8 @@ class CudaArangeRef:
 
 
 class SSACUDACodegen:
+    MAX_SHARED_MEMORY_BYTES: ClassVar[int] = 48 * 1024
+
     BINARY_OPS: ClassVar[dict[str, str]] = {
         "add": "+",
         "sub": "-",
@@ -51,6 +64,12 @@ class SSACUDACodegen:
             thread_shape=(1,),
         )
         self.shared_lines: list[str] = []
+        self.shared_memory_bytes = 0
+        self.definitions = SSADefinitions([])
+        self.staging_analysis = CudaDotStagingAnalysis(
+            dot_plans={},
+            staging_only_ids=frozenset(),
+        )
 
     def cuda_type(self, ty: Type) -> str:
         if isinstance(ty, BlockType):
@@ -132,6 +151,215 @@ class SSACUDACodegen:
         name = f"v{result.id}"
         self.lines.append(f"    {self.cuda_type(result.ty)} {name};")
         self.values[result.id] = name
+
+    def reserve_shared_memory(self, additional_bytes: int) -> None:
+        required_bytes = self.shared_memory_bytes + additional_bytes
+        if required_bytes > self.MAX_SHARED_MEMORY_BYTES:
+            raise ValueError(
+                f"CUDA shared memory requires {required_bytes} bytes, "
+                f"exceeding the conservative {self.MAX_SHARED_MEMORY_BYTES}-byte limit"
+            )
+
+        self.shared_memory_bytes = required_bytes
+
+    def append_shared_buffer_declaration(self, buffer: CudaSharedBuffer) -> None:
+        cuda_ty = self.cuda_type(buffer.element_ty)
+        self.shared_lines.append(
+            f"    __shared__ {cuda_ty} {buffer.name}[{buffer.size}];"
+        )
+
+    def declare_shared_buffer(
+        self,
+        name: str,
+        logical_shape: tuple[int, ...],
+        element_ty: ScalarType,
+    ) -> CudaSharedBuffer:
+        buffer = CudaSharedBuffer(
+            name=name,
+            logical_shape=logical_shape,
+            element_ty=element_ty,
+        )
+
+        self.reserve_shared_memory(buffer.nbytes)
+        self.append_shared_buffer_declaration(buffer)
+
+        return buffer
+
+    def emit_cooperative_load(
+        self,
+        target: CudaSharedBuffer,
+        source: CudaGlobalTile,
+        *,
+        order: tuple[int, ...] = (1, 0),
+    ) -> None:
+        cooperative_layout = self.layout.cooperative_tile_layout(
+            target.logical_shape,
+            order=order,
+        )
+        if cooperative_layout.order != (1, 0):
+            raise ValueError(
+                "CUDA cooperative dot loads require row-major order (1, 0), "
+                f"got {cooperative_layout.order}"
+            )
+
+        index = f"{target.name}_index"
+        row = f"{target.name}_row"
+        column = f"{target.name}_column"
+        global_row = f"{target.name}_global_row"
+        global_column = f"{target.name}_global_column"
+        source_index = f"{target.name}_source_index"
+        in_bounds = f"{target.name}_in_bounds"
+
+        self.lines.extend(
+            [
+                (
+                    f"    for (int {index} = threadIdx.x; "
+                    f"{index} < {cooperative_layout.size}; "
+                    f"{index} += {cooperative_layout.threads_per_block}) {{"
+                ),
+                f"        int {row} = {index} / {target.columns};",
+                f"        int {column} = {index} % {target.columns};",
+                (f"        int {global_row} = ({source.row_offset}) + {row};"),
+                (f"        int {global_column} = ({source.column_offset}) + {column};"),
+                (
+                    f"        int {source_index} = "
+                    f"{global_row} * ({source.row_stride}) + {global_column};"
+                ),
+                (
+                    f"        bool {in_bounds} = "
+                    f"{global_row} < ({source.row_bound}) && "
+                    f"{global_column} < ({source.column_bound});"
+                ),
+                (
+                    f"        {target.element(row, column)} = "
+                    f"{in_bounds} ? "
+                    f"{source.base}[{source_index}] : {source.other};"
+                ),
+                "    }",
+            ]
+        )
+
+    def emit_block_barrier(self) -> None:
+        self.lines.append("    __syncthreads();")
+
+    def emit_dot_operand_staging(
+        self,
+        dot_result_id: int,
+        lhs_shape: tuple[int, ...],
+        rhs_shape: tuple[int, ...],
+        element_ty: ScalarType,
+        lhs_source: CudaGlobalTile,
+        rhs_source: CudaGlobalTile,
+    ) -> CudaDotSharedBuffers:
+        if len(lhs_shape) != 2 or len(rhs_shape) != 2 or lhs_shape[1] != rhs_shape[0]:
+            raise ValueError(
+                "dot staging expects compatible rank-2 operands, "
+                f"got {lhs_shape} and {rhs_shape}"
+            )
+
+        lhs = CudaSharedBuffer(
+            name=f"dot_lhs_{dot_result_id}",
+            logical_shape=lhs_shape,
+            element_ty=element_ty,
+        )
+        rhs = CudaSharedBuffer(
+            name=f"dot_rhs_{dot_result_id}",
+            logical_shape=rhs_shape,
+            element_ty=element_ty,
+        )
+
+        # Reserve both operands before mutating the generated CUDA fragment.
+        self.reserve_shared_memory(lhs.nbytes + rhs.nbytes)
+        self.append_shared_buffer_declaration(lhs)
+        self.append_shared_buffer_declaration(rhs)
+
+        self.emit_cooperative_load(lhs, lhs_source)
+        self.emit_cooperative_load(rhs, rhs_source)
+        self.emit_block_barrier()
+
+        return CudaDotSharedBuffers(
+            lhs=lhs,
+            rhs=rhs,
+        )
+
+    def resolve_global_tile(
+        self,
+        plan: CudaGlobalTilePlan,
+    ) -> CudaGlobalTile:
+        base = self.pointer_operand(plan.base)
+
+        if base.index != "0":
+            raise TypeError(
+                f"dot staging expects an unmodified global base pointer, got {base}"
+            )
+
+        return CudaGlobalTile(
+            base=base.base,
+            row_offset=self.expression_operand(plan.row_offset),
+            column_offset=self.expression_operand(plan.column_offset),
+            row_stride=self.expression_operand(plan.row_stride),
+            row_bound=self.expression_operand(plan.row_bound),
+            column_bound=self.expression_operand(plan.column_bound),
+            other=self.expression_operand(plan.other),
+        )
+
+    def emit_dot_operand_staging_from_ssa(
+        self,
+        op: SSAOp,
+        plan: CudaDotStagingPlan,
+    ) -> CudaDotSharedBuffers:
+        if op.opcode != "dot":
+            raise TypeError(
+                f"expected dot operation for shared staging, got {op.opcode}"
+            )
+
+        if op.result is None:
+            raise TypeError("dot operation requires a result")
+
+        lhs, rhs = op.operands
+
+        if not isinstance(lhs, SSAValue) or not isinstance(
+            lhs.ty,
+            BlockType,
+        ):
+            raise TypeError(f"dot lhs must be a block SSA value, got {lhs}")
+
+        if not isinstance(rhs, SSAValue) or not isinstance(
+            rhs.ty,
+            BlockType,
+        ):
+            raise TypeError(f"dot rhs must be a block SSA value, got {rhs}")
+
+        element_ty = lhs.ty.element
+        if not isinstance(element_ty, ScalarType):
+            raise TypeError(
+                f"dot shared-memory element must be scalar, got {element_ty}"
+            )
+
+        if rhs.ty.element != element_ty:
+            raise TypeError(
+                "dot shared-memory operands must have matching elements, "
+                f"got {lhs.ty.element} and {rhs.ty.element}"
+            )
+
+        # Resolve every operand before mutating shared_lines/lines.
+        lhs_source = self.resolve_global_tile(plan.lhs)
+        rhs_source = self.resolve_global_tile(plan.rhs)
+
+        return self.emit_dot_operand_staging(
+            dot_result_id=op.result.id,
+            lhs_shape=lhs.ty.shape,
+            rhs_shape=rhs.ty.shape,
+            element_ty=element_ty,
+            lhs_source=lhs_source,
+            rhs_source=rhs_source,
+        )
+
+    def is_staging_only(self, op: SSAOp) -> bool:
+        return (
+            op.result is not None
+            and op.result.id in self.staging_analysis.staging_only_ids
+        )
 
     def scalar_type(self, ty: Type) -> ScalarType | PointerType:
         return ty.element if isinstance(ty, BlockType) else ty
@@ -215,6 +443,9 @@ class SSACUDACodegen:
         value = self.expression_operand(operand)
 
         element_ty = input_ty.element
+        if not isinstance(element_ty, ScalarType):
+            raise TypeError(f"{op.opcode} expects scalar elements, got {element_ty}")
+
         cuda_ty = self.cuda_type(element_ty)
         width = input_ty.size
         if width & (width - 1):
@@ -223,6 +454,7 @@ class SSACUDACodegen:
         shared = f"reduce_smem_{result.id}"
         stride = f"stride_{result.id}"
 
+        self.reserve_shared_memory(width * cuda_scalar_nbytes(element_ty))
         self.shared_lines.append(f"    __shared__ {cuda_ty} {shared}[{width}];")
 
         self.lines.extend(
@@ -285,7 +517,7 @@ class SSACUDACodegen:
         for body_op in loop.body:
             if isinstance(body_op, SSAForRange):
                 self.emit_for_range(body_op)
-            else:
+            elif not self.is_staging_only(body_op):
                 self.emit(body_op)
 
         for yielded, carried_name in zip(loop.yields, carried_names, strict=True):
@@ -351,7 +583,16 @@ class SSACUDACodegen:
             zero = False if element_ty == BOOL else 0.0 if element_ty == F32 else 0
             self.assign(result, self.literal(zero))
         elif op.opcode == "dot":
-            raise TypeError("CUDA lowering for tl.dot is not implemented")
+            if result.id not in self.staging_analysis.stageable_dot_ids:
+                raise TypeError("CUDA lowering for tl.dot is not implemented")
+
+            plan = self.staging_analysis.plan_for(result.id)
+            self.emit_dot_operand_staging_from_ssa(op, plan)
+
+            raise TypeError(
+                "CUDA shared-memory staging for tl.dot is implemented, "
+                "but CUDA computation for tl.dot is not implemented"
+            )
         elif op.opcode in self.BINARY_OPS:
             lhs = self.expression_operand(op.operands[0])
             rhs = self.expression_operand(op.operands[1])
@@ -481,7 +722,10 @@ class SSACUDACodegen:
     ) -> str:
         self.lines = []
         self.shared_lines = []
+        self.shared_memory_bytes = 0
         self.values = {}
+        self.definitions = SSADefinitions(ssa_ops)
+        self.staging_analysis = CudaDotStagingAnalyzer(self.definitions).analyze()
         self.layout = cuda_kernel_layout(ssa_ops)
 
         self.emit_rank2_prologue()
@@ -493,7 +737,7 @@ class SSACUDACodegen:
         for op in ssa_ops:
             if isinstance(op, SSAForRange):
                 self.emit_for_range(op)
-            else:
+            elif not self.is_staging_only(op):
                 self.emit(op)
 
         body = [
