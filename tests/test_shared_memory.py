@@ -6,8 +6,15 @@ import pytest
 import mytriton as triton
 import mytriton.language as tl
 from mytriton.ast_frontend import trace as trace_ast
-from mytriton.block_shapes import CudaKernelLayout
-from mytriton.cuda_codegen import SSACUDACodegen
+from mytriton.block_shapes import (
+    CudaKernelLayout,
+    cuda_kernel_layout,
+)
+from mytriton.cuda_codegen import (
+    CudaArangeRef,
+    CudaRegisterTileRef,
+    SSACUDACodegen,
+)
 from mytriton.cuda_dot_staging import (
     CudaDotOperandMatcher,
     CudaDotSharedBuffers,
@@ -28,6 +35,7 @@ from mytriton.ssa import (
     SSAValue,
 )
 from mytriton.trace import (
+    BOOL,
     F32,
     I32,
     PTR_F32,
@@ -1226,7 +1234,7 @@ def test_cuda_core_dot_rejects_wrong_result_shape() -> None:
     assert codegen.values == {}
 
 
-def test_cuda_core_dot_requires_one_thread_per_result_element() -> None:
+def test_cuda_core_dot_emits_multiple_accumulators_per_thread() -> None:
     codegen = SSACUDACodegen()
     codegen.layout = CudaKernelLayout(
         output_tile_shape=(4, 8),
@@ -1250,14 +1258,967 @@ def test_cuda_core_dot_requires_one_thread_per_result_element() -> None:
         ),
     )
 
+    codegen.emit_dot_from_shared_memory(result, buffers)
+
+    assert codegen.lines == [
+        "    float v7_0_0 = 0.0f;",
+        "    float v7_1_0 = 0.0f;",
+        "    for (int dot_k_7 = 0; dot_k_7 < 16; ++dot_k_7) {",
+        (
+            "        v7_0_0 += "
+            "dot_lhs_7[(tile_i) * 16 + (dot_k_7)] * "
+            "dot_rhs_7[(dot_k_7) * 8 + (tile_j)];"
+        ),
+        (
+            "        v7_1_0 += "
+            "dot_lhs_7[(tile_i + 2) * 16 + (dot_k_7)] * "
+            "dot_rhs_7[(dot_k_7) * 8 + (tile_j)];"
+        ),
+        "    }",
+        "    __syncthreads();",
+    ]
+
+    value = codegen.values[result.id]
+    assert isinstance(value, CudaRegisterTileRef)
+    assert value.element((0, 0)) == "v7_0_0"
+    assert value.element((1, 0)) == "v7_1_0"
+
+
+def test_cuda_register_tile_ref_names_multiple_registers() -> None:
+    register_tile = CudaRegisterTileRef(
+        base="v7",
+        layout=CudaKernelLayout(
+            output_tile_shape=(8, 8),
+            thread_shape=(4, 4),
+        ).register_tile_layout(),
+    )
+
+    assert register_tile.element((0, 0)) == "v7_0_0"
+    assert register_tile.element((0, 1)) == "v7_0_1"
+    assert register_tile.element((1, 0)) == "v7_1_0"
+    assert register_tile.element((1, 1)) == "v7_1_1"
+
+
+def test_cuda_register_tile_ref_preserves_scalar_name() -> None:
+    register_tile = CudaRegisterTileRef(
+        base="v7",
+        layout=CudaKernelLayout(
+            output_tile_shape=(4, 8),
+            thread_shape=(4, 8),
+        ).register_tile_layout(),
+    )
+
+    assert register_tile.element((0, 0)) == "v7"
+
+
+def test_cuda_register_tile_ref_rejects_invalid_coordinate() -> None:
+    register_tile = CudaRegisterTileRef(
+        base="v7",
+        layout=CudaKernelLayout(
+            output_tile_shape=(8, 8),
+            thread_shape=(4, 4),
+        ).register_tile_layout(),
+    )
+
+    with pytest.raises(ValueError, match="invalid register coordinate"):
+        register_tile.element((2, 0))
+
+
+def test_cuda_codegen_emits_register_wise_binary_operation() -> None:
+    codegen = SSACUDACodegen()
+    codegen.layout = CudaKernelLayout(
+        output_tile_shape=(4, 8),
+        thread_shape=(2, 8),
+    )
+
+    ty = BlockType((4, 8), F32)
+    accumulator = SSAValue(id=0, ty=ty)
+    dot = SSAValue(id=1, ty=ty)
+    result = SSAValue(id=2, ty=ty)
+
+    register_layout = codegen.layout.register_tile_layout()
+    codegen.values[accumulator.id] = "acc"
+    codegen.values[dot.id] = CudaRegisterTileRef(
+        base="v1",
+        layout=register_layout,
+    )
+
+    codegen.emit(
+        SSAOp(
+            opcode="add",
+            operands=(accumulator, dot),
+            result=result,
+        )
+    )
+
+    assert codegen.lines == [
+        "    float v2_0_0 = (acc + v1_0_0);",
+        "    float v2_1_0 = (acc + v1_1_0);",
+    ]
+
+    value = codegen.values[result.id]
+    assert isinstance(value, CudaRegisterTileRef)
+    assert value.element((0, 0)) == "v2_0_0"
+    assert value.element((1, 0)) == "v2_1_0"
+
+
+def test_cuda_for_range_carries_register_tile() -> None:
+    codegen = SSACUDACodegen()
+    codegen.layout = CudaKernelLayout(
+        output_tile_shape=(4, 8),
+        thread_shape=(2, 8),
+    )
+
+    ty = BlockType((4, 8), F32)
+    initial = SSAValue(id=0, ty=ty)
+    increment = SSAValue(id=1, ty=ty)
+    index = SSAValue(id=2, ty=I32)
+    carried_arg = SSAValue(id=3, ty=ty)
+    updated = SSAValue(id=4, ty=ty)
+    result = SSAValue(id=5, ty=ty)
+
+    register_layout = codegen.layout.register_tile_layout()
+    codegen.values[initial.id] = "initial"
+    codegen.values[increment.id] = CudaRegisterTileRef(
+        base="increment",
+        layout=register_layout,
+    )
+
+    codegen.emit_for_range(
+        SSAForRange(
+            index=index,
+            start=Const(0),
+            stop=Const(2),
+            step=Const(1),
+            carried_inputs=(initial,),
+            carried_args=(carried_arg,),
+            body=[
+                SSAOp(
+                    opcode="add",
+                    operands=(carried_arg, increment),
+                    result=updated,
+                )
+            ],
+            yields=(updated,),
+            results=(result,),
+        )
+    )
+
+    assert codegen.lines == [
+        "    float v5_0_0 = initial;",
+        "    float v5_1_0 = initial;",
+        "    for (int v2 = 0; v2 < 2; v2 += 1) {",
+        "        float v4_0_0 = (v5_0_0 + increment_0_0);",
+        "        float v4_1_0 = (v5_1_0 + increment_1_0);",
+        "        v5_0_0 = v4_0_0;",
+        "        v5_1_0 = v4_1_0;",
+        "    }",
+    ]
+
+    carried_value = codegen.values[carried_arg.id]
+    result_value = codegen.values[result.id]
+
+    assert isinstance(carried_value, CudaRegisterTileRef)
+    assert isinstance(result_value, CudaRegisterTileRef)
+    assert carried_value == result_value
+    assert result_value.element((0, 0)) == "v5_0_0"
+    assert result_value.element((1, 0)) == "v5_1_0"
+
+
+def test_cuda_codegen_emits_register_wise_addptr() -> None:
+    codegen = SSACUDACodegen()
+    codegen.layout = CudaKernelLayout(
+        output_tile_shape=(4, 8),
+        thread_shape=(2, 8),
+    )
+
+    offsets = SSAValue(
+        id=0,
+        ty=BlockType((4, 8), I32),
+    )
+    pointers = SSAValue(
+        id=1,
+        ty=BlockType((4, 8), PTR_F32),
+    )
+
+    register_layout = codegen.layout.register_tile_layout()
+    codegen.values[offsets.id] = CudaRegisterTileRef(
+        base="offset",
+        layout=register_layout,
+    )
+
+    codegen.emit(
+        SSAOp(
+            opcode="addptr",
+            operands=(Param("out", PTR_F32), offsets),
+            result=pointers,
+        )
+    )
+
+    assert codegen.lines == [
+        "    float* v1_0_0 = out + offset_0_0;",
+        "    float* v1_1_0 = out + offset_1_0;",
+    ]
+
+    value = codegen.values[pointers.id]
+    assert isinstance(value, CudaRegisterTileRef)
+    assert value.element((0, 0)) == "v1_0_0"
+    assert value.element((1, 0)) == "v1_1_0"
+
+
+def test_cuda_codegen_emits_register_wise_masked_store() -> None:
+    codegen = SSACUDACodegen()
+    codegen.layout = CudaKernelLayout(
+        output_tile_shape=(4, 8),
+        thread_shape=(2, 8),
+    )
+
+    pointers = SSAValue(
+        id=0,
+        ty=BlockType((4, 8), PTR_F32),
+    )
+    values = SSAValue(
+        id=1,
+        ty=BlockType((4, 8), F32),
+    )
+    mask = SSAValue(
+        id=2,
+        ty=BlockType((4, 8), BOOL),
+    )
+
+    register_layout = codegen.layout.register_tile_layout()
+    codegen.values[pointers.id] = CudaRegisterTileRef(
+        base="pointer",
+        layout=register_layout,
+    )
+    codegen.values[values.id] = CudaRegisterTileRef(
+        base="value",
+        layout=register_layout,
+    )
+    codegen.values[mask.id] = CudaRegisterTileRef(
+        base="mask",
+        layout=register_layout,
+    )
+
+    codegen.emit(
+        SSAOp(
+            opcode="store",
+            operands=(pointers, values, mask),
+        )
+    )
+
+    assert codegen.lines == [
+        "    if (mask_0_0) {",
+        "        pointer_0_0[0] = value_0_0;",
+        "    }",
+        "    if (mask_1_0) {",
+        "        pointer_1_0[0] = value_1_0;",
+        "    }",
+    ]
+
+
+def test_cuda_codegen_rejects_store_with_incompatible_register_layouts() -> None:
+    codegen = SSACUDACodegen()
+    codegen.layout = CudaKernelLayout(
+        output_tile_shape=(4, 8),
+        thread_shape=(2, 8),
+    )
+
+    pointers = SSAValue(
+        id=0,
+        ty=BlockType((4, 8), PTR_F32),
+    )
+    values = SSAValue(
+        id=1,
+        ty=BlockType((4, 8), F32),
+    )
+
+    codegen.values[pointers.id] = CudaRegisterTileRef(
+        base="pointer",
+        layout=codegen.layout.register_tile_layout(),
+    )
+    codegen.values[values.id] = CudaRegisterTileRef(
+        base="value",
+        layout=CudaKernelLayout(
+            output_tile_shape=(4, 8),
+            thread_shape=(4, 4),
+        ).register_tile_layout(),
+    )
+
     with pytest.raises(
         TypeError,
-        match="requires one CUDA thread per result element",
+        match="incompatible CUDA register tile layouts",
     ):
-        codegen.emit_dot_from_shared_memory(
-            result,
-            buffers,
+        codegen.emit(
+            SSAOp(
+                opcode="store",
+                operands=(pointers, values, None),
+            )
         )
 
-    assert codegen.lines == []
-    assert codegen.values == {}
+
+def test_cuda_register_tile_ref_broadcasts_register_axes() -> None:
+    register_layout = CudaKernelLayout(
+        output_tile_shape=(8, 8),
+        thread_shape=(4, 4),
+    ).register_tile_layout()
+
+    rows = CudaRegisterTileRef(
+        base="rows",
+        layout=register_layout,
+        broadcast_axes=(1,),
+    )
+    columns = CudaRegisterTileRef(
+        base="columns",
+        layout=register_layout,
+        broadcast_axes=(0,),
+    )
+
+    assert rows.storage_shape == (2, 1)
+    assert rows.storage_coordinates() == (
+        (0, 0),
+        (1, 0),
+    )
+    assert rows.element((0, 0)) == "rows_0_0"
+    assert rows.element((0, 1)) == "rows_0_0"
+    assert rows.element((1, 0)) == "rows_1_0"
+    assert rows.element((1, 1)) == "rows_1_0"
+
+    assert columns.storage_shape == (1, 2)
+    assert columns.storage_coordinates() == (
+        (0, 0),
+        (0, 1),
+    )
+    assert columns.element((0, 0)) == "columns_0_0"
+    assert columns.element((1, 0)) == "columns_0_0"
+    assert columns.element((0, 1)) == "columns_0_1"
+    assert columns.element((1, 1)) == "columns_0_1"
+
+
+def test_cuda_codegen_expands_aranges_across_register_tile() -> None:
+    codegen = SSACUDACodegen()
+    codegen.layout = CudaKernelLayout(
+        output_tile_shape=(8, 8),
+        thread_shape=(4, 4),
+    )
+
+    row_arange = SSAValue(
+        id=0,
+        ty=BlockType((8,), I32),
+    )
+    rows = SSAValue(
+        id=1,
+        ty=BlockType((8, 1), I32),
+    )
+    column_arange = SSAValue(
+        id=2,
+        ty=BlockType((8,), I32),
+    )
+    columns = SSAValue(
+        id=3,
+        ty=BlockType((1, 8), I32),
+    )
+
+    codegen.values[row_arange.id] = CudaArangeRef(
+        start=0,
+        end=8,
+    )
+    codegen.values[column_arange.id] = CudaArangeRef(
+        start=0,
+        end=8,
+    )
+
+    codegen.emit(
+        SSAOp(
+            opcode="expand_dims",
+            operands=(row_arange,),
+            result=rows,
+            attrs={"axis": 1},
+        )
+    )
+    codegen.emit(
+        SSAOp(
+            opcode="expand_dims",
+            operands=(column_arange,),
+            result=columns,
+            attrs={"axis": 0},
+        )
+    )
+
+    assert codegen.lines == [
+        "    int v1_0_0 = tile_i;",
+        "    int v1_1_0 = tile_i + 4;",
+        "    int v3_0_0 = tile_j;",
+        "    int v3_0_1 = tile_j + 4;",
+    ]
+
+    row_value = codegen.values[rows.id]
+    column_value = codegen.values[columns.id]
+
+    assert isinstance(row_value, CudaRegisterTileRef)
+    assert isinstance(column_value, CudaRegisterTileRef)
+
+    assert row_value.broadcast_axes == (1,)
+    assert row_value.element((1, 1)) == "v1_1_0"
+
+    assert column_value.broadcast_axes == (0,)
+    assert column_value.element((1, 1)) == "v3_0_1"
+
+
+def test_cuda_binary_operations_preserve_and_expand_register_broadcasts() -> None:
+    codegen = SSACUDACodegen()
+    codegen.layout = CudaKernelLayout(
+        output_tile_shape=(8, 8),
+        thread_shape=(4, 4),
+    )
+
+    rows = SSAValue(
+        id=0,
+        ty=BlockType((8, 1), I32),
+    )
+    scaled_rows = SSAValue(
+        id=1,
+        ty=BlockType((8, 1), I32),
+    )
+    columns = SSAValue(
+        id=2,
+        ty=BlockType((1, 8), I32),
+    )
+    offsets = SSAValue(
+        id=3,
+        ty=BlockType((8, 8), I32),
+    )
+
+    register_layout = codegen.layout.register_tile_layout()
+    codegen.values[rows.id] = CudaRegisterTileRef(
+        base="rows",
+        layout=register_layout,
+        broadcast_axes=(1,),
+    )
+    codegen.values[columns.id] = CudaRegisterTileRef(
+        base="columns",
+        layout=register_layout,
+        broadcast_axes=(0,),
+    )
+
+    codegen.emit(
+        SSAOp(
+            opcode="mul",
+            operands=(rows, Param("stride", I32)),
+            result=scaled_rows,
+        )
+    )
+    codegen.emit(
+        SSAOp(
+            opcode="add",
+            operands=(scaled_rows, columns),
+            result=offsets,
+        )
+    )
+
+    assert codegen.lines == [
+        "    int v1_0_0 = (rows_0_0 * stride);",
+        "    int v1_1_0 = (rows_1_0 * stride);",
+        "    int v3_0_0 = (v1_0_0 + columns_0_0);",
+        "    int v3_0_1 = (v1_0_0 + columns_0_1);",
+        "    int v3_1_0 = (v1_1_0 + columns_0_0);",
+        "    int v3_1_1 = (v1_1_0 + columns_0_1);",
+    ]
+
+    scaled_value = codegen.values[scaled_rows.id]
+    offset_value = codegen.values[offsets.id]
+
+    assert isinstance(scaled_value, CudaRegisterTileRef)
+    assert isinstance(offset_value, CudaRegisterTileRef)
+
+    assert scaled_value.broadcast_axes == (1,)
+    assert scaled_value.element((1, 1)) == "v1_1_0"
+
+    assert offset_value.broadcast_axes == ()
+    assert offset_value.element((1, 1)) == "v3_1_1"
+
+
+def test_cuda_binary_operations_build_register_wise_mask() -> None:
+    codegen = SSACUDACodegen()
+    codegen.layout = CudaKernelLayout(
+        output_tile_shape=(8, 8),
+        thread_shape=(4, 4),
+    )
+
+    rows = SSAValue(
+        id=0,
+        ty=BlockType((8, 1), I32),
+    )
+    columns = SSAValue(
+        id=1,
+        ty=BlockType((1, 8), I32),
+    )
+    row_mask = SSAValue(
+        id=2,
+        ty=BlockType((8, 1), BOOL),
+    )
+    column_mask = SSAValue(
+        id=3,
+        ty=BlockType((1, 8), BOOL),
+    )
+    mask = SSAValue(
+        id=4,
+        ty=BlockType((8, 8), BOOL),
+    )
+
+    register_layout = codegen.layout.register_tile_layout()
+    codegen.values[rows.id] = CudaRegisterTileRef(
+        base="rows",
+        layout=register_layout,
+        broadcast_axes=(1,),
+    )
+    codegen.values[columns.id] = CudaRegisterTileRef(
+        base="columns",
+        layout=register_layout,
+        broadcast_axes=(0,),
+    )
+
+    codegen.emit(
+        SSAOp(
+            opcode="cmp_lt",
+            operands=(rows, Param("M", I32)),
+            result=row_mask,
+        )
+    )
+    codegen.emit(
+        SSAOp(
+            opcode="cmp_lt",
+            operands=(columns, Param("N", I32)),
+            result=column_mask,
+        )
+    )
+    codegen.emit(
+        SSAOp(
+            opcode="and",
+            operands=(row_mask, column_mask),
+            result=mask,
+        )
+    )
+
+    assert codegen.lines == [
+        "    bool v2_0_0 = (rows_0_0 < M);",
+        "    bool v2_1_0 = (rows_1_0 < M);",
+        "    bool v3_0_0 = (columns_0_0 < N);",
+        "    bool v3_0_1 = (columns_0_1 < N);",
+        "    bool v4_0_0 = (v2_0_0 && v3_0_0);",
+        "    bool v4_0_1 = (v2_0_0 && v3_0_1);",
+        "    bool v4_1_0 = (v2_1_0 && v3_0_0);",
+        "    bool v4_1_1 = (v2_1_0 && v3_0_1);",
+    ]
+
+
+def test_cuda_addptr_preserves_and_expands_register_broadcasts() -> None:
+    codegen = SSACUDACodegen()
+    codegen.layout = CudaKernelLayout(
+        output_tile_shape=(8, 8),
+        thread_shape=(4, 4),
+    )
+
+    row_offsets = SSAValue(
+        id=0,
+        ty=BlockType((8, 1), I32),
+    )
+    column_offsets = SSAValue(
+        id=1,
+        ty=BlockType((1, 8), I32),
+    )
+    row_pointers = SSAValue(
+        id=2,
+        ty=BlockType((8, 1), PTR_F32),
+    )
+    output_pointers = SSAValue(
+        id=3,
+        ty=BlockType((8, 8), PTR_F32),
+    )
+
+    register_layout = codegen.layout.register_tile_layout()
+    codegen.values[row_offsets.id] = CudaRegisterTileRef(
+        base="rows",
+        layout=register_layout,
+        broadcast_axes=(1,),
+    )
+    codegen.values[column_offsets.id] = CudaRegisterTileRef(
+        base="columns",
+        layout=register_layout,
+        broadcast_axes=(0,),
+    )
+
+    codegen.emit(
+        SSAOp(
+            opcode="addptr",
+            operands=(Param("out", PTR_F32), row_offsets),
+            result=row_pointers,
+        )
+    )
+    codegen.emit(
+        SSAOp(
+            opcode="addptr",
+            operands=(row_pointers, column_offsets),
+            result=output_pointers,
+        )
+    )
+
+    assert codegen.lines == [
+        "    float* v2_0_0 = out + rows_0_0;",
+        "    float* v2_1_0 = out + rows_1_0;",
+        "    float* v3_0_0 = v2_0_0 + columns_0_0;",
+        "    float* v3_0_1 = v2_0_0 + columns_0_1;",
+        "    float* v3_1_0 = v2_1_0 + columns_0_0;",
+        "    float* v3_1_1 = v2_1_0 + columns_0_1;",
+    ]
+
+    row_pointer_value = codegen.values[row_pointers.id]
+    output_pointer_value = codegen.values[output_pointers.id]
+
+    assert isinstance(row_pointer_value, CudaRegisterTileRef)
+    assert isinstance(output_pointer_value, CudaRegisterTileRef)
+
+    assert row_pointer_value.broadcast_axes == (1,)
+    assert row_pointer_value.element((1, 1)) == "v2_1_0"
+
+    assert output_pointer_value.broadcast_axes == ()
+    assert output_pointer_value.element((1, 1)) == "v3_1_1"
+
+
+def test_ast_frontend_lowers_multi_result_dot_to_cuda(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MYTRITON_FRONTEND", "ast")
+    monkeypatch.setenv("MYTRITON_BACKEND", "cuda")
+
+    M = N = K = 8
+    BM = BK = BN = 8
+
+    a = np.zeros((M, K), dtype=np.float32)
+    b = np.zeros((K, N), dtype=np.float32)
+    out = np.zeros((M, N), dtype=np.float32)
+
+    single_tile_dot_kernel.clear_cache()
+
+    _, ssa_ops, cuda_src = single_tile_dot_kernel[(1, 1)](
+        a,
+        b,
+        out,
+        M,
+        N,
+        K,
+        0,
+        BM=BM,
+        BK=BK,
+        BN=BN,
+    )
+
+    layout = cuda_kernel_layout(ssa_ops)
+
+    assert layout.output_tile_shape == (8, 8)
+    assert layout.thread_shape == (4, 8)
+    assert layout.threads_per_block == 32
+    assert layout.register_tile_layout().register_shape == (2, 1)
+
+    dot = next(op for op in ssa_ops if isinstance(op, SSAOp) and op.opcode == "dot")
+    store = next(op for op in ssa_ops if isinstance(op, SSAOp) and op.opcode == "store")
+
+    assert dot.result is not None
+    dot_id = dot.result.id
+
+    pointer = store.operands[0]
+    value = store.operands[1]
+    mask = store.operands[2]
+
+    assert isinstance(pointer, SSAValue)
+    assert isinstance(value, SSAValue)
+    assert isinstance(mask, SSAValue)
+    assert value == dot.result
+
+    assert "    int tile_i = threadIdx.x / 8;" in cuda_src
+    assert "    int tile_j = threadIdx.x % 8;" in cuda_src
+
+    assert f"    float v{dot_id}_0_0 = 0.0f;" in cuda_src
+    assert f"    float v{dot_id}_1_0 = 0.0f;" in cuda_src
+
+    assert (
+        f"        v{dot_id}_0_0 += "
+        f"dot_lhs_{dot_id}[(tile_i) * 8 + (dot_k_{dot_id})] * "
+        f"dot_rhs_{dot_id}[(dot_k_{dot_id}) * 8 + (tile_j)];"
+    ) in cuda_src
+
+    assert (
+        f"        v{dot_id}_1_0 += "
+        f"dot_lhs_{dot_id}[(tile_i + 4) * 8 + (dot_k_{dot_id})] * "
+        f"dot_rhs_{dot_id}[(dot_k_{dot_id}) * 8 + (tile_j)];"
+    ) in cuda_src
+
+    assert (
+        f"    if (v{mask.id}_0_0) {{\n"
+        f"        v{pointer.id}_0_0[0] = v{dot_id}_0_0;\n"
+        "    }"
+    ) in cuda_src
+
+    assert (
+        f"    if (v{mask.id}_1_0) {{\n"
+        f"        v{pointer.id}_1_0[0] = v{dot_id}_1_0;\n"
+        "    }"
+    ) in cuda_src
+
+
+@pytest.mark.execution
+def test_shared_memory_dot_executes_multiple_results_per_thread(
+    cp,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MYTRITON_FRONTEND", "ast")
+    monkeypatch.setenv("MYTRITON_BACKEND", "cuda")
+
+    M, N, K = 13, 11, 7
+    BM, BK, BN = 8, 8, 8
+
+    a_host = np.arange(M * K, dtype=np.float32).reshape(M, K) % 9 - 4
+    b_host = np.arange(K * N, dtype=np.float32).reshape(K, N) % 7 - 3
+
+    a = cp.asarray(a_host)
+    b = cp.asarray(b_host)
+    out = cp.zeros((M, N), dtype=cp.float32)
+
+    grid = (
+        (M + BM - 1) // BM,
+        (N + BN - 1) // BN,
+    )
+
+    single_tile_dot_kernel.clear_cache()
+    single_tile_dot_kernel[grid](
+        a,
+        b,
+        out,
+        M,
+        N,
+        K,
+        0,
+        BM=BM,
+        BK=BK,
+        BN=BN,
+    )
+    cp.cuda.Stream.null.synchronize()
+
+    expected = a_host @ b_host
+    cp.testing.assert_allclose(
+        out,
+        cp.asarray(expected),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
+def test_runtime_k_loop_carries_multiple_results_per_thread(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MYTRITON_FRONTEND", "ast")
+    monkeypatch.setenv("MYTRITON_BACKEND", "cuda")
+
+    M, N, K = 8, 8, 16
+    BM, BK, BN = 8, 8, 8
+
+    a = np.zeros((M, K), dtype=np.float32)
+    b = np.zeros((K, N), dtype=np.float32)
+    out = np.zeros((M, N), dtype=np.float32)
+
+    tiled_matmul_kernel.clear_cache()
+
+    _, ssa_ops, cuda_src = tiled_matmul_kernel[(1, 1)](
+        a,
+        b,
+        out,
+        M,
+        N,
+        K,
+        BM=BM,
+        BK=BK,
+        BN=BN,
+    )
+
+    layout = cuda_kernel_layout(ssa_ops)
+
+    assert layout.output_tile_shape == (8, 8)
+    assert layout.thread_shape == (4, 8)
+    assert layout.register_tile_layout().register_shape == (2, 1)
+
+    loop = next(op for op in ssa_ops if isinstance(op, SSAForRange))
+    dot = next(op for op in loop.body if isinstance(op, SSAOp) and op.opcode == "dot")
+    accumulation = next(
+        op
+        for op in loop.body
+        if (isinstance(op, SSAOp) and op.opcode == "add" and dot.result in op.operands)
+    )
+
+    assert dot.result is not None
+    assert accumulation.result is not None
+    assert len(loop.carried_inputs) == 1
+    assert len(loop.results) == 1
+
+    initial = loop.carried_inputs[0]
+    assert isinstance(initial, SSAValue)
+
+    dot_id = dot.result.id
+    accumulation_id = accumulation.result.id
+    accumulator_id = loop.results[0].id
+    index_id = loop.index.id
+
+    assert (f"    float v{accumulator_id}_0_0 = v{initial.id};") in cuda_src
+    assert (f"    float v{accumulator_id}_1_0 = v{initial.id};") in cuda_src
+
+    outer_loop = (
+        f"    for (int v{index_id} = 0; v{index_id} < K; v{index_id} += {BK}) {{"
+    )
+    assert outer_loop in cuda_src
+
+    assert f"        float v{dot_id}_0_0 = 0.0f;" in cuda_src
+    assert f"        float v{dot_id}_1_0 = 0.0f;" in cuda_src
+
+    assert (
+        f"        v{dot_id}_1_0 += "
+        f"dot_lhs_{dot_id}[(tile_i + 4) * {BK} + "
+        f"(dot_k_{dot_id})] * "
+        f"dot_rhs_{dot_id}[(dot_k_{dot_id}) * {BN} + "
+        "(tile_j)];"
+    ) in cuda_src
+
+    expected_update = (
+        f"        float v{accumulation_id}_0_0 = "
+        f"(v{accumulator_id}_0_0 + v{dot_id}_0_0);\n"
+        f"        float v{accumulation_id}_1_0 = "
+        f"(v{accumulator_id}_1_0 + v{dot_id}_1_0);\n"
+        f"        v{accumulator_id}_0_0 = "
+        f"v{accumulation_id}_0_0;\n"
+        f"        v{accumulator_id}_1_0 = "
+        f"v{accumulation_id}_1_0;"
+    )
+    assert expected_update in cuda_src
+
+    assert cuda_src.count("__syncthreads();") == 2
+
+
+@pytest.mark.execution
+def test_tiled_matmul_executes_multiple_results_per_thread(
+    cp,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MYTRITON_FRONTEND", "ast")
+    monkeypatch.setenv("MYTRITON_BACKEND", "cuda")
+
+    M, N, K = 13, 11, 19
+    BM, BK, BN = 8, 8, 8
+
+    a_host = np.arange(M * K, dtype=np.float32).reshape(M, K) % 9 - 4
+    b_host = np.arange(K * N, dtype=np.float32).reshape(K, N) % 7 - 3
+
+    a = cp.asarray(a_host)
+    b = cp.asarray(b_host)
+    out = cp.zeros((M, N), dtype=cp.float32)
+
+    grid = (
+        (M + BM - 1) // BM,
+        (N + BN - 1) // BN,
+    )
+
+    tiled_matmul_kernel.clear_cache()
+    tiled_matmul_kernel[grid](
+        a,
+        b,
+        out,
+        M,
+        N,
+        K,
+        BM=BM,
+        BK=BK,
+        BN=BN,
+    )
+    cp.cuda.Stream.null.synchronize()
+
+    expected = a_host @ b_host
+    cp.testing.assert_allclose(
+        out,
+        cp.asarray(expected),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
+@pytest.mark.parametrize(
+    "broadcast_axes",
+    [
+        (1, 0),
+        (0, 0),
+        (-1,),
+        (2,),
+    ],
+)
+def test_cuda_register_tile_ref_rejects_invalid_broadcast_axes(
+    broadcast_axes: tuple[int, ...],
+) -> None:
+    layout = CudaKernelLayout(
+        output_tile_shape=(8, 8),
+        thread_shape=(4, 4),
+    ).register_tile_layout()
+
+    with pytest.raises(ValueError, match="broadcast axes"):
+        CudaRegisterTileRef(
+            base="value",
+            layout=layout,
+            broadcast_axes=broadcast_axes,
+        )
+
+
+@pytest.mark.execution
+def test_tiled_matmul_executes_two_dimensional_register_tile(
+    cp,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MYTRITON_FRONTEND", "ast")
+    monkeypatch.setenv("MYTRITON_BACKEND", "cuda")
+
+    M, N, K = 17, 19, 15
+    BM, BK, BN = 16, 8, 16
+
+    a_host = np.arange(M * K, dtype=np.float32).reshape(M, K) % 9 - 4
+    b_host = np.arange(K * N, dtype=np.float32).reshape(K, N) % 7 - 3
+
+    a = cp.asarray(a_host)
+    b = cp.asarray(b_host)
+    out = cp.zeros((M, N), dtype=cp.float32)
+
+    grid = (
+        (M + BM - 1) // BM,
+        (N + BN - 1) // BN,
+    )
+
+    tiled_matmul_kernel.clear_cache()
+    _, ssa_ops, _ = tiled_matmul_kernel[grid](
+        a,
+        b,
+        out,
+        M,
+        N,
+        K,
+        BM=BM,
+        BK=BK,
+        BN=BN,
+    )
+    cp.cuda.Stream.null.synchronize()
+
+    layout = cuda_kernel_layout(ssa_ops)
+
+    assert layout.output_tile_shape == (16, 16)
+    assert layout.thread_shape == (4, 8)
+    assert layout.register_tile_layout().register_shape == (4, 2)
+
+    expected = a_host @ b_host
+    cp.testing.assert_allclose(
+        out,
+        cp.asarray(expected),
+        rtol=1e-5,
+        atol=1e-5,
+    )

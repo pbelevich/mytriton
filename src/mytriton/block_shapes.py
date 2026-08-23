@@ -130,6 +130,86 @@ class CudaCooperativeTileLayout:
 
 
 @dataclass(frozen=True)
+class CudaRegisterTileLayout:
+    """Distribution of a logical rank-2 tile across threads and registers."""
+
+    logical_shape: tuple[int, ...]
+    thread_shape: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        for name, shape in (
+            ("logical tile", self.logical_shape),
+            ("CUDA thread", self.thread_shape),
+        ):
+            if len(shape) != 2:
+                raise ValueError(f"{name} shape must have rank 2, got {shape}")
+
+            if any(type(dim) is not int or dim <= 0 for dim in shape):
+                raise ValueError(
+                    f"{name} dimensions must be positive integers, got {shape}"
+                )
+
+        for logical_dim, thread_dim in zip(
+            self.logical_shape,
+            self.thread_shape,
+            strict=True,
+        ):
+            if logical_dim % thread_dim != 0:
+                raise ValueError(
+                    "register tile requires logical dimensions divisible "
+                    "by CUDA thread dimensions, "
+                    f"got {self.logical_shape} and {self.thread_shape}"
+                )
+
+    @property
+    def register_shape(self) -> tuple[int, ...]:
+        return tuple(
+            logical_dim // thread_dim
+            for logical_dim, thread_dim in zip(
+                self.logical_shape,
+                self.thread_shape,
+                strict=True,
+            )
+        )
+
+    @property
+    def registers_per_thread(self) -> int:
+        return prod(self.register_shape)
+
+    def logical_coordinate(
+        self,
+        *,
+        thread_coordinate: tuple[int, ...],
+        register_coordinate: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        for name, coordinate, shape in (
+            ("thread", thread_coordinate, self.thread_shape),
+            ("register", register_coordinate, self.register_shape),
+        ):
+            if len(coordinate) != 2 or any(
+                type(index) is not int or index < 0 or index >= dim
+                for index, dim in zip(
+                    coordinate,
+                    shape,
+                    strict=True,
+                )
+            ):
+                raise ValueError(
+                    f"invalid {name} coordinate {coordinate} for shape {shape}"
+                )
+
+        return tuple(
+            thread_index + register_index * thread_dim
+            for thread_index, register_index, thread_dim in zip(
+                thread_coordinate,
+                register_coordinate,
+                self.thread_shape,
+                strict=True,
+            )
+        )
+
+
+@dataclass(frozen=True)
 class CudaKernelLayout:
     """Logical output tile and physical CUDA thread organization."""
 
@@ -176,6 +256,12 @@ class CudaKernelLayout:
     @property
     def threads_per_block(self) -> int:
         return prod(self.thread_shape)
+
+    def register_tile_layout(self) -> CudaRegisterTileLayout:
+        return CudaRegisterTileLayout(
+            logical_shape=self.output_tile_shape,
+            thread_shape=self.thread_shape,
+        )
 
     def tile_layout(
         self,
@@ -307,6 +393,30 @@ def reduction_block_shapes(ssa_ops: list[SSAItem]) -> list[tuple[int, ...]]:
     return shapes
 
 
+def dot_result_shapes(
+    ssa_ops: list[SSAItem],
+) -> list[tuple[int, ...]]:
+    """Collect logical output shapes produced by tl.dot."""
+
+    from .ssa import SSAForRange, SSAValue
+
+    shapes = []
+
+    for op in ssa_ops:
+        if isinstance(op, SSAForRange):
+            shapes.extend(dot_result_shapes(op.body))
+            continue
+
+        if (
+            op.opcode == "dot"
+            and isinstance(op.result, SSAValue)
+            and isinstance(op.result.ty, BlockType)
+        ):
+            shapes.append(op.result.ty.shape)
+
+    return shapes
+
+
 def _infer_cuda_kernel_tile_shape(ssa_ops: list[SSAItem]) -> tuple[int, ...]:
     shapes = store_block_shapes(ssa_ops)
 
@@ -345,38 +455,81 @@ def _infer_cuda_kernel_tile_shape(ssa_ops: list[SSAItem]) -> tuple[int, ...]:
     return (next(iter(widths)),)
 
 
+CUDA_DOT_MAX_THREADS = 32
+
+
+def _divisors(dim: int) -> tuple[int, ...]:
+    return tuple(candidate for candidate in range(1, dim + 1) if dim % candidate == 0)
+
+
+def _infer_cuda_dot_thread_shape(
+    output_tile_shape: tuple[int, ...],
+) -> tuple[int, ...]:
+    if len(output_tile_shape) != 2:
+        raise ValueError(f"CUDA dot output must have rank 2, got {output_tile_shape}")
+
+    rows, columns = output_tile_shape
+    candidates = [
+        (thread_rows, thread_columns)
+        for thread_rows in _divisors(rows)
+        for thread_columns in _divisors(columns)
+        if (thread_rows * thread_columns <= CUDA_DOT_MAX_THREADS)
+    ]
+
+    if not candidates:
+        raise ValueError(
+            f"cannot fit CUDA dot tile {output_tile_shape} "
+            f"into {CUDA_DOT_MAX_THREADS} threads"
+        )
+
+    return max(
+        candidates,
+        key=lambda shape: (
+            prod(shape),
+            min(shape),
+            shape[1],
+        ),
+    )
+
+
 def _infer_cuda_thread_shape(
     output_tile_shape: tuple[int, ...],
     reduction_shapes: list[tuple[int, ...]],
+    dot_shapes: list[tuple[int, ...]],
 ) -> tuple[int, ...]:
-    if not reduction_shapes:
-        return output_tile_shape
+    if reduction_shapes:
+        if any(len(shape) != 1 for shape in reduction_shapes):
+            rendered = ", ".join(str(shape) for shape in reduction_shapes)
+            raise ValueError(f"CUDA reductions require rank-1 inputs, got {rendered}")
 
-    if any(len(shape) != 1 for shape in reduction_shapes):
-        rendered = ", ".join(str(shape) for shape in reduction_shapes)
-        raise ValueError(f"CUDA reductions require rank-1 inputs, got {rendered}")
+        reduction_widths = {shape[0] for shape in reduction_shapes}
+        if len(reduction_widths) != 1:
+            rendered = ", ".join(str(width) for width in sorted(reduction_widths))
+            raise ValueError(
+                f"CUDA reductions require one thread width, got: {rendered}"
+            )
 
-    reduction_widths = {shape[0] for shape in reduction_shapes}
-    if len(reduction_widths) != 1:
-        rendered = ", ".join(str(width) for width in sorted(reduction_widths))
-        raise ValueError(f"CUDA reductions require one thread width, got: {rendered}")
+        reduction_width = next(iter(reduction_widths))
 
-    reduction_width = next(iter(reduction_widths))
+        if len(output_tile_shape) == 1:
+            output_width = output_tile_shape[0]
+            if output_width not in (1, reduction_width):
+                raise ValueError(
+                    f"reduction width {reduction_width} does not match "
+                    f"output tile width {output_width}"
+                )
+            return (reduction_width,)
 
-    if len(output_tile_shape) == 1:
-        output_width = output_tile_shape[0]
-        if output_width not in (1, reduction_width):
+        if prod(output_tile_shape) != reduction_width:
             raise ValueError(
                 f"reduction width {reduction_width} does not match "
-                f"output tile width {output_width}"
+                f"output tile size {prod(output_tile_shape)}"
             )
-        return (reduction_width,)
 
-    if prod(output_tile_shape) != reduction_width:
-        raise ValueError(
-            f"reduction width {reduction_width} does not match "
-            f"output tile size {prod(output_tile_shape)}"
-        )
+        return output_tile_shape
+
+    if len(output_tile_shape) == 2 and output_tile_shape in dot_shapes:
+        return _infer_cuda_dot_thread_shape(output_tile_shape)
 
     return output_tile_shape
 
@@ -386,6 +539,7 @@ def cuda_kernel_layout(ssa_ops: list[SSAItem]) -> CudaKernelLayout:
     thread_shape = _infer_cuda_thread_shape(
         output_tile_shape,
         reduction_block_shapes(ssa_ops),
+        dot_result_shapes(ssa_ops),
     )
 
     return CudaKernelLayout(
