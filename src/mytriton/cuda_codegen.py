@@ -282,6 +282,77 @@ class SSACUDACodegen:
             rhs=rhs,
         )
 
+    def emit_dot_from_shared_memory(
+        self,
+        result: SSAValue,
+        buffers: CudaDotSharedBuffers,
+    ) -> None:
+        if not isinstance(result.ty, BlockType) or result.ty.rank != 2:
+            raise TypeError(f"CUDA-core dot requires a rank-2 result, got {result.ty}")
+
+        if buffers.lhs.columns != buffers.rhs.rows:
+            raise TypeError(
+                "CUDA-core dot requires matching reduction dimensions, "
+                f"got {buffers.lhs.logical_shape} and "
+                f"{buffers.rhs.logical_shape}"
+            )
+
+        expected_shape = (
+            buffers.lhs.rows,
+            buffers.rhs.columns,
+        )
+        if result.ty.shape != expected_shape:
+            raise TypeError(
+                f"CUDA-core dot expected result shape {expected_shape}, "
+                f"got {result.ty.shape}"
+            )
+
+        if result.ty.shape != self.layout.thread_shape:
+            raise TypeError(
+                "CUDA-core dot currently requires one CUDA thread per "
+                f"result element, got result {result.ty.shape} and "
+                f"thread layout {self.layout.thread_shape}"
+            )
+
+        if (
+            result.ty.element != F32
+            or buffers.lhs.element_ty != F32
+            or buffers.rhs.element_ty != F32
+        ):
+            raise TypeError("CUDA-core dot currently supports only f32")
+
+        result_name = f"v{result.id}"
+        reduction_index = f"dot_k_{result.id}"
+        row = self.thread_coordinate(0)
+        column = self.thread_coordinate(1)
+
+        lhs_element = buffers.lhs.element(
+            row,
+            reduction_index,
+        )
+        rhs_element = buffers.rhs.element(
+            reduction_index,
+            column,
+        )
+
+        self.lines.extend(
+            [
+                f"    float {result_name} = 0.0f;",
+                (
+                    f"    for (int {reduction_index} = 0; "
+                    f"{reduction_index} < {buffers.reduction_size}; "
+                    f"++{reduction_index}) {{"
+                ),
+                (f"        {result_name} += {lhs_element} * {rhs_element};"),
+                "    }",
+            ]
+        )
+        self.values[result.id] = result_name
+
+        # All threads must finish reading the current tiles before another
+        # runtime K-loop iteration overwrites the shared buffers.
+        self.emit_block_barrier()
+
     def resolve_global_tile(
         self,
         plan: CudaGlobalTilePlan,
@@ -587,11 +658,13 @@ class SSACUDACodegen:
                 raise TypeError("CUDA lowering for tl.dot is not implemented")
 
             plan = self.staging_analysis.plan_for(result.id)
-            self.emit_dot_operand_staging_from_ssa(op, plan)
-
-            raise TypeError(
-                "CUDA shared-memory staging for tl.dot is implemented, "
-                "but CUDA computation for tl.dot is not implemented"
+            buffers = self.emit_dot_operand_staging_from_ssa(
+                op,
+                plan,
+            )
+            self.emit_dot_from_shared_memory(
+                result,
+                buffers,
             )
         elif op.opcode in self.BINARY_OPS:
             lhs = self.expression_operand(op.operands[0])

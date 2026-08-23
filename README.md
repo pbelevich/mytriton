@@ -59,6 +59,11 @@ MLIR's GPU/NVVM stack to a cubin.
   cooperative staging of `tl.dot` operands, zero-filled boundary handling,
   block synchronization, and an explicit diagnostic for the deferred
   CUDA-core dot computation.
+- [ver15](https://github.com/pbelevich/mytriton/tree/ver15): working
+  CUDA-core lowering for canonical `tl.dot` matrix tiles, one register
+  accumulator per output thread, an FMA loop over shared-memory operands,
+  synchronization before tile reuse, runtime traversal of multiple K-tiles,
+  and CUDA correctness tests for masked edge tiles.
 
 ## AST frontend
 
@@ -243,12 +248,11 @@ type. `dot` is a pure SSA operation, so duplicate operations are eligible for
 common subexpression elimination and unused operations can be removed by
 dead-code elimination.
 
-Version 13 defines the language and IR semantics only. CUDA lowering for
-`tl.dot` is intentionally not implemented yet. The next versions will introduce
-cooperative shared-memory tiles and then lower `dot` to an ordinary CUDA-core
-multiply-accumulate loop.
+Version 13 defines the language and IR semantics only. Version 14 adds
+cooperative shared-memory staging for canonical matrix loads, and Version 15
+lowers the staged operands to an ordinary CUDA-core multiply-accumulate loop.
 
-## Shared-memory dot staging
+## Shared-memory CUDA-core dot
 
 The CUDA backend recognizes canonical matrix tiles loaded for `tl.dot`:
 
@@ -288,11 +292,39 @@ threadIdx.x + 2 * threads_per_block
 until the complete A `[BM, BK]` or B `[BK, BN]` tile has been covered. Logical
 row and column coordinates determine the global matrix address. Out-of-bounds
 positions receive `0.0`, so edge tiles are safe without divergent barriers.
-After both cooperative loads, the backend emits one `__syncthreads()`.
+After both cooperative loads, the backend emits `__syncthreads()` so no thread
+starts reading a tile before all writes have completed.
 
-Version 14 intentionally stops after staging and reports that CUDA computation
-for `tl.dot` is not implemented. Version 15 will read the shared buffers,
-perform the ordinary CUDA-core FMA loop over `BK`, and store the result tile.
+Each CUDA thread owns one output coordinate `(tile_i, tile_j)` and one `f32`
+register accumulator. It performs the ordinary CUDA-core reduction:
+
+```text
+accumulator = 0.0
+
+for k in range(BK):
+    accumulator += shared_a[tile_i, k] * shared_b[k, tile_j]
+```
+
+A second `__syncthreads()` ensures every thread has finished reading the current
+shared buffers before a runtime K-loop iteration overwrites them with the next
+tiles. Partial K-tiles are zero-filled by the existing load masks.
+
+A complete tiled matmul can therefore accumulate several `tl.dot` results:
+
+```python
+acc = tl.zeros((BM, BN), tl.float32)
+
+for k_base in range(0, K, BK):
+    # Build and load A [BM, BK] and B [BK, BN] tiles.
+    acc = acc + tl.dot(a_values, b_values)
+
+tl.store(output_pointers, acc, mask=output_mask)
+```
+
+Version 14 intentionally stops after shared-memory staging. Version 15 adds the
+CUDA-core FMA loop, safe shared-buffer reuse, and execution across multiple
+K-tiles. It still uses one CUDA thread per output element; register tiles with
+multiple results per thread are deferred to Version 16.
 
 ## Example
 
@@ -525,23 +557,21 @@ these rewrite passes because they are not region-aware yet.
   reductions. Floating-point elementwise extrema propagate NaNs and choose the
   right-hand operand when values compare equal. For canonical matrix-load
   operands, `tl.dot` lowering emits shared-memory declarations, cooperative
-  masked loads with zero-filled boundaries, and a block barrier. It then
-  intentionally rejects the missing CUDA-core dot computation instead of
-  returning an incorrect kernel.
+  masked loads with zero-filled boundaries, a CUDA-core FMA loop, and the
+  barriers required before reading and reusing the shared tiles. Runtime
+  `range` loops can accumulate multiple K-tiles into one result.
 - Reductions are currently single-block reductions over the SSA vector width.
   The vector width must be a power of two and must match the CUDA thread block
   size. Larger rows can be handled by statically unrolling multiple loads into
   one block-local partial vector, as in the long-row sum test, but there is no
   multi-block reduction yet.
-- Matrix multiplication support is intentionally naive so far. The current
-  rank-2 matmul kernel computes one output tile with one CUDA thread per output
-  element and repeatedly reads from global memory. It can traverse the
-  reduction dimension with either an unrolled `tl.static_range` or a runtime
-  CUDA loop. Cooperative tile layouts can describe A `[BM, BK]` and B
-  `[BK, BN]` independently of C `[BM, BN]`. The `tl.dot` operation now has
-  expression-tree, typed SSA, verification, and optimization semantics, but it
-  can only stage canonical load operands cooperatively in CUDA shared memory;
-  the multiply-accumulate computation remains deferred to Version 15.
+- Matrix multiplication supports a correct tiled CUDA-core implementation for
+  canonical `tl.dot` operands. A `[BM, BK]` and B `[BK, BN]` are loaded
+  cooperatively into shared memory, each thread computes one C element, and a
+  runtime CUDA loop can traverse the complete K dimension. The implementation
+  prioritizes correctness over performance: it has no per-thread register
+  tiles, vectorized loads, shared-memory padding or swizzling, double buffering,
+  asynchronous copies, tensor-core instructions, or autotuning yet.
   `tl.empty`, `tl.full`, and `tl.zeros` continue to represent logical
   per-thread values rather than shared-memory allocations.
 - MLIR lowering currently supports only `ptr<f32>` parameters as
