@@ -118,7 +118,7 @@ class CompiledKernel(Generic[P]):
             chip = None
             if backend == "mlir":
                 try:
-                    chip = cuda_chip()
+                    chip = cuda_chip(runtime_args)
                 except CudaUnavailableError:
                     chip = "sm_80"
 

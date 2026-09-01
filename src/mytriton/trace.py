@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Annotated, Any, TypeAlias, get_args, get_origi
 
 import numpy as np
 
+from .runtime_args import array_arg_info
+
 # ----------------------------
 # Language API
 # ----------------------------
@@ -527,11 +529,15 @@ class Builder:
 
 
 def _make_param(name, value) -> Param:
-    if hasattr(value, "dtype") and hasattr(value, "flags"):
-        if str(value.dtype) != "float32":
+    array_info = array_arg_info(value)
+
+    if array_info is not None:
+        if array_info.dtype_name != "float32":
             raise TypeError(f"{name}: only float32 arrays are supported")
-        if not value.flags.c_contiguous:
+
+        if not array_info.c_contiguous:
             raise TypeError(f"{name}: only C-contiguous arrays are supported")
+
         return Param(name, PTR_F32)
 
     if isinstance(value, (int, np.integer)):
