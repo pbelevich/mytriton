@@ -69,6 +69,10 @@ MLIR's GPU/NVVM stack to a cubin.
   mapping, broadcast-aware register arithmetic and pointer construction,
   register-valued loop-carried accumulators, masked multi-result stores, and
   CUDA execution tests in which each thread computes several C elements.
+- [ver17](https://github.com/pbelevich/mytriton/tree/ver17): optional PyTorch
+  tensor arguments, framework-independent runtime array metadata, zero-copy
+  DLPack conversion for CUDA tensors, same-device validation, execution on the
+  current PyTorch CUDA stream, and Torch-backed CUDA and MLIR execution tests.
 
 ## AST frontend
 
@@ -362,6 +366,61 @@ K-tiles. Version 16 separates the physical thread tile from the logical dot
 output, carries register-tile accumulators through runtime K-loops, and emits a
 masked store for every result owned by a thread.
 
+## PyTorch tensor interoperability
+
+Runtime pointer arguments may be NumPy arrays, CuPy arrays, or PyTorch tensors.
+All three become the same `ptr<f32>` parameter in typed SSA, so the frontend,
+optimizer, and backend source are independent of the Python array framework.
+
+CPU NumPy arrays and CPU PyTorch tensors are compilation-only inputs. A CUDA
+PyTorch tensor compiles and executes the kernel directly:
+
+```python
+import torch
+
+n = 1_000
+block = 256
+x = torch.ones(n, device="cuda", dtype=torch.float32)
+y = torch.ones(n, device="cuda", dtype=torch.float32)
+out = torch.empty_like(x)
+
+add_kernel[
+    lambda meta: (triton.cdiv(n, meta["BLOCK"]),)
+](
+    x,
+    y,
+    out,
+    n,
+    BLOCK=block,
+)
+```
+
+CuPy remains the internal CUDA compiler and launcher. At the runtime boundary,
+a Torch CUDA tensor is detached from autograd metadata and exported through
+DLPack:
+
+```text
+torch.Tensor -- detach -- DLPack -- zero-copy CuPy view
+                                           |
+                                           v
+                                 RawKernel/cubin launch
+```
+
+`detach()` does not copy storage. It only makes the raw tensor memory
+exportable through DLPack, matching a low-level Triton launch: tensors with
+`requires_grad=True` are accepted as pointers, but the launch does not create
+an autograd graph or provide a backward operation.
+
+Torch launches run in `torch.cuda.current_stream()` by wrapping it with
+`cupy.cuda.Stream.from_external()`. DLPack conversion and kernel execution
+happen inside the same stream context, so work queued before and after the
+kernel remains correctly ordered without a global device synchronization.
+
+One launch must use either CuPy CUDA arrays or Torch CUDA tensors, not a mixture
+of the two frameworks. All array arguments must be on the same CUDA device.
+Mixing CPU and CUDA arrays is also rejected. As elsewhere in the current MVP,
+runtime arrays must be C-contiguous and have `float32` elements.
+
 ## Example
 
 ```python
@@ -405,10 +464,10 @@ print(src)
 The first result contains the expression-tree operations built by the AST
 frontend. The second contains optimized typed SSA operations, and the third
 contains generated source for the selected backend. The default backend is
-CUDA, so `src` is CUDA C++. With NumPy arguments, compilation stops there. If
-the arguments are CuPy arrays and a CUDA GPU is available, the generated kernel
-is also compiled and launched. Shared expressions such as `offsets` and `mask`
-are lowered once and referenced by their SSA values wherever they are reused.
+CUDA, so `src` is CUDA C++. With NumPy or CPU Torch arguments, compilation stops
+there. With CuPy arrays or CUDA Torch tensors, the generated kernel is also
+compiled and launched. Shared expressions such as `offsets` and `mask` are
+lowered once and referenced by their SSA values wherever they are reused.
 
 For example, part of the resulting SSA looks like this:
 
@@ -505,13 +564,14 @@ module attributes {gpu.container_module} {
 }
 ```
 
-For NumPy arguments, the MLIR backend stops after source generation, so MLIR
-Python bindings are not required just to inspect the emitted MLIR. For CuPy
-arguments, the backend runs a small pass pipeline that attaches an NVVM target,
-converts GPU operations to NVVM, emits a GPU binary, extracts the cubin, loads
-it through CuPy, and launches it with the same grid and thread-block size used
-by the CUDA backend. CuPy arrays are passed using the ranked-memref ABI:
-allocated pointer, aligned pointer, offset, size, and stride.
+For NumPy or CPU Torch arguments, the MLIR backend stops after source
+generation, so MLIR Python bindings are not required just to inspect the
+emitted MLIR. For CuPy arrays or CUDA Torch tensors, the backend runs a small
+pass pipeline that attaches an NVVM target, converts GPU operations to NVVM,
+emits a GPU binary, extracts the cubin, loads it through CuPy, and launches it
+with the same grid and thread-block size used by the CUDA backend. CUDA arrays
+are passed using the ranked-memref ABI: allocated pointer, aligned pointer,
+offset, size, and stride.
 
 The test kernels also include a copy, 2D matrix add, ReLU through
 `tl.maximum`, leaky ReLU through `tl.where`, sigmoid through negation,
@@ -553,8 +613,10 @@ these rewrite passes because they are not region-aware yet.
 ## Current limitations
 
 - Generated backend source is returned as a string. Execution requires CuPy
-  built for the installed CUDA version and an available CUDA GPU; NumPy inputs
-  remain compilation-only.
+  built for the installed CUDA version and an available CUDA GPU. CUDA launch
+  arguments may be homogeneous CuPy arrays or PyTorch CUDA tensors; PyTorch is
+  imported only for Torch execution. NumPy arrays and CPU Torch tensors remain
+  compilation-only.
 - `MYTRITON_BACKEND` can be `cuda` or `mlir`. The CUDA backend is the default
   and supports the full current mytriton test language. The MLIR backend is an
   experimental MVP for 1D elementwise kernels. MLIR source generation does not
@@ -568,7 +630,10 @@ these rewrite passes because they are not region-aware yet.
   assigning to the induction variable is rejected. `if`/`while`,
   `break`/`continue`, `for/else`, and other symbolic Python control flow are not
   supported.
-- Runtime array arguments must be C-contiguous `float32` arrays.
+- Runtime array arguments must be C-contiguous `float32` arrays. One execution
+  cannot mix CPU and CUDA arrays, CuPy and Torch CUDA arrays, or arrays from
+  different CUDA devices. Raw launches accept Torch tensors with
+  `requires_grad=True`, but do not participate in PyTorch autograd.
 - The launch grid is evaluated and used for CUDA execution, but it is not
   represented in the IR.
 - The CUDA kernel layout is inferred from block-shaped operands of observable
@@ -624,8 +689,9 @@ these rewrite passes because they are not region-aware yet.
   code. It does not yet support 2D program IDs, reductions, `expand_dims`,
   Boolean `&`, `tl.maximum`, `tl.minimum`, `tl.where`, negation, `tl.exp`,
   `tl.static_range`, runtime `range`, or matrix multiplication.
-- MLIR execution currently supports only 1D C-contiguous CuPy arrays because it
-  builds one-dimensional memref descriptors.
+- MLIR execution currently supports only 1D C-contiguous CUDA arrays because it
+  builds one-dimensional memref descriptors. Torch CUDA tensors are normalized
+  to zero-copy CuPy views before those descriptors are constructed.
 - The SSA IR has structured `for` regions and loop-carried `iter_args`/`yield`
   values, but it has no general basic blocks, conditional control flow, or phi
   nodes outside this loop representation.
@@ -647,6 +713,11 @@ To enable CUDA execution with CUDA 12, install the matching CuPy wheel:
 ```bash
 python -m pip install -e ".[cuda12]"
 ```
+
+PyTorch is an optional runtime integration rather than a project dependency.
+Install a PyTorch build matching the local CUDA environment separately. When
+PyTorch is available, CUDA tensors can be passed directly to kernels; CuPy is
+still required internally for CUDA source compilation and kernel launch.
 
 MLIR cubin execution requires Python bindings importable as `mlir.ir` and
 `mlir.passmanager`, plus an MLIR build that includes the GPU/NVVM passes needed

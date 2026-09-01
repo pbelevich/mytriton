@@ -1,9 +1,13 @@
 import importlib
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any, Protocol, TypeGuard
 
 import numpy as np
 
-CudaKernelCache = dict[tuple[object, str], Any]
+from .runtime_args import array_arg_info
+
+CudaKernelCache = dict[tuple[object, str, int], Any]
 
 
 class _ArrayFlagsLike(Protocol):
@@ -48,6 +52,15 @@ def cuda_module():
     return cp
 
 
+def _torch_module() -> Any:
+    try:
+        return importlib.import_module("torch")
+    except (ImportError, OSError) as error:
+        raise CudaUnavailableError(
+            "PyTorch is required for Torch CUDA tensor execution"
+        ) from error
+
+
 def _is_cupy_array(value: object) -> TypeGuard[_CupyArrayLike]:
     module = type(value).__module__
     return module == "cupy" or module.startswith("cupy.")
@@ -61,25 +74,116 @@ def _convert_runtime_arg(value: object) -> object:
     return value
 
 
+def _normalize_cuda_array_args(
+    cp,
+    runtime_args: tuple[object, ...],
+) -> tuple[object, ...]:
+    normalized = []
+
+    for value in runtime_args:
+        info = array_arg_info(value)
+
+        if info is None:
+            normalized.append(value)
+            continue
+
+        if not info.is_cuda:
+            raise TypeError(f"cannot use {info.framework} CPU array as a CUDA argument")
+
+        if info.framework == "cupy":
+            normalized.append(value)
+            continue
+
+        if info.framework == "torch":
+            detach = getattr(value, "detach", None)
+            if not callable(detach):
+                raise TypeError("Torch CUDA array does not support detach()")
+
+            # A raw kernel launch is not an autograd operation. Detaching makes
+            # the tensor exportable through DLPack while preserving its storage.
+            normalized.append(cp.from_dlpack(detach()))
+            continue
+
+        raise TypeError(f"unsupported CUDA array framework: {info.framework}")
+
+    return tuple(normalized)
+
+
 def cuda_execution_required(
     runtime_args: tuple[object, ...], *, backend_name: str
 ) -> bool:
-    array_args = [
-        value
-        for value in runtime_args
-        if hasattr(value, "dtype") and hasattr(value, "flags")
+    array_infos = [
+        info for value in runtime_args if (info := array_arg_info(value)) is not None
     ]
-    cupy_array_args = [value for value in array_args if _is_cupy_array(value)]
 
-    if not cupy_array_args:
+    if not array_infos:
         return False
 
-    if len(cupy_array_args) != len(array_args):
+    cuda_infos = [info for info in array_infos if info.is_cuda]
+
+    if not cuda_infos:
+        return False
+
+    if len(cuda_infos) != len(array_infos):
         raise TypeError(
-            f"{backend_name} execution does not support mixed NumPy and CuPy arrays"
+            f"{backend_name} execution does not support mixed CPU and CUDA arrays"
+        )
+
+    frameworks = {info.framework for info in cuda_infos}
+    if len(frameworks) != 1:
+        rendered = ", ".join(sorted(frameworks))
+        raise TypeError(
+            f"{backend_name} execution does not support mixed CUDA "
+            f"array frameworks: {rendered}"
+        )
+
+    device_indices = {info.device_index for info in cuda_infos}
+    if len(device_indices) != 1:
+        rendered = ", ".join(
+            "unknown" if index is None else str(index)
+            for index in sorted(
+                device_indices,
+                key=lambda index: -1 if index is None else index,
+            )
+        )
+        raise TypeError(
+            f"{backend_name} execution requires one CUDA device, got: {rendered}"
         )
 
     return True
+
+
+@contextmanager
+def _cuda_launch_context(
+    cp,
+    runtime_args: tuple[object, ...],
+) -> Iterator[None]:
+    cuda_infos = [
+        info
+        for value in runtime_args
+        if ((info := array_arg_info(value)) is not None and info.is_cuda)
+    ]
+
+    if not cuda_infos:
+        raise RuntimeError("CUDA launch requires at least one CUDA array")
+
+    launch_info = cuda_infos[0]
+    device_index = launch_info.device_index
+
+    if device_index is None:
+        raise TypeError("CUDA array device index is unavailable")
+
+    with cp.cuda.Device(device_index):
+        if launch_info.framework == "torch":
+            torch = _torch_module()
+            torch_stream = torch.cuda.current_stream(
+                device=device_index,
+            )
+
+            with cp.cuda.Stream.from_external(torch_stream):
+                yield
+        else:
+            yield
 
 
 def execute_cuda_if_needed(
@@ -91,35 +195,66 @@ def execute_cuda_if_needed(
     threads_per_block: int,
     runtime_args: tuple[object, ...],
 ) -> None:
-    # NumPy calls are compilation-only, including on CUDA machines.
+    # CPU arrays are compilation-only, including on CUDA machines.
     if not cuda_execution_required(runtime_args, backend_name="CUDA"):
         return
 
     cp = cuda_module()
-    max_threads = cp.cuda.Device().attributes["MaxThreadsPerBlock"]
-    if threads_per_block > max_threads:
-        raise ValueError(
-            f"CUDA block size {threads_per_block} exceeds device limit {max_threads}"
-        )
 
-    cache_key = (cuda_src, kernel_name)
-    if cache_key not in kernel_cache:
-        kernel_cache[cache_key] = cp.RawKernel(
+    with _cuda_launch_context(cp, runtime_args):
+        max_threads = cp.cuda.Device().attributes["MaxThreadsPerBlock"]
+        if threads_per_block > max_threads:
+            raise ValueError(
+                f"CUDA block size {threads_per_block} "
+                f"exceeds device limit {max_threads}"
+            )
+
+        cache_key = (
             cuda_src,
             kernel_name,
-            options=("--std=c++14",),
+            cp.cuda.Device().id,
+        )
+        if cache_key not in kernel_cache:
+            kernel_cache[cache_key] = cp.RawKernel(
+                cuda_src,
+                kernel_name,
+                options=("--std=c++14",),
+            )
+
+        normalized_args = _normalize_cuda_array_args(
+            cp,
+            runtime_args,
         )
 
-    kernel_cache[cache_key](
-        launch_grid,
-        (threads_per_block,),
-        tuple(_convert_runtime_arg(value) for value in runtime_args),
-    )
+        kernel_cache[cache_key](
+            launch_grid,
+            (threads_per_block,),
+            tuple(_convert_runtime_arg(value) for value in normalized_args),
+        )
 
 
-def cuda_chip() -> str:
+def cuda_chip(runtime_args: tuple[object, ...] = ()) -> str:
+    cuda_infos = [
+        info
+        for value in runtime_args
+        if ((info := array_arg_info(value)) is not None and info.is_cuda)
+    ]
+
+    device_index = None
+    if cuda_infos:
+        cuda_execution_required(runtime_args, backend_name="MLIR")
+        device_index = cuda_infos[0].device_index
+
+        if device_index is None:
+            raise TypeError("CUDA array device index is unavailable")
+
     cp = cuda_module()
-    return f"sm_{cp.cuda.Device().compute_capability}"
+
+    if device_index is None:
+        return f"sm_{cp.cuda.Device().compute_capability}"
+
+    with cp.cuda.Device(device_index):
+        return f"sm_{cp.cuda.Device().compute_capability}"
 
 
 def _convert_mlir_memref_args(runtime_args: tuple[object, ...]) -> tuple[object, ...]:
@@ -157,25 +292,37 @@ def execute_mlir_cubin_if_needed(
     threads_per_block: int,
     runtime_args: tuple[object, ...],
 ) -> None:
-    # NumPy calls are compile-only, same behavior as CUDA backend.
+    # CPU arrays are compilation-only, same behavior as the CUDA backend.
     if not cuda_execution_required(runtime_args, backend_name="MLIR"):
         return
 
     cp = cuda_module()
-    max_threads = cp.cuda.Device().attributes["MaxThreadsPerBlock"]
-    if threads_per_block > max_threads:
-        raise ValueError(
-            f"CUDA block size {threads_per_block} exceeds device limit {max_threads}"
+
+    with _cuda_launch_context(cp, runtime_args):
+        max_threads = cp.cuda.Device().attributes["MaxThreadsPerBlock"]
+        if threads_per_block > max_threads:
+            raise ValueError(
+                f"CUDA block size {threads_per_block} "
+                f"exceeds device limit {max_threads}"
+            )
+
+        cache_key = (
+            cubin,
+            kernel_name,
+            cp.cuda.Device().id,
+        )
+        if cache_key not in kernel_cache:
+            module = cp.cuda.function.Module()
+            module.load(cubin)
+            kernel_cache[cache_key] = module.get_function(kernel_name)
+
+        normalized_args = _normalize_cuda_array_args(
+            cp,
+            runtime_args,
         )
 
-    cache_key = (cubin, kernel_name)
-    if cache_key not in kernel_cache:
-        module = cp.cuda.function.Module()
-        module.load(cubin)
-        kernel_cache[cache_key] = module.get_function(kernel_name)
-
-    kernel_cache[cache_key](
-        launch_grid,
-        (threads_per_block,),
-        _convert_mlir_memref_args(runtime_args),
-    )
+        kernel_cache[cache_key](
+            launch_grid,
+            (threads_per_block,),
+            _convert_mlir_memref_args(normalized_args),
+        )
