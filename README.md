@@ -64,6 +64,11 @@ MLIR's GPU/NVVM stack to a cubin.
   accumulator per output thread, an FMA loop over shared-memory operands,
   synchronization before tile reuse, runtime traversal of multiple K-tiles,
   and CUDA correctness tests for masked edge tiles.
+- [ver16](https://github.com/pbelevich/mytriton/tree/ver16): per-thread CUDA
+  register tiles for `tl.dot` outputs, explicit logical-output-to-thread/register
+  mapping, broadcast-aware register arithmetic and pointer construction,
+  register-valued loop-carried accumulators, masked multi-result stores, and
+  CUDA execution tests in which each thread computes several C elements.
 
 ## AST frontend
 
@@ -165,13 +170,16 @@ dtype:
 %2 = add %0, %1 : vector<8 x f32>
 ```
 
-In the current CUDA execution model, each element of a distributed block is
-represented by one scalar in its CUDA thread. Consequently `tl.zeros` emits a
-zero-initialized per-thread value, `tl.full` emits the fill value in each
-thread, and `tl.empty` declares an uninitialized per-thread value. These factory
-functions describe logical blocks; they do not allocate CUDA shared memory.
-Any computation that consumes a value produced by `tl.empty` observes undefined
-contents.
+In the ordinary elementwise CUDA execution model, each element of a distributed
+block is represented by one scalar in its CUDA thread. Consequently `tl.zeros`
+emits a zero-initialized per-thread value, `tl.full` emits the fill value in each
+thread, and `tl.empty` declares an uninitialized per-thread value. A `tl.dot`
+kernel may instead distribute a logical output tile across several registers
+per thread; a constructed scalar value such as the initial `tl.zeros`
+accumulator is then used to initialize every owned output register. These
+factory functions describe logical blocks; they do not allocate CUDA shared
+memory. Any computation that consumes a value produced by `tl.empty` observes
+undefined contents.
 
 ## CUDA tile layouts
 
@@ -188,11 +196,26 @@ layout = CudaKernelLayout(
 ```
 
 This layout represents a 64-by-64 output tile executed by 256 CUDA threads.
-The current elementwise lowering still uses one output element per thread, so
-the automatically inferred thread shape equals the output tile shape. Keeping
-the two shapes explicit prepares the backend for kernels in which each thread
-owns several output elements. Reductions already use this separation: a scalar
-output tile can retain the wider thread shape required by the reduction input.
+Ordinary elementwise lowering still uses one output element per thread, so its
+automatically inferred thread shape equals the output tile shape. Reductions
+use the separation to retain the wider thread shape required by a scalar
+output. `tl.dot` kernels can now use a smaller physical thread shape and assign
+several logical output elements to registers owned by each thread.
+
+`CudaRegisterTileLayout` describes that assignment. Its register shape is the
+elementwise quotient of the logical output shape and thread shape. Logical
+coordinates use a strided mapping:
+
+```text
+logical_coordinate =
+    thread_coordinate + register_coordinate * thread_shape
+```
+
+For an `(8, 8)` output tile executed by `(4, 8)` threads, the register shape is
+`(2, 1)`: every thread computes two C elements whose row coordinates differ by
+four. A `(16, 16)` output executed by `(4, 8)` threads gives a `(4, 2)` register
+tile, or eight results per thread. Logical dimensions must be divisible by
+their physical thread dimensions.
 
 A projected `CudaTileLayout` maps logical dimensions directly to CUDA thread
 dimensions. Singleton dimensions may be broadcast:
@@ -295,15 +318,27 @@ positions receive `0.0`, so edge tiles are safe without divergent barriers.
 After both cooperative loads, the backend emits `__syncthreads()` so no thread
 starts reading a tile before all writes have completed.
 
-Each CUDA thread owns one output coordinate `(tile_i, tile_j)` and one `f32`
-register accumulator. It performs the ordinary CUDA-core reduction:
+For a small output tile, each CUDA thread may still own one output coordinate
+`(tile_i, tile_j)` and one `f32` register accumulator. Larger `tl.dot` outputs
+use at most 32 physical threads in the current policy and assign a register tile
+to every thread. For example, an `(8, 8)` output executed by `(4, 8)` threads
+uses two accumulators per thread:
 
 ```text
-accumulator = 0.0
+accumulator_0 = 0.0
+accumulator_1 = 0.0
 
 for k in range(BK):
-    accumulator += shared_a[tile_i, k] * shared_b[k, tile_j]
+    accumulator_0 += shared_a[tile_i, k] * shared_b[k, tile_j]
+    accumulator_1 += shared_a[tile_i + 4, k] * shared_b[k, tile_j]
 ```
+
+Rank-2 broadcast values participate in the same mapping without unnecessary
+duplication. A `(BM, 1)` row-offset tile stores registers only along the row
+axis, while a `(1, BN)` column-offset tile stores registers only along the
+column axis. Binary arithmetic combines them into full `(BM, BN)` register
+tiles when necessary. Pointer addition, Boolean masks, and stores select the
+matching pointer, value, and mask register for every logical output element.
 
 A second `__syncthreads()` ensures every thread has finished reading the current
 shared buffers before a runtime K-loop iteration overwrites them with the next
@@ -323,8 +358,9 @@ tl.store(output_pointers, acc, mask=output_mask)
 
 Version 14 intentionally stops after shared-memory staging. Version 15 adds the
 CUDA-core FMA loop, safe shared-buffer reuse, and execution across multiple
-K-tiles. It still uses one CUDA thread per output element; register tiles with
-multiple results per thread are deferred to Version 16.
+K-tiles. Version 16 separates the physical thread tile from the logical dot
+output, carries register-tile accumulators through runtime K-loops, and emits a
+masked store for every result owned by a thread.
 
 ## Example
 
@@ -536,12 +572,13 @@ these rewrite passes because they are not region-aware yet.
 - The launch grid is evaluated and used for CUDA execution, but it is not
   represented in the IR.
 - The CUDA kernel layout is inferred from block-shaped operands of observable
-  `store` operations and from the input widths required by reductions. The
-  current elementwise policy assigns one CUDA thread to each output element;
-  reductions may retain a wider thread shape for a scalar output. Scalar-only
-  kernels use one thread per block. The layout model can represent fewer
-  threads than output elements, but CUDA code generation does not use that
-  mapping yet.
+  `store` operations, input widths required by reductions, and `tl.dot` result
+  shapes. The current elementwise policy assigns one CUDA thread to each output
+  element; reductions may retain a wider thread shape for a scalar output.
+  CUDA-core dot kernels use at most 32 threads and can assign several output
+  elements to a per-thread rank-2 register tile. Scalar-only kernels use one
+  thread per block. The dot thread-count policy is fixed rather than tuned for
+  a particular GPU.
 - JIT cache entries are specialized by runtime types and constexpr values. Python
   globals and closure values used by a kernel must remain unchanged; call
   `kernel.clear_cache()` after changing them.
@@ -559,7 +596,10 @@ these rewrite passes because they are not region-aware yet.
   operands, `tl.dot` lowering emits shared-memory declarations, cooperative
   masked loads with zero-filled boundaries, a CUDA-core FMA loop, and the
   barriers required before reading and reusing the shared tiles. Runtime
-  `range` loops can accumulate multiple K-tiles into one result.
+  `range` loops can accumulate multiple K-tiles into one result. Dot outputs,
+  their broadcasted row/column coordinates, pointer arithmetic, masks,
+  loop-carried accumulators, and stores support several register-resident
+  results per CUDA thread.
 - Reductions are currently single-block reductions over the SSA vector width.
   The vector width must be a power of two and must match the CUDA thread block
   size. Larger rows can be handled by statically unrolling multiple loads into
@@ -567,11 +607,12 @@ these rewrite passes because they are not region-aware yet.
   multi-block reduction yet.
 - Matrix multiplication supports a correct tiled CUDA-core implementation for
   canonical `tl.dot` operands. A `[BM, BK]` and B `[BK, BN]` are loaded
-  cooperatively into shared memory, each thread computes one C element, and a
-  runtime CUDA loop can traverse the complete K dimension. The implementation
-  prioritizes correctness over performance: it has no per-thread register
-  tiles, vectorized loads, shared-memory padding or swizzling, double buffering,
-  asynchronous copies, tensor-core instructions, or autotuning yet.
+  cooperatively into shared memory, each thread computes a rank-2 register tile
+  of C elements, and a runtime CUDA loop can traverse the complete K dimension.
+  The implementation prioritizes correctness over performance: it has a fixed
+  one-warp-at-most dot layout policy and no vectorized loads, shared-memory
+  padding or swizzling, double buffering, asynchronous copies, tensor-core
+  instructions, or autotuning yet.
   `tl.empty`, `tl.full`, and `tl.zeros` continue to represent logical
   per-thread values rather than shared-memory allocations.
 - MLIR lowering currently supports only `ptr<f32>` parameters as

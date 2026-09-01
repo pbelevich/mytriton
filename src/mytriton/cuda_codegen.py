@@ -2,7 +2,11 @@ import math
 from dataclasses import dataclass
 from typing import ClassVar
 
-from .block_shapes import CudaKernelLayout, cuda_kernel_layout
+from .block_shapes import (
+    CudaKernelLayout,
+    CudaRegisterTileLayout,
+    cuda_kernel_layout,
+)
 from .cuda_dot_staging import (
     CudaDotSharedBuffers,
     CudaDotStagingAnalysis,
@@ -44,6 +48,63 @@ class CudaArangeRef:
         return self.end - self.start
 
 
+@dataclass(frozen=True)
+class CudaRegisterTileRef:
+    """CUDA registers owned by one thread for a logical rank-2 tile."""
+
+    base: str
+    layout: CudaRegisterTileLayout
+    broadcast_axes: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        if tuple(sorted(set(self.broadcast_axes))) != self.broadcast_axes:
+            raise ValueError(
+                f"broadcast axes must be unique and sorted, got {self.broadcast_axes}"
+            )
+
+        if any(axis not in (0, 1) for axis in self.broadcast_axes):
+            raise ValueError(f"invalid broadcast axes {self.broadcast_axes}")
+
+    @property
+    def storage_shape(self) -> tuple[int, ...]:
+        return tuple(
+            1 if axis in self.broadcast_axes else dim
+            for axis, dim in enumerate(self.layout.register_shape)
+        )
+
+    def storage_coordinates(self) -> tuple[tuple[int, int], ...]:
+        return tuple(
+            (register_row, register_column)
+            for register_row in range(self.storage_shape[0])
+            for register_column in range(self.storage_shape[1])
+        )
+
+    def element(self, register_coordinate: tuple[int, ...]) -> str:
+        if len(register_coordinate) != 2 or any(
+            type(index) is not int or index < 0 or index >= dim
+            for index, dim in zip(
+                register_coordinate,
+                self.layout.register_shape,
+                strict=True,
+            )
+        ):
+            raise ValueError(
+                f"invalid register coordinate {register_coordinate} "
+                f"for {self.layout.register_shape}"
+            )
+
+        storage_coordinate = tuple(
+            0 if axis in self.broadcast_axes else index
+            for axis, index in enumerate(register_coordinate)
+        )
+
+        if all(dim == 1 for dim in self.storage_shape):
+            return self.base
+
+        row, column = storage_coordinate
+        return f"{self.base}_{row}_{column}"
+
+
 class SSACUDACodegen:
     MAX_SHARED_MEMORY_BYTES: ClassVar[int] = 48 * 1024
 
@@ -58,7 +119,10 @@ class SSACUDACodegen:
 
     def __init__(self):
         self.lines: list[str] = []
-        self.values: dict[int, str | CudaPtrRef | CudaArangeRef] = {}
+        self.values: dict[
+            int,
+            str | CudaPtrRef | CudaArangeRef | CudaRegisterTileRef,
+        ] = {}
         self.layout = CudaKernelLayout(
             output_tile_shape=(1,),
             thread_shape=(1,),
@@ -104,7 +168,9 @@ class SSACUDACodegen:
 
         raise TypeError(f"Unsupported CUDA literal: {value!r}")
 
-    def operand(self, operand: SSAOperand) -> str | CudaPtrRef | CudaArangeRef | None:
+    def operand(
+        self, operand: SSAOperand
+    ) -> str | CudaPtrRef | CudaArangeRef | CudaRegisterTileRef | None:
         if operand is None:
             return None
         if isinstance(operand, SSAValue):
@@ -132,6 +198,61 @@ class SSACUDACodegen:
         if not isinstance(value, str):
             raise TypeError(f"Expected CUDA scalar expression, got {value}")
         return value
+
+    def register_expression_operand(
+        self,
+        operand: SSAOperand,
+        register_coordinate: tuple[int, ...],
+        expected_layout: CudaRegisterTileLayout,
+    ) -> str:
+        value = self.operand(operand)
+
+        if isinstance(value, CudaRegisterTileRef):
+            if value.layout != expected_layout:
+                raise TypeError(
+                    "incompatible CUDA register tile layouts: "
+                    f"{value.layout} and {expected_layout}"
+                )
+
+            return value.element(register_coordinate)
+
+        if isinstance(value, str):
+            return value
+
+        raise TypeError(
+            f"expected CUDA scalar or register tile expression, got {value}"
+        )
+
+    def register_pointer_operand(
+        self,
+        operand: SSAOperand,
+        register_coordinate: tuple[int, ...],
+        expected_layout: CudaRegisterTileLayout,
+    ) -> CudaPtrRef:
+        value = self.operand(operand)
+
+        if isinstance(value, CudaRegisterTileRef):
+            if value.layout != expected_layout:
+                raise TypeError(
+                    "incompatible CUDA register tile layouts: "
+                    f"{value.layout} and {expected_layout}"
+                )
+
+            return CudaPtrRef(
+                base=value.element(register_coordinate),
+                index="0",
+            )
+
+        if isinstance(value, CudaPtrRef):
+            return value
+
+        if isinstance(value, str):
+            return CudaPtrRef(
+                base=value,
+                index="0",
+            )
+
+        raise TypeError(f"expected CUDA pointer or register pointer tile, got {value}")
 
     def pointer_operand(self, operand: SSAOperand) -> CudaPtrRef:
         value = self.operand(operand)
@@ -307,12 +428,21 @@ class SSACUDACodegen:
                 f"got {result.ty.shape}"
             )
 
-        if result.ty.shape != self.layout.thread_shape:
+        if result.ty.shape != self.layout.output_tile_shape:
             raise TypeError(
-                "CUDA-core dot currently requires one CUDA thread per "
-                f"result element, got result {result.ty.shape} and "
-                f"thread layout {self.layout.thread_shape}"
+                "CUDA-core dot result must match the kernel output tile, "
+                f"got result {result.ty.shape} and "
+                f"output tile {self.layout.output_tile_shape}"
             )
+
+        try:
+            register_layout = self.layout.register_tile_layout()
+        except ValueError as error:
+            raise TypeError(
+                "CUDA-core dot cannot distribute result tile "
+                f"{result.ty.shape} across CUDA threads "
+                f"{self.layout.thread_shape}"
+            ) from error
 
         if (
             result.ty.element != F32
@@ -321,33 +451,49 @@ class SSACUDACodegen:
         ):
             raise TypeError("CUDA-core dot currently supports only f32")
 
-        result_name = f"v{result.id}"
+        result_ref = CudaRegisterTileRef(
+            base=f"v{result.id}",
+            layout=register_layout,
+        )
         reduction_index = f"dot_k_{result.id}"
-        row = self.thread_coordinate(0)
-        column = self.thread_coordinate(1)
 
-        lhs_element = buffers.lhs.element(
-            row,
-            reduction_index,
-        )
-        rhs_element = buffers.rhs.element(
-            reduction_index,
-            column,
+        register_coordinates = self.register_coordinates(register_layout)
+
+        for register_coordinate in register_coordinates:
+            result_element = result_ref.element(register_coordinate)
+            self.lines.append(f"    float {result_element} = 0.0f;")
+
+        self.lines.append(
+            f"    for (int {reduction_index} = 0; "
+            f"{reduction_index} < {buffers.reduction_size}; "
+            f"++{reduction_index}) {{"
         )
 
-        self.lines.extend(
-            [
-                f"    float {result_name} = 0.0f;",
-                (
-                    f"    for (int {reduction_index} = 0; "
-                    f"{reduction_index} < {buffers.reduction_size}; "
-                    f"++{reduction_index}) {{"
-                ),
-                (f"        {result_name} += {lhs_element} * {rhs_element};"),
-                "    }",
-            ]
-        )
-        self.values[result.id] = result_name
+        for register_coordinate in register_coordinates:
+            row, column = self.register_logical_coordinates(
+                register_layout,
+                register_coordinate,
+            )
+            result_element = result_ref.element(register_coordinate)
+            lhs_element = buffers.lhs.element(
+                row,
+                reduction_index,
+            )
+            rhs_element = buffers.rhs.element(
+                reduction_index,
+                column,
+            )
+
+            self.lines.append(
+                f"        {result_element} += {lhs_element} * {rhs_element};"
+            )
+
+        self.lines.append("    }")
+
+        if register_layout.registers_per_thread == 1:
+            self.values[result.id] = result_ref.element((0, 0))
+        else:
+            self.values[result.id] = result_ref
 
         # All threads must finish reading the current tiles before another
         # runtime K-loop iteration overwrites the shared buffers.
@@ -457,6 +603,38 @@ class SSACUDACodegen:
 
         return coordinates[thread_axis]
 
+    def register_coordinates(
+        self,
+        layout: CudaRegisterTileLayout,
+    ) -> tuple[tuple[int, int], ...]:
+        return tuple(
+            (register_row, register_column)
+            for register_row in range(layout.register_shape[0])
+            for register_column in range(layout.register_shape[1])
+        )
+
+    def register_logical_coordinates(
+        self,
+        layout: CudaRegisterTileLayout,
+        register_coordinate: tuple[int, ...],
+    ) -> tuple[str, ...]:
+        offsets = layout.logical_coordinate(
+            thread_coordinate=(0, 0),
+            register_coordinate=register_coordinate,
+        )
+
+        return tuple(
+            thread_coordinate if offset == 0 else f"{thread_coordinate} + {offset}"
+            for thread_coordinate, offset in zip(
+                (
+                    self.thread_coordinate(0),
+                    self.thread_coordinate(1),
+                ),
+                offsets,
+                strict=True,
+            )
+        )
+
     def emit_rank2_prologue(self) -> None:
         if not self.is_rank2_kernel():
             return
@@ -560,7 +738,7 @@ class SSACUDACodegen:
 
         index_name = f"v{loop.index.id}"
 
-        carried_names = []
+        carried_values: list[str | CudaRegisterTileRef] = []
 
         for carried_input, carried_arg, result in zip(
             loop.carried_inputs,
@@ -568,17 +746,52 @@ class SSACUDACodegen:
             loop.results,
             strict=True,
         ):
-            init = self.expression_operand(carried_input)
-            name = f"v{result.id}"
+            register_layout: CudaRegisterTileLayout | None = None
+
+            if (
+                isinstance(result.ty, BlockType)
+                and result.ty.rank == 2
+                and result.ty.shape == self.layout.output_tile_shape
+            ):
+                candidate_layout = self.layout.register_tile_layout()
+
+                if candidate_layout.registers_per_thread > 1:
+                    register_layout = candidate_layout
+
+            if register_layout is None:
+                init = self.expression_operand(carried_input)
+                name = f"v{result.id}"
+                cuda_ty = self.cuda_type(result.ty)
+
+                self.lines.append(f"    {cuda_ty} {name} = {init};")
+                self.values[carried_arg.id] = name
+                self.values[result.id] = name
+                carried_values.append(name)
+                continue
+
+            result_ref = CudaRegisterTileRef(
+                base=f"v{result.id}",
+                layout=register_layout,
+            )
             cuda_ty = self.cuda_type(result.ty)
 
-            self.lines.append(f"    {cuda_ty} {name} = {init};")
-            self.values[carried_arg.id] = name
-            self.values[result.id] = name
-            carried_names.append(name)
+            for register_coordinate in self.register_coordinates(register_layout):
+                init = self.register_expression_operand(
+                    carried_input,
+                    register_coordinate,
+                    register_layout,
+                )
+                name = result_ref.element(register_coordinate)
+                self.lines.append(f"    {cuda_ty} {name} = {init};")
+
+            self.values[carried_arg.id] = result_ref
+            self.values[result.id] = result_ref
+            carried_values.append(result_ref)
 
         self.lines.append(
-            f"    for (int {index_name} = {start}; {index_name} < {stop}; {index_name} += {step}) {{"
+            f"    for (int {index_name} = {start}; "
+            f"{index_name} < {stop}; "
+            f"{index_name} += {step}) {{"
         )
 
         self.values[loop.index.id] = index_name
@@ -591,20 +804,173 @@ class SSACUDACodegen:
             elif not self.is_staging_only(body_op):
                 self.emit(body_op)
 
-        for yielded, carried_name in zip(loop.yields, carried_names, strict=True):
-            value = self.expression_operand(yielded)
-            self.lines.append(f"    {carried_name} = {value};")
+        for yielded, carried_value in zip(
+            loop.yields,
+            carried_values,
+            strict=True,
+        ):
+            if isinstance(carried_value, CudaRegisterTileRef):
+                for register_coordinate in self.register_coordinates(
+                    carried_value.layout
+                ):
+                    value = self.register_expression_operand(
+                        yielded,
+                        register_coordinate,
+                        carried_value.layout,
+                    )
+                    name = carried_value.element(register_coordinate)
+                    self.lines.append(f"    {name} = {value};")
+            else:
+                value = self.expression_operand(yielded)
+                self.lines.append(f"    {carried_value} = {value};")
 
         body_lines = self.lines[body_start:]
         self.lines[body_start:] = [f"    {line}" for line in body_lines]
 
         self.lines.append("    }")
 
-    def emit(self, op: SSAOp) -> None:
-        if op.opcode == "store":
-            ptr = self.pointer_operand(op.operands[0])
-            value = self.expression_operand(op.operands[1])
-            mask_operand = op.operands[2]
+    def register_broadcast_axes(
+        self,
+        ty: Type,
+    ) -> tuple[int, ...] | None:
+        if not isinstance(ty, BlockType) or ty.rank != 2:
+            return None
+
+        broadcast_axes = []
+
+        for axis, (result_dim, output_dim) in enumerate(
+            zip(
+                ty.shape,
+                self.layout.output_tile_shape,
+                strict=True,
+            )
+        ):
+            if result_dim == output_dim:
+                continue
+
+            if result_dim == 1:
+                broadcast_axes.append(axis)
+                continue
+
+            return None
+
+        return tuple(broadcast_axes)
+
+    def emit_binary(self, op: SSAOp, result: SSAValue) -> None:
+        symbol = self.BINARY_OPS[op.opcode]
+        broadcast_axes = self.register_broadcast_axes(result.ty)
+
+        if broadcast_axes is None:
+            lhs = self.expression_operand(op.operands[0])
+            rhs = self.expression_operand(op.operands[1])
+            self.assign(result, f"({lhs} {symbol} {rhs})")
+            return
+
+        register_layout = self.layout.register_tile_layout()
+
+        if register_layout.registers_per_thread == 1:
+            lhs = self.expression_operand(op.operands[0])
+            rhs = self.expression_operand(op.operands[1])
+            self.assign(result, f"({lhs} {symbol} {rhs})")
+            return
+
+        result_ref = CudaRegisterTileRef(
+            base=f"v{result.id}",
+            layout=register_layout,
+            broadcast_axes=broadcast_axes,
+        )
+        cuda_ty = self.cuda_type(result.ty)
+
+        for register_coordinate in result_ref.storage_coordinates():
+            lhs = self.register_expression_operand(
+                op.operands[0],
+                register_coordinate,
+                register_layout,
+            )
+            rhs = self.register_expression_operand(
+                op.operands[1],
+                register_coordinate,
+                register_layout,
+            )
+            result_element = result_ref.element(register_coordinate)
+
+            self.lines.append(
+                f"    {cuda_ty} {result_element} = ({lhs} {symbol} {rhs});"
+            )
+
+        self.values[result.id] = result_ref
+
+    def emit_addptr(self, op: SSAOp, result: SSAValue) -> None:
+        broadcast_axes = self.register_broadcast_axes(result.ty)
+
+        if broadcast_axes is not None:
+            register_layout = self.layout.register_tile_layout()
+
+            if register_layout.registers_per_thread > 1:
+                result_ref = CudaRegisterTileRef(
+                    base=f"v{result.id}",
+                    layout=register_layout,
+                    broadcast_axes=broadcast_axes,
+                )
+                cuda_ty = self.cuda_type(result.ty)
+
+                for register_coordinate in result_ref.storage_coordinates():
+                    base = self.register_pointer_operand(
+                        op.operands[0],
+                        register_coordinate,
+                        register_layout,
+                    )
+                    offset = self.register_expression_operand(
+                        op.operands[1],
+                        register_coordinate,
+                        register_layout,
+                    )
+
+                    if base.index != "0":
+                        offset = f"({base.index} + {offset})"
+
+                    result_element = result_ref.element(register_coordinate)
+                    self.lines.append(
+                        f"    {cuda_ty} {result_element} = {base.base} + {offset};"
+                    )
+
+                self.values[result.id] = result_ref
+                return
+
+        scalar_base = self.operand(op.operands[0])
+        offset = self.expression_operand(op.operands[1])
+
+        if isinstance(scalar_base, CudaPtrRef):
+            if scalar_base.index != "0":
+                offset = f"({scalar_base.index} + {offset})"
+            scalar_base = scalar_base.base
+
+        if not isinstance(scalar_base, str):
+            raise TypeError(f"addptr expects pointer base, got {scalar_base}")
+
+        self.values[result.id] = CudaPtrRef(
+            scalar_base,
+            offset,
+        )
+
+    def emit_store(self, op: SSAOp) -> None:
+        pointer_operand, value_operand, mask_operand = op.operands
+
+        operand_values = tuple(
+            self.operand(operand) for operand in op.operands if operand is not None
+        )
+        register_ref = next(
+            (
+                value
+                for value in operand_values
+                if isinstance(value, CudaRegisterTileRef)
+            ),
+            None,
+        )
+
+        if register_ref is None:
+            ptr = self.pointer_operand(pointer_operand)
+            value = self.expression_operand(value_operand)
             mask = (
                 None if mask_operand is None else self.expression_operand(mask_operand)
             )
@@ -619,6 +985,145 @@ class SSACUDACodegen:
                         "    }",
                     ]
                 )
+            return
+
+        register_layout = register_ref.layout
+
+        for register_coordinate in self.register_coordinates(register_layout):
+            ptr = self.register_pointer_operand(
+                pointer_operand,
+                register_coordinate,
+                register_layout,
+            )
+            value = self.register_expression_operand(
+                value_operand,
+                register_coordinate,
+                register_layout,
+            )
+            mask = (
+                None
+                if mask_operand is None
+                else self.register_expression_operand(
+                    mask_operand,
+                    register_coordinate,
+                    register_layout,
+                )
+            )
+
+            if mask is None:
+                self.lines.append(f"    {ptr.base}[{ptr.index}] = {value};")
+            else:
+                self.lines.extend(
+                    [
+                        f"    if ({mask}) {{",
+                        f"        {ptr.base}[{ptr.index}] = {value};",
+                        "    }",
+                    ]
+                )
+
+    def emit_expand_dims(
+        self,
+        op: SSAOp,
+        result: SSAValue,
+    ) -> None:
+        if not self.is_rank2_kernel():
+            raise TypeError(
+                "CUDA expand_dims lowering currently requires rank-2 kernel"
+            )
+
+        operand = op.operands[0]
+        if not isinstance(operand, SSAValue):
+            raise TypeError(f"expand_dims expects SSA operand, got {operand}")
+
+        arange_ref = self.operand(operand)
+        if not isinstance(arange_ref, CudaArangeRef):
+            raise TypeError(
+                "CUDA expand_dims MVP supports only direct arange expansion, "
+                f"got {arange_ref}"
+            )
+
+        axis = op.attrs.get("axis")
+        if type(axis) is not int:
+            raise TypeError(f"expand_dims axis must be an integer, got {axis}")
+
+        assert isinstance(axis, int)
+
+        if not isinstance(result.ty, BlockType):
+            raise TypeError(f"expand_dims expects block result, got {result.ty}")
+
+        result_shape = result.ty.shape
+        register_layout = self.layout.register_tile_layout()
+
+        if register_layout.registers_per_thread > 1:
+            expected_shape = list(self.layout.output_tile_shape)
+            expected_shape[axis] = 1
+
+            if result_shape != tuple(expected_shape):
+                raise TypeError(
+                    f"cannot map expand_dims result {result.ty} into "
+                    f"CUDA output tile {self.layout.output_tile_shape}"
+                )
+
+            result_ref = CudaRegisterTileRef(
+                base=f"v{result.id}",
+                layout=register_layout,
+                broadcast_axes=(axis,),
+            )
+            cuda_ty = self.cuda_type(result.ty)
+            source_axis = 1 - axis
+
+            for register_coordinate in result_ref.storage_coordinates():
+                logical_coordinates = self.register_logical_coordinates(
+                    register_layout,
+                    register_coordinate,
+                )
+                coordinate = logical_coordinates[source_axis]
+                expression = (
+                    coordinate
+                    if arange_ref.start == 0
+                    else f"({arange_ref.start} + {coordinate})"
+                )
+                result_element = result_ref.element(register_coordinate)
+
+                self.lines.append(f"    {cuda_ty} {result_element} = {expression};")
+
+            self.values[result.id] = result_ref
+            return
+
+        try:
+            tile_layout = self.layout.tile_layout(
+                result_shape,
+                broadcast_axes=(axis,),
+            )
+        except ValueError as error:
+            raise TypeError(
+                f"cannot map expand_dims result {result.ty} into CUDA tile "
+                f"shape {self.layout.thread_shape}"
+            ) from error
+
+        mapped_axes = [
+            thread_axis
+            for thread_axis in tile_layout.thread_axes
+            if thread_axis is not None
+        ]
+
+        if len(mapped_axes) != 1:
+            raise TypeError(
+                "expanded arange must map to exactly one CUDA thread axis, "
+                f"got {tile_layout}"
+            )
+
+        coordinate = self.thread_coordinate(mapped_axes[0])
+        expression = (
+            coordinate
+            if arange_ref.start == 0
+            else f"({arange_ref.start} + {coordinate})"
+        )
+        self.assign(result, expression)
+
+    def emit(self, op: SSAOp) -> None:
+        if op.opcode == "store":
+            self.emit_store(op)
             return
 
         result = op.result
@@ -667,20 +1172,9 @@ class SSACUDACodegen:
                 buffers,
             )
         elif op.opcode in self.BINARY_OPS:
-            lhs = self.expression_operand(op.operands[0])
-            rhs = self.expression_operand(op.operands[1])
-            symbol = self.BINARY_OPS[op.opcode]
-            self.assign(result, f"({lhs} {symbol} {rhs})")
+            self.emit_binary(op, result)
         elif op.opcode == "addptr":
-            base = self.operand(op.operands[0])
-            offset = self.expression_operand(op.operands[1])
-            if isinstance(base, CudaPtrRef):
-                if base.index != "0":
-                    offset = f"({base.index} + {offset})"
-                base = base.base
-            if not isinstance(base, str):
-                raise TypeError(f"addptr expects pointer base, got {base}")
-            self.values[result.id] = CudaPtrRef(base, offset)
+            self.emit_addptr(op, result)
         elif op.opcode == "load":
             ptr = self.pointer_operand(op.operands[0])
             mask_operand = op.operands[1]
@@ -728,62 +1222,7 @@ class SSACUDACodegen:
         elif op.opcode in ("sum", "max", "min"):
             self.emit_reduction(op)
         elif op.opcode == "expand_dims":
-            if not self.is_rank2_kernel():
-                raise TypeError(
-                    "CUDA expand_dims lowering currently requires rank-2 kernel"
-                )
-
-            operand = op.operands[0]
-            if not isinstance(operand, SSAValue):
-                raise TypeError(f"expand_dims expects SSA operand, got {operand}")
-
-            arange_ref = self.operand(operand)
-            if not isinstance(arange_ref, CudaArangeRef):
-                raise TypeError(
-                    "CUDA expand_dims MVP supports only direct arange expansion, "
-                    f"got {arange_ref}"
-                )
-
-            axis = op.attrs.get("axis")
-            if type(axis) is not int:
-                raise TypeError(f"expand_dims axis must be an integer, got {axis}")
-
-            assert isinstance(axis, int)
-
-            if not isinstance(result.ty, BlockType):
-                raise TypeError(f"expand_dims expects block result, got {result.ty}")
-
-            result_shape = result.ty.shape
-
-            try:
-                tile_layout = self.layout.tile_layout(
-                    result_shape,
-                    broadcast_axes=(axis,),
-                )
-            except ValueError as error:
-                raise TypeError(
-                    f"cannot map expand_dims result {result.ty} into CUDA tile "
-                    f"shape {self.layout.thread_shape}"
-                ) from error
-
-            mapped_axes = [
-                thread_axis
-                for thread_axis in tile_layout.thread_axes
-                if thread_axis is not None
-            ]
-
-            if len(mapped_axes) != 1:
-                raise TypeError(
-                    "expanded arange must map to exactly one CUDA thread axis, "
-                    f"got {tile_layout}"
-                )
-
-            coord = self.thread_coordinate(mapped_axes[0])
-
-            expression = (
-                coord if arange_ref.start == 0 else f"({arange_ref.start} + {coord})"
-            )
-            self.assign(result, expression)
+            self.emit_expand_dims(op, result)
         else:
             raise TypeError(f"Unsupported SSA opcode: {op.opcode}")
 

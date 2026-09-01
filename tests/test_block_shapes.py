@@ -3,6 +3,7 @@ import pytest
 from mytriton.block_shapes import (
     CudaCooperativeTileLayout,
     CudaKernelLayout,
+    CudaRegisterTileLayout,
     CudaTileLayout,
     cuda_kernel_layout,
 )
@@ -230,6 +231,50 @@ def test_cuda_kernel_layout_separates_output_tile_from_threads() -> None:
     assert layout.threads_per_block == 256
 
 
+def test_register_tile_layout_maps_multiple_results_per_thread() -> None:
+    layout = CudaRegisterTileLayout(
+        logical_shape=(8, 8),
+        thread_shape=(4, 4),
+    )
+
+    assert layout.register_shape == (2, 2)
+    assert layout.registers_per_thread == 4
+
+    assert layout.logical_coordinate(
+        thread_coordinate=(2, 3),
+        register_coordinate=(0, 0),
+    ) == (2, 3)
+    assert layout.logical_coordinate(
+        thread_coordinate=(2, 3),
+        register_coordinate=(0, 1),
+    ) == (2, 7)
+    assert layout.logical_coordinate(
+        thread_coordinate=(2, 3),
+        register_coordinate=(1, 0),
+    ) == (6, 3)
+    assert layout.logical_coordinate(
+        thread_coordinate=(2, 3),
+        register_coordinate=(1, 1),
+    ) == (6, 7)
+
+    logical_coordinates = {
+        layout.logical_coordinate(
+            thread_coordinate=(thread_row, thread_column),
+            register_coordinate=(register_row, register_column),
+        )
+        for thread_row in range(layout.thread_shape[0])
+        for thread_column in range(layout.thread_shape[1])
+        for register_row in range(layout.register_shape[0])
+        for register_column in range(layout.register_shape[1])
+    }
+
+    assert logical_coordinates == {
+        (row, column)
+        for row in range(layout.logical_shape[0])
+        for column in range(layout.logical_shape[1])
+    }
+
+
 def test_cooperative_layout_distributes_a_tile_across_threads() -> None:
     kernel_layout = CudaKernelLayout(
         output_tile_shape=(4, 8),
@@ -394,3 +439,144 @@ def test_cuda_layouts_reject_more_than_1024_threads() -> None:
             threads_per_block=1025,
             order=(1, 0),
         )
+
+
+@pytest.mark.parametrize(
+    ("logical_shape", "thread_shape"),
+    [
+        ((8,), (4,)),
+        ((8, 8), (4,)),
+        ((8, 0), (4, 4)),
+        ((8, 8), (0, 4)),
+        ((7, 8), (4, 4)),
+        ((4, 8), (8, 4)),
+    ],
+)
+def test_register_tile_layout_rejects_invalid_shapes(
+    logical_shape: tuple[int, ...],
+    thread_shape: tuple[int, ...],
+) -> None:
+    with pytest.raises(ValueError):
+        CudaRegisterTileLayout(logical_shape, thread_shape)
+
+
+def test_register_tile_layout_rejects_invalid_coordinates() -> None:
+    layout = CudaRegisterTileLayout(
+        logical_shape=(8, 8),
+        thread_shape=(4, 4),
+    )
+
+    with pytest.raises(ValueError, match="invalid thread coordinate"):
+        layout.logical_coordinate(
+            thread_coordinate=(4, 0),
+            register_coordinate=(0, 0),
+        )
+
+    with pytest.raises(ValueError, match="invalid thread coordinate"):
+        layout.logical_coordinate(
+            thread_coordinate=(-1, 0),
+            register_coordinate=(0, 0),
+        )
+
+    with pytest.raises(ValueError, match="invalid register coordinate"):
+        layout.logical_coordinate(
+            thread_coordinate=(0, 0),
+            register_coordinate=(2, 0),
+        )
+
+    with pytest.raises(ValueError, match="invalid register coordinate"):
+        layout.logical_coordinate(
+            thread_coordinate=(0, 0),
+            register_coordinate=(0, -1),
+        )
+
+
+def test_cuda_kernel_layout_builds_output_register_tile_layout() -> None:
+    kernel_layout = CudaKernelLayout(
+        output_tile_shape=(8, 8),
+        thread_shape=(4, 4),
+    )
+
+    assert kernel_layout.register_tile_layout() == CudaRegisterTileLayout(
+        logical_shape=(8, 8),
+        thread_shape=(4, 4),
+    )
+
+
+@pytest.mark.parametrize(
+    ("output_shape", "expected_thread_shape"),
+    [
+        ((4, 8), (4, 8)),
+        ((8, 8), (4, 8)),
+        ((16, 32), (4, 8)),
+    ],
+)
+def test_dot_kernel_layout_uses_one_warp_register_tile(
+    output_shape: tuple[int, ...],
+    expected_thread_shape: tuple[int, ...],
+) -> None:
+    rows, columns = output_shape
+
+    lhs = SSAValue(
+        id=0,
+        ty=BlockType((rows, 16), F32),
+    )
+    rhs = SSAValue(
+        id=1,
+        ty=BlockType((16, columns), F32),
+    )
+    dot = SSAValue(
+        id=2,
+        ty=BlockType(output_shape, F32),
+    )
+    pointers = SSAValue(
+        id=3,
+        ty=BlockType(output_shape, PTR_F32),
+    )
+
+    ssa_ops: list[SSAItem] = [
+        SSAOp(
+            opcode="dot",
+            operands=(lhs, rhs),
+            result=dot,
+        ),
+        SSAOp(
+            opcode="store",
+            operands=(pointers, dot, None),
+        ),
+    ]
+
+    layout = cuda_kernel_layout(ssa_ops)
+
+    assert layout.output_tile_shape == output_shape
+    assert layout.thread_shape == expected_thread_shape
+    assert layout.threads_per_block <= 32
+
+    register_layout = layout.register_tile_layout()
+    assert register_layout.logical_shape == output_shape
+    assert register_layout.thread_shape == expected_thread_shape
+
+
+def test_non_dot_kernel_keeps_one_thread_per_result() -> None:
+    shape = (8, 8)
+    pointers = SSAValue(
+        id=0,
+        ty=BlockType(shape, PTR_F32),
+    )
+    values = SSAValue(
+        id=1,
+        ty=BlockType(shape, F32),
+    )
+
+    layout = cuda_kernel_layout(
+        [
+            SSAOp(
+                opcode="store",
+                operands=(pointers, values, None),
+            )
+        ]
+    )
+
+    assert layout.output_tile_shape == shape
+    assert layout.thread_shape == shape
+    assert layout.register_tile_layout().register_shape == (1, 1)
