@@ -384,9 +384,7 @@ x = torch.ones(n, device="cuda", dtype=torch.float32)
 y = torch.ones(n, device="cuda", dtype=torch.float32)
 out = torch.empty_like(x)
 
-add_kernel[
-    lambda meta: (triton.cdiv(n, meta["BLOCK"]),)
-](
+add_kernel[lambda meta: (triton.cdiv(n, meta["BLOCK"]),)](
     x,
     y,
     out,
