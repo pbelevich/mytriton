@@ -16,6 +16,7 @@ from mytriton.cuda_codegen import (
     SSACUDACodegen,
 )
 from mytriton.cuda_dot_staging import (
+    CudaDotDoubleBufferingPlan,
     CudaDotOperandMatcher,
     CudaDotSharedBuffers,
     CudaDotStagingAnalysis,
@@ -25,6 +26,8 @@ from mytriton.cuda_dot_staging import (
     CudaGlobalTilePlan,
     CudaSharedBuffer,
     SSADefinitions,
+    cuda_f32_shared_row_padding,
+    match_cuda_dot_double_buffering,
 )
 from mytriton.ssa import (
     SSAForRange,
@@ -314,6 +317,7 @@ def test_cuda_codegen_stages_both_dot_operands() -> None:
             name="dot_lhs_7",
             logical_shape=(4, 16),
             element_ty=F32,
+            row_padding=1,
         ),
         rhs=CudaSharedBuffer(
             name="dot_rhs_7",
@@ -322,9 +326,10 @@ def test_cuda_codegen_stages_both_dot_operands() -> None:
         ),
     )
     assert buffers.reduction_size == 16
+    assert codegen.shared_memory_bytes == (68 + 128) * 4
 
     assert codegen.shared_lines == [
-        "    __shared__ float dot_lhs_7[64];",
+        "    __shared__ float dot_lhs_7[68];",
         "    __shared__ float dot_rhs_7[128];",
     ]
 
@@ -340,7 +345,7 @@ def test_cuda_codegen_stages_both_dot_operands() -> None:
         "dot_lhs_7_global_column < (K);"
     )
     assert codegen.lines[7] == (
-        "        dot_lhs_7[(dot_lhs_7_row) * 16 + "
+        "        dot_lhs_7[(dot_lhs_7_row) * 17 + "
         "(dot_lhs_7_column)] = dot_lhs_7_in_bounds ? "
         "a[dot_lhs_7_source_index] : 0.0f;"
     )
@@ -550,8 +555,10 @@ def test_cuda_codegen_stages_dot_operands_from_ssa() -> None:
     )
 
     assert buffers.reduction_size == 16
+    assert buffers.lhs.row_padding == 1
+    assert buffers.rhs.row_padding == 0
     assert codegen.shared_lines == [
-        "    __shared__ float dot_lhs_29[64];",
+        "    __shared__ float dot_lhs_29[68];",
         "    __shared__ float dot_rhs_29[128];",
     ]
 
@@ -684,7 +691,7 @@ def test_cuda_generate_lowers_dot_to_cuda_cores() -> None:
         """\
         extern "C" __global__
         void cuda_core_dot_kernel(float* a, float* b, float* out, int M, int N, int K, int k_base) {
-            __shared__ float dot_lhs_29[64];
+            __shared__ float dot_lhs_29[68];
             __shared__ float dot_rhs_29[128];
 
             int tile_i = threadIdx.x / 8;
@@ -700,7 +707,7 @@ def test_cuda_generate_lowers_dot_to_cuda_cores() -> None:
                 int dot_lhs_29_global_column = (k_base) + dot_lhs_29_column;
                 int dot_lhs_29_source_index = dot_lhs_29_global_row * (K) + dot_lhs_29_global_column;
                 bool dot_lhs_29_in_bounds = dot_lhs_29_global_row < (M) && dot_lhs_29_global_column < (K);
-                dot_lhs_29[(dot_lhs_29_row) * 16 + (dot_lhs_29_column)] = dot_lhs_29_in_bounds ? a[dot_lhs_29_source_index] : 0.0f;
+                dot_lhs_29[(dot_lhs_29_row) * 17 + (dot_lhs_29_column)] = dot_lhs_29_in_bounds ? a[dot_lhs_29_source_index] : 0.0f;
             }
             for (int dot_rhs_29_index = threadIdx.x; dot_rhs_29_index < 128; dot_rhs_29_index += 32) {
                 int dot_rhs_29_row = dot_rhs_29_index / 8;
@@ -713,8 +720,9 @@ def test_cuda_generate_lowers_dot_to_cuda_cores() -> None:
             }
             __syncthreads();
             float v29 = 0.0f;
+            #pragma unroll
             for (int dot_k_29 = 0; dot_k_29 < 16; ++dot_k_29) {
-                v29 += dot_lhs_29[(tile_i) * 16 + (dot_k_29)] * dot_rhs_29[(dot_k_29) * 8 + (tile_j)];
+                v29 += dot_lhs_29[(tile_i) * 17 + (dot_k_29)] * dot_rhs_29[(dot_k_29) * 8 + (tile_j)];
             }
             __syncthreads();
             out[0] = v29;
@@ -797,7 +805,7 @@ def test_ast_frontend_lowers_shared_memory_dot_to_cuda(
         """\
         extern "C" __global__
         void single_tile_dot_kernel(float* a, float* b, float* out, int M, int N, int K, int k_base) {
-            __shared__ float dot_lhs_29[64];
+            __shared__ float dot_lhs_29[68];
             __shared__ float dot_rhs_29[128];
 
             int tile_i = threadIdx.x / 8;
@@ -819,7 +827,7 @@ def test_ast_frontend_lowers_shared_memory_dot_to_cuda(
                 int dot_lhs_29_global_column = (k_base) + dot_lhs_29_column;
                 int dot_lhs_29_source_index = dot_lhs_29_global_row * (K) + dot_lhs_29_global_column;
                 bool dot_lhs_29_in_bounds = dot_lhs_29_global_row < (M) && dot_lhs_29_global_column < (K);
-                dot_lhs_29[(dot_lhs_29_row) * 16 + (dot_lhs_29_column)] = dot_lhs_29_in_bounds ? a[dot_lhs_29_source_index] : 0.0f;
+                dot_lhs_29[(dot_lhs_29_row) * 17 + (dot_lhs_29_column)] = dot_lhs_29_in_bounds ? a[dot_lhs_29_source_index] : 0.0f;
             }
             for (int dot_rhs_29_index = threadIdx.x; dot_rhs_29_index < 128; dot_rhs_29_index += 32) {
                 int dot_rhs_29_row = dot_rhs_29_index / 8;
@@ -832,8 +840,9 @@ def test_ast_frontend_lowers_shared_memory_dot_to_cuda(
             }
             __syncthreads();
             float v29 = 0.0f;
+            #pragma unroll
             for (int dot_k_29 = 0; dot_k_29 < 16; ++dot_k_29) {
-                v29 += dot_lhs_29[(tile_i) * 16 + (dot_k_29)] * dot_rhs_29[(dot_k_29) * 8 + (tile_j)];
+                v29 += dot_lhs_29[(tile_i) * 17 + (dot_k_29)] * dot_rhs_29[(dot_k_29) * 8 + (tile_j)];
             }
             __syncthreads();
             int v30 = (v4 * N);
@@ -950,12 +959,21 @@ def test_runtime_k_loop_lowers_dot_with_reusable_shared_memory() -> None:
     )
 
     dot_id = dot.result.id
+    stage_name = f"dot_stage_{dot_id}"
+    lhs_stage_size = BM * (BK + 1)
+    rhs_stage_size = BK * BN
     loop_index = f"v{loop.index.id}"
     accumulator = f"v{loop.results[0].id}"
     accumulation_result = f"v{accumulation.result.id}"
 
     outer_loop = (
         f"    for (int {loop_index} = 0; {loop_index} < K; {loop_index} += {BK}) {{"
+    )
+    outer_loop_position = cuda_src.index(outer_loop)
+    stage_declaration = f"        int {stage_name} = ({loop_index} / {BK}) & 1;"
+    stage_position = cuda_src.index(
+        stage_declaration,
+        outer_loop_position,
     )
     lhs_load = f"        for (int dot_lhs_{dot_id}_index = threadIdx.x; "
     rhs_load = f"        for (int dot_rhs_{dot_id}_index = threadIdx.x; "
@@ -965,12 +983,10 @@ def test_runtime_k_loop_lowers_dot_with_reusable_shared_memory() -> None:
     )
     barrier = "        __syncthreads();"
 
-    outer_loop_position = cuda_src.index(outer_loop)
     lhs_load_position = cuda_src.index(lhs_load, outer_loop_position)
     rhs_load_position = cuda_src.index(rhs_load, lhs_load_position)
     load_barrier_position = cuda_src.index(barrier, rhs_load_position)
     fma_position = cuda_src.index(fma_loop, load_barrier_position)
-    reuse_barrier_position = cuda_src.index(barrier, fma_position)
 
     expected_accumulation = (
         f"        float {accumulation_result} = "
@@ -979,24 +995,28 @@ def test_runtime_k_loop_lowers_dot_with_reusable_shared_memory() -> None:
     )
     accumulation_position = cuda_src.index(
         expected_accumulation,
-        reuse_barrier_position,
+        fma_position,
     )
 
     assert (
         outer_loop_position
+        < stage_position
         < lhs_load_position
         < rhs_load_position
         < load_barrier_position
         < fma_position
-        < reuse_barrier_position
         < accumulation_position
     )
 
     assert f"global_column = ({loop_index}) + dot_lhs_{dot_id}_column;" in cuda_src
     assert f"global_row = ({loop_index}) + dot_rhs_{dot_id}_row;" in cuda_src
+    assert (f"dot_lhs_{dot_id}[(({stage_name}) * {lhs_stage_size}) + ") in cuda_src
+    assert (f"dot_rhs_{dot_id}[(({stage_name}) * {rhs_stage_size}) + ") in cuda_src
+    assert (f"    __shared__ float dot_lhs_{dot_id}[{2 * lhs_stage_size}];") in cuda_src
+    assert (f"    __shared__ float dot_rhs_{dot_id}[{2 * rhs_stage_size}];") in cuda_src
 
-    assert cuda_src.count("__syncthreads();") == 2
-    assert codegen.shared_memory_bytes == (BM * BK + BK * BN) * 4
+    assert cuda_src.count("__syncthreads();") == 1
+    assert codegen.shared_memory_bytes == 2 * (BM * (BK + 1) + BK * BN) * 4
 
 
 @pytest.mark.execution
@@ -1148,6 +1168,7 @@ def test_cuda_codegen_computes_dot_from_shared_memory() -> None:
 
     assert codegen.lines == [
         "    float v7 = 0.0f;",
+        "    #pragma unroll",
         "    for (int dot_k_7 = 0; dot_k_7 < 16; ++dot_k_7) {",
         (
             "        v7 += "
@@ -1158,6 +1179,44 @@ def test_cuda_codegen_computes_dot_from_shared_memory() -> None:
         "    __syncthreads();",
     ]
     assert codegen.values[result.id] == "v7"
+
+
+def test_double_buffered_dot_skips_reuse_barrier() -> None:
+    codegen = SSACUDACodegen()
+    codegen.layout = CudaKernelLayout(
+        output_tile_shape=(4, 8),
+        thread_shape=(4, 8),
+    )
+
+    result = SSAValue(
+        id=7,
+        ty=BlockType((4, 8), F32),
+    )
+    buffers = CudaDotSharedBuffers(
+        lhs=CudaSharedBuffer(
+            name="dot_lhs_7",
+            logical_shape=(4, 16),
+            element_ty=F32,
+            row_padding=1,
+            stage_count=2,
+        ),
+        rhs=CudaSharedBuffer(
+            name="dot_rhs_7",
+            logical_shape=(16, 8),
+            element_ty=F32,
+            stage_count=2,
+        ),
+    )
+
+    codegen.emit_dot_from_shared_memory(
+        result,
+        buffers,
+        stage="stage",
+        emit_reuse_barrier=False,
+    )
+
+    assert codegen.lines[-1] == "    }"
+    assert "__syncthreads();" not in codegen.lines
 
 
 def test_cuda_core_dot_rejects_mismatched_reduction_dimensions() -> None:
@@ -1263,6 +1322,7 @@ def test_cuda_core_dot_emits_multiple_accumulators_per_thread() -> None:
     assert codegen.lines == [
         "    float v7_0_0 = 0.0f;",
         "    float v7_1_0 = 0.0f;",
+        "    #pragma unroll",
         "    for (int dot_k_7 = 0; dot_k_7 < 16; ++dot_k_7) {",
         (
             "        v7_0_0 += "
@@ -2066,6 +2126,9 @@ def test_runtime_k_loop_carries_multiple_results_per_thread(
     accumulation_id = accumulation.result.id
     accumulator_id = loop.results[0].id
     index_id = loop.index.id
+    stage_name = f"dot_stage_{dot_id}"
+    lhs_stage_size = BM * BK
+    rhs_stage_size = BK * BN
 
     assert (f"    float v{accumulator_id}_0_0 = v{initial.id};") in cuda_src
     assert (f"    float v{accumulator_id}_1_0 = v{initial.id};") in cuda_src
@@ -2074,15 +2137,20 @@ def test_runtime_k_loop_carries_multiple_results_per_thread(
         f"    for (int v{index_id} = 0; v{index_id} < K; v{index_id} += {BK}) {{"
     )
     assert outer_loop in cuda_src
+    assert (f"        int {stage_name} = (v{index_id} / {BK}) & 1;") in cuda_src
 
     assert f"        float v{dot_id}_0_0 = 0.0f;" in cuda_src
     assert f"        float v{dot_id}_1_0 = 0.0f;" in cuda_src
 
     assert (
         f"        v{dot_id}_1_0 += "
-        f"dot_lhs_{dot_id}[(tile_i + 4) * {BK} + "
+        f"dot_lhs_{dot_id}[(({stage_name}) * "
+        f"{lhs_stage_size}) + "
+        f"(tile_i + 4) * {BK} + "
         f"(dot_k_{dot_id})] * "
-        f"dot_rhs_{dot_id}[(dot_k_{dot_id}) * {BN} + "
+        f"dot_rhs_{dot_id}[(({stage_name}) * "
+        f"{rhs_stage_size}) + "
+        f"(dot_k_{dot_id}) * {BN} + "
         "(tile_j)];"
     ) in cuda_src
 
@@ -2098,7 +2166,7 @@ def test_runtime_k_loop_carries_multiple_results_per_thread(
     )
     assert expected_update in cuda_src
 
-    assert cuda_src.count("__syncthreads();") == 2
+    assert cuda_src.count("__syncthreads();") == 1
 
 
 @pytest.mark.execution
@@ -2222,3 +2290,389 @@ def test_tiled_matmul_executes_two_dimensional_register_tile(
         rtol=1e-5,
         atol=1e-5,
     )
+
+
+def test_cuda_shared_buffer_supports_padded_rows() -> None:
+    buffer = CudaSharedBuffer(
+        name="dot_lhs_7",
+        logical_shape=(4, 16),
+        element_ty=F32,
+        row_padding=1,
+    )
+
+    assert buffer.rows == 4
+    assert buffer.columns == 16
+    assert buffer.row_stride == 17
+    assert buffer.size == 68
+    assert buffer.nbytes == 272
+    assert buffer.offset(3, 15) == 66
+    assert buffer.element("row", "column") == ("dot_lhs_7[(row) * 17 + (column)]")
+
+
+def test_padded_lhs_rows_use_distinct_shared_memory_banks() -> None:
+    unpadded = CudaSharedBuffer(
+        name="unpadded",
+        logical_shape=(4, 16),
+        element_ty=F32,
+    )
+    padded = CudaSharedBuffer(
+        name="padded",
+        logical_shape=(4, 16),
+        element_ty=F32,
+        row_padding=1,
+    )
+
+    unpadded_banks = tuple(unpadded.offset(row, 0) % 32 for row in range(4))
+    padded_banks = tuple(padded.offset(row, 0) % 32 for row in range(4))
+
+    assert unpadded_banks == (0, 16, 0, 16)
+    assert padded_banks == (0, 17, 2, 19)
+    assert len(set(padded_banks)) == 4
+
+
+@pytest.mark.parametrize(
+    ("columns", "simultaneous_rows", "expected_padding"),
+    [
+        (16, 4, 1),
+        (16, 2, 0),
+        (8, 4, 0),
+        (8, 8, 1),
+        (32, 2, 1),
+        (7, 4, 0),
+    ],
+)
+def test_cuda_f32_shared_row_padding(
+    columns: int,
+    simultaneous_rows: int,
+    expected_padding: int,
+) -> None:
+    assert (
+        cuda_f32_shared_row_padding(
+            columns=columns,
+            simultaneous_rows=simultaneous_rows,
+        )
+        == expected_padding
+    )
+
+
+@pytest.mark.parametrize(
+    ("columns", "simultaneous_rows"),
+    [
+        (0, 4),
+        (-1, 4),
+        (16, 0),
+        (16, 33),
+    ],
+)
+def test_cuda_f32_shared_row_padding_rejects_invalid_arguments(
+    columns: int,
+    simultaneous_rows: int,
+) -> None:
+    with pytest.raises(ValueError):
+        cuda_f32_shared_row_padding(
+            columns=columns,
+            simultaneous_rows=simultaneous_rows,
+        )
+
+
+def test_cuda_shared_buffer_supports_multiple_stages() -> None:
+    buffer = CudaSharedBuffer(
+        name="dot_lhs_7",
+        logical_shape=(4, 16),
+        element_ty=F32,
+        row_padding=1,
+        stage_count=2,
+    )
+
+    assert buffer.stage_size == 68
+    assert buffer.size == 136
+    assert buffer.nbytes == 544
+
+    assert buffer.offset(0, 0, stage=0) == 0
+    assert buffer.offset(3, 15, stage=0) == 66
+    assert buffer.offset(0, 0, stage=1) == 68
+    assert buffer.offset(3, 15, stage=1) == 134
+
+    assert buffer.element(
+        "row",
+        "column",
+        stage="stage",
+    ) == ("dot_lhs_7[((stage) * 68) + (row) * 17 + (column)]")
+
+
+def test_multi_stage_shared_buffer_requires_stage_expression() -> None:
+    buffer = CudaSharedBuffer(
+        name="tile",
+        logical_shape=(4, 16),
+        element_ty=F32,
+        stage_count=2,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="requires a stage expression",
+    ):
+        buffer.element("row", "column")
+
+
+@pytest.mark.parametrize("stage_count", [0, -1, True])
+def test_cuda_shared_buffer_rejects_invalid_stage_count(
+    stage_count: int,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="stage count must be a positive integer",
+    ):
+        CudaSharedBuffer(
+            name="tile",
+            logical_shape=(4, 16),
+            element_ty=F32,
+            stage_count=stage_count,
+        )
+
+
+def test_cuda_codegen_uses_same_stage_for_loads_and_dot() -> None:
+    codegen = SSACUDACodegen()
+    codegen.layout = CudaKernelLayout(
+        output_tile_shape=(4, 8),
+        thread_shape=(4, 8),
+    )
+
+    buffers = codegen.emit_dot_operand_staging(
+        dot_result_id=7,
+        lhs_shape=(4, 16),
+        rhs_shape=(16, 8),
+        element_ty=F32,
+        lhs_source=CudaGlobalTile(
+            base="a",
+            row_offset="blockIdx.x * 4",
+            column_offset="k_base",
+            row_stride="K",
+            row_bound="M",
+            column_bound="K",
+        ),
+        rhs_source=CudaGlobalTile(
+            base="b",
+            row_offset="k_base",
+            column_offset="blockIdx.y * 8",
+            row_stride="N",
+            row_bound="K",
+            column_bound="N",
+        ),
+        stage_count=2,
+        stage="stage",
+    )
+
+    result = SSAValue(
+        id=7,
+        ty=BlockType((4, 8), F32),
+    )
+    codegen.emit_dot_from_shared_memory(
+        result,
+        buffers,
+        stage="stage",
+    )
+
+    assert buffers.stage_count == 2
+    assert codegen.shared_memory_bytes == (136 + 256) * 4
+    assert codegen.shared_lines == [
+        "    __shared__ float dot_lhs_7[136];",
+        "    __shared__ float dot_rhs_7[256];",
+    ]
+
+    assert codegen.lines[7] == (
+        "        dot_lhs_7[((stage) * 68) + "
+        "(dot_lhs_7_row) * 17 + "
+        "(dot_lhs_7_column)] = "
+        "dot_lhs_7_in_bounds ? "
+        "a[dot_lhs_7_source_index] : 0.0f;"
+    )
+    assert codegen.lines[16] == (
+        "        dot_rhs_7[((stage) * 128) + "
+        "(dot_rhs_7_row) * 8 + "
+        "(dot_rhs_7_column)] = "
+        "dot_rhs_7_in_bounds ? "
+        "b[dot_rhs_7_source_index] : 0.0f;"
+    )
+    assert (
+        "        v7 += "
+        "dot_lhs_7[((stage) * 68) + "
+        "(tile_i) * 17 + (dot_k_7)] * "
+        "dot_rhs_7[((stage) * 128) + "
+        "(dot_k_7) * 8 + (tile_j)];"
+    ) in codegen.lines
+
+
+def test_dot_shared_buffers_reject_mismatched_stage_counts() -> None:
+    with pytest.raises(
+        ValueError,
+        match="matching stage counts",
+    ):
+        CudaDotSharedBuffers(
+            lhs=CudaSharedBuffer(
+                name="lhs",
+                logical_shape=(4, 16),
+                element_ty=F32,
+                stage_count=2,
+            ),
+            rhs=CudaSharedBuffer(
+                name="rhs",
+                logical_shape=(16, 8),
+                element_ty=F32,
+            ),
+        )
+
+
+def test_double_buffering_matcher_accepts_canonical_k_loop() -> None:
+    M, N, K = 4, 8, 32
+    BM, BK, BN = 4, 16, 8
+
+    a = np.zeros((M, K), dtype=np.float32)
+    b = np.zeros((K, N), dtype=np.float32)
+    out = np.zeros((M, N), dtype=np.float32)
+
+    bound = tiled_matmul_kernel.signature.bind(
+        a,
+        b,
+        out,
+        M,
+        N,
+        K,
+        BM=BM,
+        BK=BK,
+        BN=BN,
+    )
+    runtime_params = make_runtime_params(
+        tiled_matmul_kernel.signature,
+        bound.arguments,
+    )
+    traced_ops, _ = trace_ast(
+        tiled_matmul_kernel.fn,
+        tiled_matmul_kernel.signature,
+        bound.arguments,
+        runtime_params=runtime_params,
+    )
+    ssa_ops = SSALowering().lower(traced_ops)
+
+    loop = next(item for item in ssa_ops if isinstance(item, SSAForRange))
+    dot = next(
+        item for item in loop.body if isinstance(item, SSAOp) and item.opcode == "dot"
+    )
+    assert dot.result is not None
+
+    analysis = CudaDotStagingAnalyzer(SSADefinitions(ssa_ops)).analyze()
+
+    assert match_cuda_dot_double_buffering(
+        loop,
+        analysis,
+    ) == CudaDotDoubleBufferingPlan(
+        dot_result_id=dot.result.id,
+    )
+
+    loop.step = Const(BK // 2)
+
+    assert (
+        match_cuda_dot_double_buffering(
+            loop,
+            analysis,
+        )
+        is None
+    )
+
+    loop.step = Const(BK)
+    loop.start = Const(BK)
+
+    assert (
+        match_cuda_dot_double_buffering(
+            loop,
+            analysis,
+        )
+        is None
+    )
+
+    loop.start = Const(False)
+
+    assert (
+        match_cuda_dot_double_buffering(
+            loop,
+            analysis,
+        )
+        is None
+    )
+
+    loop.start = Const(0)
+    accumulation = next(
+        item
+        for item in loop.body
+        if (
+            isinstance(item, SSAOp)
+            and item.opcode == "add"
+            and dot.result in item.operands
+        )
+    )
+    accumulation.opcode = "mul"
+
+    assert (
+        match_cuda_dot_double_buffering(
+            loop,
+            analysis,
+        )
+        is None
+    )
+
+    accumulation.opcode = "add"
+    loop.start = Const(0)
+    loop.step = Const(BK // 2)
+
+    fallback_codegen = SSACUDACodegen()
+    fallback_cuda_src = fallback_codegen.generate(
+        kernel_name="fallback_matmul_kernel",
+        ssa_ops=ssa_ops,
+        params=runtime_params,
+    )
+
+    assert f"dot_stage_{dot.result.id}" not in fallback_cuda_src
+    assert fallback_cuda_src.count("__syncthreads();") == 2
+    assert fallback_codegen.shared_memory_bytes == (BM * (BK + 1) + BK * BN) * 4
+    assert (
+        f"    __shared__ float dot_lhs_{dot.result.id}[{BM * (BK + 1)}];"
+    ) in fallback_cuda_src
+    assert (
+        f"    __shared__ float dot_rhs_{dot.result.id}[{BK * BN}];"
+    ) in fallback_cuda_src
+
+
+def test_double_buffering_rejects_shared_memory_over_budget() -> None:
+    codegen = SSACUDACodegen()
+    codegen.layout = CudaKernelLayout(
+        output_tile_shape=(64, 64),
+        thread_shape=(4, 8),
+    )
+
+    source = CudaGlobalTile(
+        base="x",
+        row_offset="0",
+        column_offset="0",
+        row_stride="64",
+        row_bound="64",
+        column_bound="64",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="exceeding the conservative 49152-byte limit",
+    ):
+        codegen.emit_dot_operand_staging(
+            dot_result_id=7,
+            lhs_shape=(64, 64),
+            rhs_shape=(64, 64),
+            element_ty=F32,
+            lhs_source=source,
+            rhs_source=source,
+            stage_count=2,
+            stage="stage",
+        )
+
+    assert codegen.shared_memory_bytes == 0
+    assert codegen.shared_lines == []
+    assert codegen.lines == []
