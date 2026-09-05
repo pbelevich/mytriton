@@ -73,6 +73,10 @@ MLIR's GPU/NVVM stack to a cubin.
   tensor arguments, framework-independent runtime array metadata, zero-copy
   DLPack conversion for CUDA tensors, same-device validation, execution on the
   current PyTorch CUDA stream, and Torch-backed CUDA and MLIR execution tests.
+- [ver18](https://github.com/pbelevich/mytriton/tree/ver18): conflict-aware
+  shared-memory row padding for A tiles, compile-time-unrolled CUDA-core dot
+  loops, two-stage ping-pong buffers for canonical runtime K loops, fewer block
+  barriers, and conservative shared-memory budget validation.
 
 ## AST frontend
 
@@ -365,6 +369,71 @@ CUDA-core FMA loop, safe shared-buffer reuse, and execution across multiple
 K-tiles. Version 16 separates the physical thread tile from the logical dot
 output, carries register-tile accumulators through runtime K-loops, and emits a
 masked store for every result owned by a thread.
+
+## Shared-memory layout optimization
+
+Version 18 makes the shared-memory implementation more explicit. A shared
+buffer now records its logical shape separately from its physical row stride:
+
+```text
+row_stride = columns + row_padding
+stage_size = rows * row_stride
+offset(stage, row, column) =
+    stage * stage_size + row * row_stride + column
+```
+
+This distinction lets the backend change the physical layout without changing
+the logical `[rows, columns]` tile seen by `tl.dot`. It also lets one allocation
+hold several copies, or stages, of the same logical tile.
+
+CUDA shared memory has 32 banks, and consecutive `f32` values map to
+consecutive banks. During the dot loop, several output rows may read the same
+column from different rows of A. When the A row stride shares a large common
+factor with 32, those reads can repeatedly select the same banks. The backend
+detects that case from the CUDA thread layout and adds one padding element to
+each A row when it increases the number of distinct banks reached. B remains
+unpadded because the current access pattern broadcasts its values rather than
+performing the corresponding cross-row access.
+
+For canonical runtime K loops, the backend allocates two stages for both A and
+B. Iteration `k_base` selects its stage with:
+
+```cpp
+int dot_stage = (k_base / BK) & 1;
+```
+
+Consecutive iterations therefore alternate between stage 0 and stage 1. Each
+iteration cooperatively fills its selected stage, synchronizes the block, and
+then runs the CUDA-core FMA loop over that stage. Since the next iteration
+writes the other stage, the trailing shared-buffer reuse barrier can be
+omitted. This is safe under the current at-most-one-warp dot layout policy.
+
+The optimization is deliberately matched only for the canonical form:
+
+```python
+acc = tl.zeros((BM, BN), tl.float32)
+
+for k_base in range(0, K, BK):
+    # A uses k_base as its column origin.
+    # B uses k_base as its row origin.
+    acc = acc + tl.dot(a_values, b_values)
+```
+
+The loop must start at zero, advance by the dot reduction width, contain one
+stageable dot, and carry and yield only its accumulator. Nested loops and loops
+with additional operations use the existing single-stage implementation with
+both synchronization barriers. Keeping this conservative fallback prevents an
+optimization matcher from changing the semantics of more general loops.
+
+The generated reduction loop also receives `#pragma unroll`, allowing the CUDA
+compiler to unroll its compile-time-known `BK` trip count. Before emitting a
+kernel, the backend accounts for row padding and every stage and rejects a dot
+whose shared allocations exceed the current 48 KiB per-block budget.
+
+The two stages currently provide ping-pong storage and barrier elimination;
+they do not yet overlap loading the next tile with computing the current one.
+True asynchronous prefetching is deferred until the backend has the alignment
+metadata and `cp.async` support needed to implement it safely.
 
 ## PyTorch tensor interoperability
 
@@ -672,10 +741,11 @@ these rewrite passes because they are not region-aware yet.
   canonical `tl.dot` operands. A `[BM, BK]` and B `[BK, BN]` are loaded
   cooperatively into shared memory, each thread computes a rank-2 register tile
   of C elements, and a runtime CUDA loop can traverse the complete K dimension.
-  The implementation prioritizes correctness over performance: it has a fixed
-  one-warp-at-most dot layout policy and no vectorized loads, shared-memory
-  padding or swizzling, double buffering, asynchronous copies, tensor-core
-  instructions, or autotuning yet.
+  Conflict-aware row padding reduces bank conflicts for A, and canonical K
+  loops alternate between two shared-memory stages to remove a tile-reuse
+  barrier. The implementation still has a fixed one-warp-at-most dot layout
+  policy and no vectorized loads, general shared-memory swizzling, overlapped
+  prefetching, asynchronous copies, tensor-core instructions, or autotuning.
   `tl.empty`, `tl.full`, and `tl.zeros` continue to represent logical
   per-thread values rather than shared-memory allocations.
 - MLIR lowering currently supports only `ptr<f32>` parameters as
