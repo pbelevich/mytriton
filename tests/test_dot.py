@@ -106,24 +106,24 @@ def test_dot_rejects_mismatched_inner_dimensions() -> None:
         TypeInference().infer(tl.dot(lhs, rhs).expr)
 
 
-def test_dot_rejects_non_f32_lhs() -> None:
+def test_dot_rejects_unsupported_lhs_element_type() -> None:
     lhs = tl.zeros((4, 16), tl.int32)
     rhs = tl.zeros((16, 8), tl.float32)
 
     with pytest.raises(
         TypeError,
-        match="dot lhs must have f32 elements",
+        match="dot lhs must have f16, bf16, or f32 elements",
     ):
         TypeInference().infer(tl.dot(lhs, rhs).expr)
 
 
-def test_dot_rejects_non_f32_rhs() -> None:
+def test_dot_rejects_unsupported_rhs_element_type() -> None:
     lhs = tl.zeros((4, 16), tl.float32)
     rhs = tl.zeros((16, 8), tl.int32)
 
     with pytest.raises(
         TypeError,
-        match="dot rhs must have f32 elements",
+        match="dot rhs must have f16, bf16, or f32 elements",
     ):
         TypeInference().infer(tl.dot(lhs, rhs).expr)
 
@@ -270,7 +270,7 @@ def test_dot_verifier_rejects_non_rank2_rhs() -> None:
         SSAVerifier(block_size=32).verify(ops)
 
 
-def test_dot_verifier_rejects_non_f32_lhs() -> None:
+def test_dot_verifier_rejects_unsupported_lhs_element_type() -> None:
     ops = make_dot_ssa(
         lhs_ty=BlockType((4, 16), I32),
         rhs_ty=BlockType((16, 8), F32),
@@ -279,12 +279,12 @@ def test_dot_verifier_rejects_non_f32_lhs() -> None:
 
     with pytest.raises(
         CompileError,
-        match="dot lhs must have f32 elements",
+        match="dot lhs must have f16, bf16, or f32 elements",
     ):
         SSAVerifier(block_size=32).verify(ops)
 
 
-def test_dot_verifier_rejects_non_f32_rhs() -> None:
+def test_dot_verifier_rejects_unsupported_rhs_element_type() -> None:
     ops = make_dot_ssa(
         lhs_ty=BlockType((4, 16), F32),
         rhs_ty=BlockType((16, 8), I32),
@@ -293,7 +293,7 @@ def test_dot_verifier_rejects_non_f32_rhs() -> None:
 
     with pytest.raises(
         CompileError,
-        match="dot rhs must have f32 elements",
+        match="dot rhs must have f16, bf16, or f32 elements",
     ):
         SSAVerifier(block_size=32).verify(ops)
 

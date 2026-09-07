@@ -6,6 +6,7 @@ from .trace import (
     AddPtr,
     Arange,
     BinOp,
+    Cast,
     Const,
     Dot,
     Empty,
@@ -170,6 +171,16 @@ class SSALowering:
                 "dot",
                 expr,
                 operands=(lhs, rhs),
+            )
+
+        if isinstance(expr, Cast):
+            value = self.lower_expr(expr.value)
+
+            return self.emit(
+                "cast",
+                expr,
+                operands=(value,),
+                attrs={"dtype": expr.dtype},
             )
 
         if isinstance(expr, BinOp):

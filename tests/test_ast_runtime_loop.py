@@ -256,7 +256,7 @@ def test_nested_runtime_for_loops(monkeypatch):
                 }
                 v9 = v8;
             }
-            out[v0] = v9;
+            out[v0] = static_cast<float>(v9);
         }
         """
     ).rstrip("\n")
