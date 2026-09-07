@@ -16,7 +16,9 @@ from .cuda_dot_staging import (
     CudaGlobalTilePlan,
     CudaSharedBuffer,
     SSADefinitions,
+    cuda_f32_shared_row_padding,
     cuda_scalar_nbytes,
+    match_cuda_dot_double_buffering,
 )
 from .ssa import SSAForRange, SSAItem, SSAOp, SSAOperand, SSAValue
 from .trace import (
@@ -311,6 +313,7 @@ class SSACUDACodegen:
         target: CudaSharedBuffer,
         source: CudaGlobalTile,
         *,
+        stage: str | None = None,
         order: tuple[int, ...] = (1, 0),
     ) -> None:
         cooperative_layout = self.layout.cooperative_tile_layout(
@@ -352,7 +355,7 @@ class SSACUDACodegen:
                     f"{global_column} < ({source.column_bound});"
                 ),
                 (
-                    f"        {target.element(row, column)} = "
+                    f"        {target.element(row, column, stage=stage)} = "
                     f"{in_bounds} ? "
                     f"{source.base}[{source_index}] : {source.other};"
                 ),
@@ -371,6 +374,9 @@ class SSACUDACodegen:
         element_ty: ScalarType,
         lhs_source: CudaGlobalTile,
         rhs_source: CudaGlobalTile,
+        *,
+        stage_count: int = 1,
+        stage: str | None = None,
     ) -> CudaDotSharedBuffers:
         if len(lhs_shape) != 2 or len(rhs_shape) != 2 or lhs_shape[1] != rhs_shape[0]:
             raise ValueError(
@@ -378,15 +384,27 @@ class SSACUDACodegen:
                 f"got {lhs_shape} and {rhs_shape}"
             )
 
+        lhs_row_padding = (
+            cuda_f32_shared_row_padding(
+                columns=lhs_shape[1],
+                simultaneous_rows=self.layout.thread_shape[0],
+            )
+            if element_ty == F32
+            else 0
+        )
+
         lhs = CudaSharedBuffer(
             name=f"dot_lhs_{dot_result_id}",
             logical_shape=lhs_shape,
             element_ty=element_ty,
+            row_padding=lhs_row_padding,
+            stage_count=stage_count,
         )
         rhs = CudaSharedBuffer(
             name=f"dot_rhs_{dot_result_id}",
             logical_shape=rhs_shape,
             element_ty=element_ty,
+            stage_count=stage_count,
         )
 
         # Reserve both operands before mutating the generated CUDA fragment.
@@ -394,8 +412,16 @@ class SSACUDACodegen:
         self.append_shared_buffer_declaration(lhs)
         self.append_shared_buffer_declaration(rhs)
 
-        self.emit_cooperative_load(lhs, lhs_source)
-        self.emit_cooperative_load(rhs, rhs_source)
+        self.emit_cooperative_load(
+            lhs,
+            lhs_source,
+            stage=stage,
+        )
+        self.emit_cooperative_load(
+            rhs,
+            rhs_source,
+            stage=stage,
+        )
         self.emit_block_barrier()
 
         return CudaDotSharedBuffers(
@@ -407,6 +433,9 @@ class SSACUDACodegen:
         self,
         result: SSAValue,
         buffers: CudaDotSharedBuffers,
+        *,
+        stage: str | None = None,
+        emit_reuse_barrier: bool = True,
     ) -> None:
         if not isinstance(result.ty, BlockType) or result.ty.rank != 2:
             raise TypeError(f"CUDA-core dot requires a rank-2 result, got {result.ty}")
@@ -463,6 +492,7 @@ class SSACUDACodegen:
             result_element = result_ref.element(register_coordinate)
             self.lines.append(f"    float {result_element} = 0.0f;")
 
+        self.lines.append("    #pragma unroll")
         self.lines.append(
             f"    for (int {reduction_index} = 0; "
             f"{reduction_index} < {buffers.reduction_size}; "
@@ -478,10 +508,12 @@ class SSACUDACodegen:
             lhs_element = buffers.lhs.element(
                 row,
                 reduction_index,
+                stage=stage,
             )
             rhs_element = buffers.rhs.element(
                 reduction_index,
                 column,
+                stage=stage,
             )
 
             self.lines.append(
@@ -495,9 +527,10 @@ class SSACUDACodegen:
         else:
             self.values[result.id] = result_ref
 
-        # All threads must finish reading the current tiles before another
-        # runtime K-loop iteration overwrites the shared buffers.
-        self.emit_block_barrier()
+        # A single-stage loop must finish all reads before overwriting the
+        # same shared storage. Ping-pong buffers write the other stage.
+        if emit_reuse_barrier:
+            self.emit_block_barrier()
 
     def resolve_global_tile(
         self,
@@ -524,6 +557,9 @@ class SSACUDACodegen:
         self,
         op: SSAOp,
         plan: CudaDotStagingPlan,
+        *,
+        stage_count: int = 1,
+        stage: str | None = None,
     ) -> CudaDotSharedBuffers:
         if op.opcode != "dot":
             raise TypeError(
@@ -570,6 +606,8 @@ class SSACUDACodegen:
             element_ty=element_ty,
             lhs_source=lhs_source,
             rhs_source=rhs_source,
+            stage_count=stage_count,
+            stage=stage,
         )
 
     def is_staging_only(self, op: SSAOp) -> bool:
@@ -732,6 +770,11 @@ class SSACUDACodegen:
         self.assign(result, f"{shared}[0]")
 
     def emit_for_range(self, loop: SSAForRange) -> None:
+        double_buffering = match_cuda_dot_double_buffering(
+            loop,
+            self.staging_analysis,
+        )
+
         start = self.expression_operand(loop.start)
         stop = self.expression_operand(loop.stop)
         step = self.expression_operand(loop.step)
@@ -798,11 +841,37 @@ class SSACUDACodegen:
 
         body_start = len(self.lines)
 
+        stage_name: str | None = None
+
+        if double_buffering is not None:
+            stage_name = f"dot_stage_{double_buffering.dot_result_id}"
+            self.lines.append(f"    int {stage_name} = ({index_name} / {step}) & 1;")
+
         for body_op in loop.body:
             if isinstance(body_op, SSAForRange):
                 self.emit_for_range(body_op)
-            elif not self.is_staging_only(body_op):
-                self.emit(body_op)
+                continue
+
+            if self.is_staging_only(body_op):
+                continue
+
+            if (
+                double_buffering is not None
+                and body_op.opcode == "dot"
+                and body_op.result is not None
+                and body_op.result.id == double_buffering.dot_result_id
+            ):
+                assert stage_name is not None
+                self.emit_dot(
+                    body_op,
+                    body_op.result,
+                    stage_count=double_buffering.stage_count,
+                    stage=stage_name,
+                    emit_reuse_barrier=False,
+                )
+                continue
+
+            self.emit(body_op)
 
         for yielded, carried_value in zip(
             loop.yields,
@@ -1121,6 +1190,32 @@ class SSACUDACodegen:
         )
         self.assign(result, expression)
 
+    def emit_dot(
+        self,
+        op: SSAOp,
+        result: SSAValue,
+        *,
+        stage_count: int = 1,
+        stage: str | None = None,
+        emit_reuse_barrier: bool = True,
+    ) -> None:
+        if result.id not in self.staging_analysis.stageable_dot_ids:
+            raise TypeError("CUDA lowering for tl.dot is not implemented")
+
+        plan = self.staging_analysis.plan_for(result.id)
+        buffers = self.emit_dot_operand_staging_from_ssa(
+            op,
+            plan,
+            stage_count=stage_count,
+            stage=stage,
+        )
+        self.emit_dot_from_shared_memory(
+            result,
+            buffers,
+            stage=stage,
+            emit_reuse_barrier=emit_reuse_barrier,
+        )
+
     def emit(self, op: SSAOp) -> None:
         if op.opcode == "store":
             self.emit_store(op)
@@ -1159,18 +1254,7 @@ class SSACUDACodegen:
             zero = False if element_ty == BOOL else 0.0 if element_ty == F32 else 0
             self.assign(result, self.literal(zero))
         elif op.opcode == "dot":
-            if result.id not in self.staging_analysis.stageable_dot_ids:
-                raise TypeError("CUDA lowering for tl.dot is not implemented")
-
-            plan = self.staging_analysis.plan_for(result.id)
-            buffers = self.emit_dot_operand_staging_from_ssa(
-                op,
-                plan,
-            )
-            self.emit_dot_from_shared_memory(
-                result,
-                buffers,
-            )
+            self.emit_dot(op, result)
         elif op.opcode in self.BINARY_OPS:
             self.emit_binary(op, result)
         elif op.opcode == "addptr":

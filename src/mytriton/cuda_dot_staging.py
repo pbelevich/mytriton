@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from math import gcd
 
 from .ssa import SSAForRange, SSAItem, SSAOp, SSAOperand, SSAValue
 from .trace import F32, I32, BlockType, Const, Param, PointerType, ScalarType
@@ -13,11 +14,45 @@ def cuda_scalar_nbytes(ty: ScalarType) -> int:
     raise TypeError(f"cannot determine CUDA storage size for {ty}")
 
 
+CUDA_SHARED_MEMORY_BANKS = 32
+
+
+def cuda_f32_shared_row_padding(
+    *,
+    columns: int,
+    simultaneous_rows: int,
+) -> int:
+    """Return one padding element when row reads would conflict."""
+
+    if type(columns) is not int or columns <= 0:
+        raise ValueError(
+            f"shared-memory columns must be a positive integer, got {columns}"
+        )
+
+    if (
+        type(simultaneous_rows) is not int
+        or not 1 <= simultaneous_rows <= CUDA_SHARED_MEMORY_BANKS
+    ):
+        raise ValueError(
+            "simultaneous shared-memory rows must be between 1 and "
+            f"{CUDA_SHARED_MEMORY_BANKS}, got {simultaneous_rows}"
+        )
+
+    distinct_banks = CUDA_SHARED_MEMORY_BANKS // gcd(
+        columns,
+        CUDA_SHARED_MEMORY_BANKS,
+    )
+
+    return int(simultaneous_rows > distinct_banks)
+
+
 @dataclass(frozen=True)
 class CudaSharedBuffer:
     name: str
     logical_shape: tuple[int, ...]
     element_ty: ScalarType
+    row_padding: int = 0
+    stage_count: int = 1
 
     def __post_init__(self) -> None:
         if len(self.logical_shape) != 2 or any(
@@ -26,6 +61,18 @@ class CudaSharedBuffer:
             raise ValueError(
                 "shared buffer must be a positive rank-2 tile, "
                 f"got {self.logical_shape}"
+            )
+
+        if type(self.row_padding) is not int or self.row_padding < 0:
+            raise ValueError(
+                "shared buffer row padding must be a non-negative integer, "
+                f"got {self.row_padding}"
+            )
+
+        if type(self.stage_count) is not int or self.stage_count <= 0:
+            raise ValueError(
+                "shared buffer stage count must be a positive integer, "
+                f"got {self.stage_count}"
             )
 
     @property
@@ -37,15 +84,66 @@ class CudaSharedBuffer:
         return self.logical_shape[1]
 
     @property
+    def row_stride(self) -> int:
+        return self.columns + self.row_padding
+
+    @property
+    def stage_size(self) -> int:
+        return self.rows * self.row_stride
+
+    @property
     def size(self) -> int:
-        return self.rows * self.columns
+        return self.stage_count * self.stage_size
 
     @property
     def nbytes(self) -> int:
         return self.size * cuda_scalar_nbytes(self.element_ty)
 
-    def element(self, row: str, column: str) -> str:
-        return f"{self.name}[({row}) * {self.columns} + ({column})]"
+    def offset(
+        self,
+        row: int,
+        column: int,
+        *,
+        stage: int = 0,
+    ) -> int:
+        if not 0 <= row < self.rows or not 0 <= column < self.columns:
+            raise ValueError(
+                f"shared buffer coordinate {(row, column)} is outside "
+                f"{self.logical_shape}"
+            )
+
+        if not 0 <= stage < self.stage_count:
+            raise ValueError(
+                f"shared buffer stage {stage} is outside "
+                f"0 <= stage < {self.stage_count}"
+            )
+
+        return stage * self.stage_size + row * self.row_stride + column
+
+    def element(
+        self,
+        row: str,
+        column: str,
+        *,
+        stage: str | None = None,
+    ) -> str:
+        element_offset = f"({row}) * {self.row_stride} + ({column})"
+
+        if self.stage_count == 1:
+            if stage is not None:
+                raise ValueError(
+                    f"single-stage shared buffer {self.name} "
+                    "does not accept a stage expression"
+                )
+
+            return f"{self.name}[{element_offset}]"
+
+        if stage is None:
+            raise ValueError(
+                f"multi-stage shared buffer {self.name} requires a stage expression"
+            )
+
+        return f"{self.name}[(({stage}) * {self.stage_size}) + {element_offset}]"
 
 
 @dataclass(frozen=True)
@@ -81,9 +179,20 @@ class CudaDotSharedBuffers:
     lhs: CudaSharedBuffer
     rhs: CudaSharedBuffer
 
+    def __post_init__(self) -> None:
+        if self.lhs.stage_count != self.rhs.stage_count:
+            raise ValueError(
+                "dot shared buffers require matching stage counts, "
+                f"got {self.lhs.stage_count} and {self.rhs.stage_count}"
+            )
+
     @property
     def reduction_size(self) -> int:
         return self.lhs.columns
+
+    @property
+    def stage_count(self) -> int:
+        return self.lhs.stage_count
 
 
 class SSADefinitions:
@@ -424,3 +533,113 @@ class CudaDotStagingAnalyzer:
             dot_plans=dot_plans,
             staging_only_ids=frozenset(staging_only_ids),
         )
+
+
+@dataclass(frozen=True)
+class CudaDotDoubleBufferingPlan:
+    dot_result_id: int
+    stage_count: int = 2
+
+
+def match_cuda_dot_double_buffering(
+    loop: SSAForRange,
+    staging_analysis: CudaDotStagingAnalysis,
+) -> CudaDotDoubleBufferingPlan | None:
+    if (
+        not isinstance(loop.start, Const)
+        or type(loop.start.value) is not int
+        or loop.start.value != 0
+    ):
+        return None
+
+    if (
+        not isinstance(loop.step, Const)
+        or type(loop.step.value) is not int
+        or loop.step.value <= 0
+    ):
+        return None
+
+    if any(isinstance(item, SSAForRange) for item in loop.body):
+        return None
+
+    dots = [
+        item
+        for item in loop.body
+        if (
+            isinstance(item, SSAOp)
+            and item.opcode == "dot"
+            and item.result is not None
+            and item.result.id in staging_analysis.stageable_dot_ids
+        )
+    ]
+
+    if len(dots) != 1:
+        return None
+
+    dot = dots[0]
+    assert dot.result is not None
+
+    lhs, rhs = dot.operands
+
+    if (
+        not isinstance(lhs, SSAValue)
+        or not isinstance(lhs.ty, BlockType)
+        or not isinstance(rhs, SSAValue)
+        or not isinstance(rhs.ty, BlockType)
+    ):
+        return None
+
+    reduction_size = lhs.ty.shape[1]
+
+    if loop.step.value != reduction_size:
+        return None
+
+    staging_plan = staging_analysis.plan_for(dot.result.id)
+
+    if staging_plan.lhs.column_offset != loop.index:
+        return None
+
+    if staging_plan.rhs.row_offset != loop.index:
+        return None
+
+    emitted_ops = [
+        item
+        for item in loop.body
+        if (
+            isinstance(item, SSAOp)
+            and (
+                item.result is None
+                or item.result.id not in staging_analysis.staging_only_ids
+            )
+        )
+    ]
+
+    if len(emitted_ops) != 2 or emitted_ops[0] is not dot:
+        return None
+
+    accumulation = emitted_ops[1]
+
+    if (
+        accumulation.opcode != "add"
+        or accumulation.result is None
+        or dot.result not in accumulation.operands
+    ):
+        return None
+
+    if (
+        len(loop.carried_inputs) != 1
+        or len(loop.carried_args) != 1
+        or len(loop.yields) != 1
+        or len(loop.results) != 1
+    ):
+        return None
+
+    if loop.carried_args[0] not in accumulation.operands:
+        return None
+
+    if loop.yields[0] != accumulation.result:
+        return None
+
+    return CudaDotDoubleBufferingPlan(
+        dot_result_id=dot.result.id,
+    )
