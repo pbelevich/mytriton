@@ -4,8 +4,10 @@ from typing import ClassVar
 
 from .block_shapes import (
     CudaKernelLayout,
+    CudaMmaM16N8K8Layout,
     CudaRegisterTileLayout,
     cuda_kernel_layout,
+    cuda_mma_m16n8k8_dot_result_ids,
 )
 from .cuda_dot_staging import (
     CudaDotSharedBuffers,
@@ -20,6 +22,7 @@ from .cuda_dot_staging import (
     cuda_scalar_nbytes,
     match_cuda_dot_double_buffering,
 )
+from .cuda_target import DEFAULT_CUDA_TARGET, CudaTarget
 from .ssa import SSAForRange, SSAItem, SSAOp, SSAOperand, SSAValue
 from .trace import (
     BF16,
@@ -112,6 +115,29 @@ class CudaRegisterTileRef:
         return f"{self.base}_{row}_{column}"
 
 
+@dataclass(frozen=True)
+class CudaMmaAccumulatorRef:
+    """Four f32 accumulator registers owned by one MMA lane."""
+
+    base: str
+    layout: CudaMmaM16N8K8Layout
+
+    @property
+    def elements_per_lane(self) -> int:
+        return len(self.layout.accumulator_coordinates(0))
+
+    def element(self, index: int) -> str:
+        if type(index) is not int or not 0 <= index < self.elements_per_lane:
+            raise ValueError(
+                f"MMA accumulator element must be between 0 and 3, got {index}"
+            )
+
+        return f"{self.base}_{index}"
+
+    def elements(self) -> tuple[str, ...]:
+        return tuple(self.element(index) for index in range(self.elements_per_lane))
+
+
 class SSACUDACodegen:
     MAX_SHARED_MEMORY_BYTES: ClassVar[int] = 48 * 1024
 
@@ -124,11 +150,16 @@ class SSACUDACodegen:
         "and": "&&",
     }
 
-    def __init__(self):
+    def __init__(self, *, target: CudaTarget = DEFAULT_CUDA_TARGET):
+        self.target = target
         self.lines: list[str] = []
         self.values: dict[
             int,
-            str | CudaPtrRef | CudaArangeRef | CudaRegisterTileRef,
+            str
+            | CudaPtrRef
+            | CudaArangeRef
+            | CudaRegisterTileRef
+            | CudaMmaAccumulatorRef,
         ] = {}
         self.layout = CudaKernelLayout(
             output_tile_shape=(1,),
@@ -142,6 +173,7 @@ class SSACUDACodegen:
             dot_plans={},
             staging_only_ids=frozenset(),
         )
+        self.mma_dot_result_ids: frozenset[int] = frozenset()
 
     def cuda_type(self, ty: Type) -> str:
         if isinstance(ty, BlockType):
@@ -232,6 +264,390 @@ class SSACUDACodegen:
             return f"__float2bfloat16_rn({as_f32})"
 
         raise TypeError(f"Cannot convert CUDA value to {destination_ty}")
+
+    def pack_f16x2(
+        self,
+        low: str,
+        high: str,
+    ) -> str:
+        """Pack two f16 values into one PTX .f16x2 register."""
+
+        self.required_headers.add("#include <cuda_fp16.h>")
+
+        return (
+            "(static_cast<unsigned>("
+            f"__half_as_ushort({low})) | "
+            "(static_cast<unsigned>("
+            f"__half_as_ushort({high})) << 16))"
+        )
+
+    def pack_bf16x2(
+        self,
+        low: str,
+        high: str,
+    ) -> str:
+        """Pack two bf16 values into one PTX .bf16x2 register."""
+
+        self.required_headers.add("#include <cuda_bf16.h>")
+
+        return (
+            "(static_cast<unsigned>("
+            f"static_cast<__nv_bfloat16_raw>({low}).x) | "
+            "(static_cast<unsigned>("
+            f"static_cast<__nv_bfloat16_raw>({high}).x) << 16))"
+        )
+
+    def pack_mma_operand_pair(
+        self,
+        low: str,
+        high: str,
+        operand_ty: ScalarType,
+    ) -> str:
+        if operand_ty == F16:
+            return self.pack_f16x2(low, high)
+        if operand_ty == BF16:
+            return self.pack_bf16x2(low, high)
+
+        raise TypeError(f"m16n8k8 MMA does not support {operand_ty} operands")
+
+    def emit_mma_operand_registers(
+        self,
+        *,
+        result_id: int,
+        buffers: CudaDotSharedBuffers,
+        stage: str | None = None,
+    ) -> tuple[tuple[str, str], str]:
+        """Load one lane's packed A and B fragments from shared memory."""
+
+        mma_layout = CudaMmaM16N8K8Layout()
+
+        if self.layout.threads_per_block != mma_layout.threads_per_warp:
+            raise TypeError(
+                "m16n8k8 MMA requires exactly 32 CUDA threads, "
+                f"got {self.layout.threads_per_block}"
+            )
+
+        if (
+            buffers.lhs.logical_shape != mma_layout.lhs_shape
+            or buffers.rhs.logical_shape != mma_layout.rhs_shape
+        ):
+            raise TypeError(
+                "m16n8k8 MMA requires shared tiles "
+                f"{mma_layout.lhs_shape} and "
+                f"{mma_layout.rhs_shape}, got "
+                f"{buffers.lhs.logical_shape} and "
+                f"{buffers.rhs.logical_shape}"
+            )
+
+        operand_ty = buffers.lhs.element_ty
+        if operand_ty not in (F16, BF16) or buffers.rhs.element_ty != operand_ty:
+            raise TypeError(
+                "m16n8k8 MMA requires matching f16 or bf16 shared-memory operands, "
+                f"got {buffers.lhs.element_ty} and "
+                f"{buffers.rhs.element_ty}"
+            )
+
+        if operand_ty == F16 and not self.target.supports_f16_mma_m16n8k8:
+            raise TypeError(f"m16n8k8 f16 MMA requires sm_75+, got {self.target.chip}")
+
+        if operand_ty == BF16 and not self.target.supports_bf16_mma_m16n8k8:
+            raise TypeError(f"m16n8k8 bf16 MMA requires sm_80+, got {self.target.chip}")
+
+        group = f"mma_group_{result_id}"
+        thread = f"mma_thread_{result_id}"
+        lhs_register_0 = f"mma_a_{result_id}_0"
+        lhs_register_1 = f"mma_a_{result_id}_1"
+        rhs_register = f"mma_b_{result_id}_0"
+
+        self.lines.extend(
+            [
+                f"    int {group} = threadIdx.x >> 2;",
+                f"    int {thread} = threadIdx.x & 3;",
+            ]
+        )
+
+        lhs_0_low = buffers.lhs.element(
+            group,
+            f"{thread} * 2",
+            stage=stage,
+        )
+        lhs_0_high = buffers.lhs.element(
+            group,
+            f"{thread} * 2 + 1",
+            stage=stage,
+        )
+        lhs_1_low = buffers.lhs.element(
+            f"{group} + 8",
+            f"{thread} * 2",
+            stage=stage,
+        )
+        lhs_1_high = buffers.lhs.element(
+            f"{group} + 8",
+            f"{thread} * 2 + 1",
+            stage=stage,
+        )
+
+        rhs_low = buffers.rhs.element(
+            f"{thread} * 2",
+            group,
+            stage=stage,
+        )
+        rhs_high = buffers.rhs.element(
+            f"{thread} * 2 + 1",
+            group,
+            stage=stage,
+        )
+
+        self.lines.extend(
+            [
+                (
+                    f"    unsigned {lhs_register_0} = "
+                    f"{self.pack_mma_operand_pair(lhs_0_low, lhs_0_high, operand_ty)};"
+                ),
+                (
+                    f"    unsigned {lhs_register_1} = "
+                    f"{self.pack_mma_operand_pair(lhs_1_low, lhs_1_high, operand_ty)};"
+                ),
+                (
+                    f"    unsigned {rhs_register} = "
+                    f"{self.pack_mma_operand_pair(rhs_low, rhs_high, operand_ty)};"
+                ),
+            ]
+        )
+
+        return (
+            (lhs_register_0, lhs_register_1),
+            rhs_register,
+        )
+
+    def emit_mma_m16n8k8(
+        self,
+        *,
+        result: SSAValue,
+        lhs_registers: tuple[str, str],
+        rhs_register: str,
+        operand_ty: ScalarType = F16,
+        accumulator: CudaMmaAccumulatorRef | None = None,
+    ) -> CudaMmaAccumulatorRef:
+        """Emit one warp-level matrix multiply with f32 accumulation."""
+
+        mma_layout = CudaMmaM16N8K8Layout()
+        expected_result_ty = BlockType(
+            mma_layout.result_shape,
+            F32,
+        )
+
+        if result.ty != expected_result_ty:
+            raise TypeError(
+                "m16n8k8 MMA requires result type "
+                f"{expected_result_ty}, got {result.ty}"
+            )
+
+        if accumulator is not None and accumulator.layout != mma_layout:
+            raise TypeError(
+                "m16n8k8 MMA requires a compatible accumulator layout, "
+                f"got {accumulator.layout}"
+            )
+
+        if operand_ty == F16:
+            if not self.target.supports_f16_mma_m16n8k8:
+                raise TypeError(
+                    f"m16n8k8 f16 MMA requires sm_75+, got {self.target.chip}"
+                )
+            ptx_operand_ty = "f16"
+        elif operand_ty == BF16:
+            if not self.target.supports_bf16_mma_m16n8k8:
+                raise TypeError(
+                    f"m16n8k8 bf16 MMA requires sm_80+, got {self.target.chip}"
+                )
+            ptx_operand_ty = "bf16"
+        else:
+            raise TypeError(f"m16n8k8 MMA does not support {operand_ty} operands")
+
+        result_ref = CudaMmaAccumulatorRef(
+            base=f"v{result.id}",
+            layout=mma_layout,
+        )
+        result_elements = result_ref.elements()
+
+        for index, element in enumerate(result_elements):
+            initial_value = (
+                "0.0f" if accumulator is None else accumulator.element(index)
+            )
+            self.lines.append(f"    float {element} = {initial_value};")
+
+        lhs_register_0, lhs_register_1 = lhs_registers
+        result_0, result_1, result_2, result_3 = result_elements
+
+        self.lines.extend(
+            [
+                "    asm volatile(",
+                (
+                    '        "mma.sync.aligned.m16n8k8.row.col.f32.'
+                    f'{ptx_operand_ty}.{ptx_operand_ty}.f32 "'
+                ),
+                '        "{%0, %1, %2, %3}, "',
+                '        "{%4, %5}, "',
+                '        "{%6}, "',
+                '        "{%0, %1, %2, %3};"',
+                (
+                    f'        : "+f"({result_0}), '
+                    f'"+f"({result_1}), '
+                    f'"+f"({result_2}), '
+                    f'"+f"({result_3})'
+                ),
+                (
+                    f'        : "r"({lhs_register_0}), '
+                    f'"r"({lhs_register_1}), '
+                    f'"r"({rhs_register})'
+                ),
+                "    );",
+            ]
+        )
+
+        self.values[result.id] = result_ref
+        return result_ref
+
+    def emit_mma_from_shared_memory(
+        self,
+        result: SSAValue,
+        buffers: CudaDotSharedBuffers,
+        *,
+        accumulator: CudaMmaAccumulatorRef | None = None,
+        stage: str | None = None,
+        emit_reuse_barrier: bool = True,
+    ) -> CudaMmaAccumulatorRef:
+        """Lower a staged low-precision dot to one m16n8k8 MMA instruction."""
+
+        lhs_registers, rhs_register = self.emit_mma_operand_registers(
+            result_id=result.id,
+            buffers=buffers,
+            stage=stage,
+        )
+        result_ref = self.emit_mma_m16n8k8(
+            result=result,
+            lhs_registers=lhs_registers,
+            rhs_register=rhs_register,
+            operand_ty=buffers.lhs.element_ty,
+            accumulator=accumulator,
+        )
+
+        if emit_reuse_barrier:
+            self.emit_block_barrier()
+
+        return result_ref
+
+    def emit_mma_accumulator_spill(
+        self,
+        *,
+        value_id: int,
+        value: CudaMmaAccumulatorRef,
+    ) -> CudaSharedBuffer:
+        """Convert an MMA accumulator fragment to row-major shared memory."""
+
+        mma_layout = CudaMmaM16N8K8Layout()
+        if value.layout != mma_layout:
+            raise TypeError(
+                f"cannot spill incompatible MMA accumulator layout, got {value.layout}"
+            )
+
+        buffer = CudaSharedBuffer(
+            name=f"mma_result_{value_id}",
+            logical_shape=mma_layout.result_shape,
+            element_ty=F32,
+        )
+        self.reserve_shared_memory(buffer.nbytes)
+        self.append_shared_buffer_declaration(buffer)
+
+        group = f"mma_store_group_{value_id}"
+        thread = f"mma_store_thread_{value_id}"
+
+        self.lines.extend(
+            [
+                f"    int {group} = threadIdx.x >> 2;",
+                f"    int {thread} = threadIdx.x & 3;",
+            ]
+        )
+
+        coordinates = (
+            (group, f"{thread} * 2"),
+            (group, f"{thread} * 2 + 1"),
+            (f"{group} + 8", f"{thread} * 2"),
+            (f"{group} + 8", f"{thread} * 2 + 1"),
+        )
+
+        for index, (row, column) in enumerate(coordinates):
+            destination = buffer.element(row, column)
+            source = value.element(index)
+            self.lines.append(f"    {destination} = {source};")
+
+        self.emit_block_barrier()
+        return buffer
+
+    def emit_mma_store(
+        self,
+        *,
+        pointer_operand: SSAOperand,
+        value_operand: SSAValue,
+        mask_operand: SSAOperand,
+        value: CudaMmaAccumulatorRef,
+        destination_ty: ScalarType,
+    ) -> None:
+        """Store an MMA fragment using the kernel's regular output layout."""
+
+        register_layout = self.layout.register_tile_layout()
+
+        if register_layout.logical_shape != value.layout.result_shape:
+            raise TypeError(
+                "MMA store output shape does not match the kernel layout, "
+                f"got {value.layout.result_shape} and "
+                f"{register_layout.logical_shape}"
+            )
+
+        buffer = self.emit_mma_accumulator_spill(
+            value_id=value_operand.id,
+            value=value,
+        )
+
+        for register_coordinate in self.register_coordinates(register_layout):
+            ptr = self.register_pointer_operand(
+                pointer_operand,
+                register_coordinate,
+                register_layout,
+            )
+            row, column = self.register_logical_coordinates(
+                register_layout,
+                register_coordinate,
+            )
+            stored_value = buffer.element(row, column)
+
+            if destination_ty != F32:
+                stored_value = self.cuda_cast_expression(
+                    stored_value,
+                    F32,
+                    destination_ty,
+                )
+
+            mask = (
+                None
+                if mask_operand is None
+                else self.register_expression_operand(
+                    mask_operand,
+                    register_coordinate,
+                    register_layout,
+                )
+            )
+
+            if mask is None:
+                self.lines.append(f"    {ptr.base}[{ptr.index}] = {stored_value};")
+            else:
+                self.lines.extend(
+                    [
+                        f"    if ({mask}) {{",
+                        (f"        {ptr.base}[{ptr.index}] = {stored_value};"),
+                        "    }",
+                    ]
+                )
 
     def emit_full(self, op: SSAOp, result: SSAValue) -> None:
         operand = op.operands[0]
@@ -468,8 +884,16 @@ class SSACUDACodegen:
         )
 
     def operand(
-        self, operand: SSAOperand
-    ) -> str | CudaPtrRef | CudaArangeRef | CudaRegisterTileRef | None:
+        self,
+        operand: SSAOperand,
+    ) -> (
+        str
+        | CudaPtrRef
+        | CudaArangeRef
+        | CudaRegisterTileRef
+        | CudaMmaAccumulatorRef
+        | None
+    ):
         if operand is None:
             return None
         if isinstance(operand, SSAValue):
@@ -1096,13 +1520,18 @@ class SSACUDACodegen:
             self.staging_analysis,
         )
 
+        tensor_core_loop = (
+            double_buffering is not None
+            and double_buffering.dot_result_id in self.mma_dot_result_ids
+        )
+
         start = self.expression_operand(loop.start)
         stop = self.expression_operand(loop.stop)
         step = self.expression_operand(loop.step)
 
         index_name = f"v{loop.index.id}"
 
-        carried_values: list[str | CudaRegisterTileRef] = []
+        carried_values: list[str | CudaRegisterTileRef | CudaMmaAccumulatorRef] = []
 
         for carried_input, carried_arg, result in zip(
             loop.carried_inputs,
@@ -1110,6 +1539,52 @@ class SSACUDACodegen:
             loop.results,
             strict=True,
         ):
+            if tensor_core_loop:
+                mma_layout = CudaMmaM16N8K8Layout()
+                expected_ty = BlockType(
+                    mma_layout.result_shape,
+                    F32,
+                )
+
+                if result.ty != expected_ty:
+                    raise TypeError(
+                        "tensor-core loop requires an f32 "
+                        f"{mma_layout.result_shape} accumulator, "
+                        f"got {result.ty}"
+                    )
+
+                initial_value = self.operand(carried_input)
+                mma_result_ref = CudaMmaAccumulatorRef(
+                    base=f"v{result.id}",
+                    layout=mma_layout,
+                )
+
+                for index, name in enumerate(mma_result_ref.elements()):
+                    if isinstance(initial_value, str):
+                        initial_element = initial_value
+                    elif isinstance(
+                        initial_value,
+                        CudaMmaAccumulatorRef,
+                    ):
+                        if initial_value.layout != mma_layout:
+                            raise TypeError(
+                                "tensor-core loop received an incompatible "
+                                f"accumulator layout: {initial_value.layout}"
+                            )
+                        initial_element = initial_value.element(index)
+                    else:
+                        raise TypeError(
+                            "tensor-core loop accumulator must be a scalar "
+                            f"or MMA fragment, got {initial_value}"
+                        )
+
+                    self.lines.append(f"    float {name} = {initial_element};")
+
+                self.values[carried_arg.id] = mma_result_ref
+                self.values[result.id] = mma_result_ref
+                carried_values.append(mma_result_ref)
+                continue
+
             register_layout: CudaRegisterTileLayout | None = None
 
             if (
@@ -1133,7 +1608,7 @@ class SSACUDACodegen:
                 carried_values.append(name)
                 continue
 
-            result_ref = CudaRegisterTileRef(
+            register_result_ref = CudaRegisterTileRef(
                 base=f"v{result.id}",
                 layout=register_layout,
             )
@@ -1145,12 +1620,12 @@ class SSACUDACodegen:
                     register_coordinate,
                     register_layout,
                 )
-                name = result_ref.element(register_coordinate)
+                name = register_result_ref.element(register_coordinate)
                 self.lines.append(f"    {cuda_ty} {name} = {init};")
 
-            self.values[carried_arg.id] = result_ref
-            self.values[result.id] = result_ref
-            carried_values.append(result_ref)
+            self.values[carried_arg.id] = register_result_ref
+            self.values[result.id] = register_result_ref
+            carried_values.append(register_result_ref)
 
         self.lines.append(
             f"    for (int {index_name} = {start}; "
@@ -1183,13 +1658,42 @@ class SSACUDACodegen:
                 and body_op.result.id == double_buffering.dot_result_id
             ):
                 assert stage_name is not None
+
+                accumulator: CudaMmaAccumulatorRef | None = None
+
+                if tensor_core_loop:
+                    carried_value = carried_values[0]
+
+                    if not isinstance(
+                        carried_value,
+                        CudaMmaAccumulatorRef,
+                    ):
+                        raise TypeError("tensor-core loop requires an MMA accumulator")
+
+                    accumulator = carried_value
+
                 self.emit_dot(
                     body_op,
                     body_op.result,
+                    accumulator=accumulator,
                     stage_count=double_buffering.stage_count,
                     stage=stage_name,
                     emit_reuse_barrier=False,
                 )
+
+                if tensor_core_loop:
+                    self.values[double_buffering.accumulation_result_id] = self.values[
+                        body_op.result.id
+                    ]
+
+                continue
+
+            if (
+                tensor_core_loop
+                and double_buffering is not None
+                and body_op.result is not None
+                and body_op.result.id == double_buffering.accumulation_result_id
+            ):
                 continue
 
             self.emit(body_op)
@@ -1199,7 +1703,32 @@ class SSACUDACodegen:
             carried_values,
             strict=True,
         ):
-            if isinstance(carried_value, CudaRegisterTileRef):
+            if isinstance(
+                carried_value,
+                CudaMmaAccumulatorRef,
+            ):
+                yielded_value = self.operand(yielded)
+
+                if not isinstance(
+                    yielded_value,
+                    CudaMmaAccumulatorRef,
+                ):
+                    raise TypeError(
+                        "tensor-core loop must yield an MMA accumulator, "
+                        f"got {yielded_value}"
+                    )
+
+                if yielded_value.layout != carried_value.layout:
+                    raise TypeError(
+                        "tensor-core loop yielded an incompatible "
+                        f"accumulator layout: {yielded_value.layout}"
+                    )
+
+                for index in range(carried_value.elements_per_lane):
+                    destination = carried_value.element(index)
+                    source = yielded_value.element(index)
+                    self.lines.append(f"    {destination} = {source};")
+            elif isinstance(carried_value, CudaRegisterTileRef):
                 for register_coordinate in self.register_coordinates(
                     carried_value.layout
                 ):
@@ -1429,6 +1958,23 @@ class SSACUDACodegen:
                 destination_ty,
             )
 
+        value_ref = self.operand(value_operand)
+
+        if isinstance(value_ref, CudaMmaAccumulatorRef):
+            if not isinstance(value_operand, SSAValue):
+                raise TypeError(
+                    f"MMA store value must be an SSA value, got {value_operand}"
+                )
+
+            self.emit_mma_store(
+                pointer_operand=pointer_operand,
+                value_operand=value_operand,
+                mask_operand=mask_operand,
+                value=value_ref,
+                destination_ty=destination_ty,
+            )
+            return
+
         operand_values = tuple(
             self.operand(operand) for operand in op.operands if operand is not None
         )
@@ -1601,6 +2147,7 @@ class SSACUDACodegen:
         op: SSAOp,
         result: SSAValue,
         *,
+        accumulator: CudaMmaAccumulatorRef | None = None,
         stage_count: int = 1,
         stage: str | None = None,
         emit_reuse_barrier: bool = True,
@@ -1615,6 +2162,20 @@ class SSACUDACodegen:
             stage_count=stage_count,
             stage=stage,
         )
+
+        if result.id in self.mma_dot_result_ids:
+            self.emit_mma_from_shared_memory(
+                result,
+                buffers,
+                accumulator=accumulator,
+                stage=stage,
+                emit_reuse_barrier=emit_reuse_barrier,
+            )
+            return
+
+        if accumulator is not None:
+            raise TypeError("an MMA accumulator can only be used by a tensor-core dot")
+
         self.emit_dot_from_shared_memory(
             result,
             buffers,
@@ -1699,6 +2260,15 @@ class SSACUDACodegen:
         self.values = {}
         self.definitions = SSADefinitions(ssa_ops)
         self.staging_analysis = CudaDotStagingAnalyzer(self.definitions).analyze()
+        mma_operand_types = set()
+        if self.target.supports_f16_mma_m16n8k8:
+            mma_operand_types.add(F16)
+        if self.target.supports_bf16_mma_m16n8k8:
+            mma_operand_types.add(BF16)
+        self.mma_dot_result_ids = cuda_mma_m16n8k8_dot_result_ids(
+            ssa_ops,
+            operand_types=frozenset(mma_operand_types),
+        )
         self.layout = cuda_kernel_layout(ssa_ops)
 
         self.emit_rank2_prologue()
