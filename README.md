@@ -83,6 +83,12 @@ MLIR's GPU/NVVM stack to a cubin.
   low-precision runtime pointer inference, explicit CUDA conversions,
   two-byte shared-memory tiles, and `f16`/`bf16` CUDA-core `tl.dot` with
   `f32` accumulation.
+- [ver20](https://github.com/pbelevich/mytriton/tree/ver20): NVIDIA
+  tensor-core paths for canonical `f16[16, 8] x f16[8, 8]` and
+  `bf16[16, 8] x bf16[8, 8]` dots, architecture-aware lowering, explicit
+  warp-fragment layouts, packed 16-bit PTX operands, fused loop-carried `f32`
+  accumulation across K-tiles, fragment redistribution for masked stores,
+  and CUDA execution tests covering partial boundary tiles.
 
 ## AST frontend
 
@@ -575,6 +581,161 @@ This is still an ordinary CUDA-core implementation. Version 19 establishes the
 types, conversions, storage widths, and mixed-precision accumulation semantics
 needed by a later tensor-core lowering; it does not emit `mma.sync` or WMMA
 instructions yet.
+
+## Tensor-core dot
+
+Version 20 adds the first specialized tensor-core lowering. The CUDA backend
+recognizes this dot contract for matching operand types `T`:
+
+```text
+A: T[16, 8]
+B: T[8, 8]
+C: f32[16, 8]
+```
+
+The operation is executed by one 32-thread CUDA warp. FP16 uses:
+
+```text
+mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+```
+
+on compute capability 7.5 or newer. Ampere (`sm_80`) and newer targets can use
+the otherwise identical native BF16 variant:
+
+```text
+mma.sync.aligned.m16n8k8.row.col.f32.bf16.bf16.f32
+```
+
+Other shapes and `f32` operands continue to use the existing CUDA-core
+implementation. BF16 also falls back to CUDA cores on pre-Ampere targets,
+instead of emitting an unsupported PTX instruction. CUDA compilation artifacts
+are cached per architecture so code selected for `sm_80` cannot be reused on an
+incompatible device. Compilation-only calls with CPU arrays conservatively use
+`sm_75`.
+
+Tensor-core operands are warp fragments rather than ordinary per-thread
+register tiles. For lane `lane`, the backend computes:
+
+```text
+group = lane >> 2
+thread = lane & 3
+```
+
+Each lane owns four A elements:
+
+```text
+A[group,     thread * 2]
+A[group,     thread * 2 + 1]
+A[group + 8, thread * 2]
+A[group + 8, thread * 2 + 1]
+```
+
+two B elements:
+
+```text
+B[thread * 2,     group]
+B[thread * 2 + 1, group]
+```
+
+and four `f32` accumulator elements at the corresponding output coordinates:
+
+```text
+C[group,     thread * 2]
+C[group,     thread * 2 + 1]
+C[group + 8, thread * 2]
+C[group + 8, thread * 2 + 1]
+```
+
+The cooperative loading machinery from the earlier shared-memory versions
+first copies the global A and B tiles into shared memory. Every pair of adjacent
+16-bit values is then packed into one 32-bit PTX operand register. FP16 extracts
+the bits with `__half_as_ushort`:
+
+```cuda
+unsigned packed =
+    static_cast<unsigned>(__half_as_ushort(low)) |
+    (static_cast<unsigned>(__half_as_ushort(high)) << 16);
+```
+
+BF16 extracts the same two raw 16-bit payloads from `__nv_bfloat16_raw` before
+packing them. The fragment coordinates and the four FP32 accumulator registers
+are shared by both operand types.
+
+A lane supplies two packed A registers and one packed B register to
+`mma.sync`. Four `f32` registers contain its accumulator fragment:
+
+```cuda
+asm volatile(
+    "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+    "{%0, %1, %2, %3}, "
+    "{%4, %5}, "
+    "{%6}, "
+    "{%0, %1, %2, %3};"
+    : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+    : "r"(a0), "r"(a1), "r"(b0)
+);
+```
+
+The `+f` constraints make every accumulator register both an input and an
+output. A standalone `tl.dot` initializes these registers with zero, producing
+`A x B + 0`.
+
+A tiled matrix multiplication carries the same four-register fragment across
+runtime K-loop iterations:
+
+```python
+acc = tl.zeros((BM, BN), tl.float32)
+
+for k_base in range(0, K, BK):
+    # Load A [16, 8] and B [8, 8] tiles.
+    acc = acc + tl.dot(a_values, b_values)
+
+tl.store(output_pointers, acc, mask=output_mask)
+```
+
+The conservative double-buffering matcher verifies that the loop starts at
+zero, advances by `BK`, contains one stageable dot, and yields exactly the
+updated accumulator. For the tensor-core shape, CUDA lowering fuses the SSA
+`dot` and `add`:
+
+```text
+%dot = dot %a, %b
+%next_acc = add %acc, %dot
+yield %next_acc
+```
+
+into one operation per iteration:
+
+```text
+next_acc = mma(a, b, acc)
+```
+
+The separate CUDA `add` is not emitted. Instead, the previous loop-carried
+fragment initializes the four `+f` operands of `mma.sync`, and the instruction's
+results become the accumulator for the next K-tile.
+
+A tensor-core accumulator has a different lane-to-element mapping from the
+ordinary output register tile used by pointer arithmetic, masks, and stores.
+After the K loop, each lane writes its four accumulator registers into a
+row-major shared-memory result tile. A block barrier makes the complete tile
+visible, after which the existing register-tile store path reads the appropriate
+elements and performs masked global stores. This redistribution also preserves
+correctness for partial M and N boundary tiles.
+
+Partial K-tiles reuse the existing masked cooperative loads. Out-of-bounds A
+and B elements are written as a zero of the operand type into shared memory, so
+the final `mma.sync` may still execute with its complete fixed `m16n8k8` shape.
+
+The runnable [Colab test notebook](tests/mytriton_colab_tests.ipynb) installs the
+current checkout, validates FP16/BF16 GPU support, and streams the complete
+pytest output. The CUDA optional dependencies include `ml_dtypes`, which CuPy
+needs to consume PyTorch BF16 storage through DLPack.
+
+The current implementation focuses on correctness and a visible end-to-end
+tensor-core lowering. It uses one warp, one fixed MMA shape, synchronous
+shared-memory loading, and an extra shared-memory redistribution before the
+store. It does not yet provide multiple warps per output tile, asynchronous
+copies, software pipelining, fragment swizzling, or autotuning.
 
 ## Example
 

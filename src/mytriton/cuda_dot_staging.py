@@ -551,6 +551,7 @@ class CudaDotStagingAnalyzer:
 @dataclass(frozen=True)
 class CudaDotDoubleBufferingPlan:
     dot_result_id: int
+    accumulation_result_id: int
     stage_count: int = 2
 
 
@@ -655,4 +656,5 @@ def match_cuda_dot_double_buffering(
 
     return CudaDotDoubleBufferingPlan(
         dot_result_id=dot.result.id,
+        accumulation_result_id=accumulation.result.id,
     )

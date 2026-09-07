@@ -1010,9 +1010,8 @@ def test_bf16_dot_executes_on_supported_cuda_gpu(
     if not torch.cuda.is_available():
         pytest.skip("PyTorch CUDA is not available")
 
-    capability = torch.cuda.get_device_capability()
-    if capability < (8, 0):
-        pytest.skip("bfloat16 CUDA execution requires compute capability 8.0 or newer")
+    if not torch.cuda.is_bf16_supported():
+        pytest.skip("PyTorch reports that bfloat16 CUDA tensors are unsupported")
 
     monkeypatch.setenv("MYTRITON_BACKEND", "cuda")
 
