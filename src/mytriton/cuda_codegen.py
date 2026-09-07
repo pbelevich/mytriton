@@ -22,15 +22,20 @@ from .cuda_dot_staging import (
 )
 from .ssa import SSAForRange, SSAItem, SSAOp, SSAOperand, SSAValue
 from .trace import (
+    BF16,
     BOOL,
+    F16,
     F32,
+    FLOAT_TYPES,
     I32,
+    NUMERIC_TYPES,
     BlockType,
     Const,
     Param,
     PointerType,
     ScalarType,
     Type,
+    promote_numeric_types,
 )
 
 
@@ -131,6 +136,7 @@ class SSACUDACodegen:
         )
         self.shared_lines: list[str] = []
         self.shared_memory_bytes = 0
+        self.required_headers: set[str] = set()
         self.definitions = SSADefinitions([])
         self.staging_analysis = CudaDotStagingAnalysis(
             dot_plans={},
@@ -143,6 +149,12 @@ class SSACUDACodegen:
 
         if ty == I32:
             return "int"
+        if ty == F16:
+            self.required_headers.add("#include <cuda_fp16.h>")
+            return "__half"
+        if ty == BF16:
+            self.required_headers.add("#include <cuda_bf16.h>")
+            return "__nv_bfloat16"
         if ty == F32:
             return "float"
         if ty == BOOL:
@@ -169,6 +181,291 @@ class SSACUDACodegen:
             return str(value)
 
         raise TypeError(f"Unsupported CUDA literal: {value!r}")
+
+    def operand_type(self, operand: SSAOperand) -> Type:
+        if isinstance(operand, (SSAValue, Param)):
+            return operand.ty
+
+        if isinstance(operand, Const):
+            if isinstance(operand.value, bool):
+                return BOOL
+            if isinstance(operand.value, int):
+                return I32
+            if isinstance(operand.value, float):
+                return F32
+
+        raise TypeError(f"Cannot determine CUDA operand type: {operand}")
+
+    def cuda_cast_expression(
+        self,
+        value: str,
+        source_ty: ScalarType,
+        destination_ty: ScalarType,
+    ) -> str:
+        if source_ty not in NUMERIC_TYPES or destination_ty not in NUMERIC_TYPES:
+            raise TypeError(
+                f"CUDA cast requires numeric types, "
+                f"got {source_ty} and {destination_ty}"
+            )
+
+        if source_ty == destination_ty:
+            return value
+
+        if source_ty == F32:
+            as_f32 = value
+        elif source_ty == I32:
+            as_f32 = f"static_cast<float>({value})"
+        elif source_ty == F16:
+            as_f32 = f"__half2float({value})"
+        elif source_ty == BF16:
+            as_f32 = f"__bfloat162float({value})"
+        else:
+            raise TypeError(f"Cannot convert CUDA value from {source_ty}")
+
+        if destination_ty == F32:
+            return as_f32
+        if destination_ty == I32:
+            return f"static_cast<int>({as_f32})"
+        if destination_ty == F16:
+            return f"__float2half_rn({as_f32})"
+        if destination_ty == BF16:
+            return f"__float2bfloat16_rn({as_f32})"
+
+        raise TypeError(f"Cannot convert CUDA value to {destination_ty}")
+
+    def emit_full(self, op: SSAOp, result: SSAValue) -> None:
+        operand = op.operands[0]
+        source_ty = self.scalar_type(self.operand_type(operand))
+        destination_ty = self.scalar_type(result.ty)
+        value = self.expression_operand(operand)
+
+        if source_ty == BOOL and destination_ty == BOOL:
+            self.assign(result, value)
+            return
+
+        if not isinstance(source_ty, ScalarType):
+            raise TypeError(f"CUDA full requires a scalar fill value, got {source_ty}")
+
+        if not isinstance(destination_ty, ScalarType):
+            raise TypeError(
+                f"CUDA full requires scalar result elements, got {destination_ty}"
+            )
+
+        expression = self.cuda_cast_expression(
+            value,
+            source_ty,
+            destination_ty,
+        )
+        self.assign(result, expression)
+
+    def emit_zeros(self, result: SSAValue) -> None:
+        element_ty = self.scalar_type(result.ty)
+
+        if element_ty == BOOL:
+            self.assign(result, self.literal(False))
+            return
+
+        if not isinstance(element_ty, ScalarType):
+            raise TypeError(
+                f"CUDA zeros requires scalar result elements, got {element_ty}"
+            )
+
+        if element_ty == I32:
+            zero = self.literal(0)
+            source_ty = I32
+        else:
+            zero = self.literal(0.0)
+            source_ty = F32
+
+        expression = self.cuda_cast_expression(
+            zero,
+            source_ty,
+            element_ty,
+        )
+        self.assign(result, expression)
+
+    def emit_load(self, op: SSAOp, result: SSAValue) -> None:
+        ptr = self.pointer_operand(op.operands[0])
+        mask_operand = op.operands[1]
+        other_operand = op.operands[2]
+        destination_ty = self.scalar_type(result.ty)
+
+        if not isinstance(destination_ty, ScalarType):
+            raise TypeError(
+                f"CUDA load requires scalar result elements, got {destination_ty}"
+            )
+
+        mask = "true" if mask_operand is None else self.expression_operand(mask_operand)
+
+        if other_operand is None:
+            if destination_ty == BOOL:
+                other = self.literal(False)
+            elif destination_ty == I32:
+                other = self.literal(0)
+            elif destination_ty in FLOAT_TYPES:
+                other = self.cuda_cast_expression(
+                    self.literal(0.0),
+                    F32,
+                    destination_ty,
+                )
+            else:
+                raise TypeError(
+                    f"CUDA load does not support elements of type {destination_ty}"
+                )
+        else:
+            source_ty = self.scalar_type(self.operand_type(other_operand))
+            other = self.expression_operand(other_operand)
+
+            if source_ty != destination_ty:
+                if not isinstance(source_ty, ScalarType):
+                    raise TypeError(
+                        f"CUDA load fallback must be scalar, got {source_ty}"
+                    )
+                other = self.cuda_cast_expression(
+                    other,
+                    source_ty,
+                    destination_ty,
+                )
+
+        self.assign(
+            result,
+            f"({mask} ? {ptr.base}[{ptr.index}] : {other})",
+        )
+
+    def emit_cast(self, op: SSAOp, result: SSAValue) -> None:
+        operand = op.operands[0]
+        source_ty = self.scalar_type(self.operand_type(operand))
+        destination_ty = self.scalar_type(result.ty)
+
+        if not isinstance(source_ty, ScalarType):
+            raise TypeError(
+                f"CUDA cast requires a scalar element type, got {source_ty}"
+            )
+
+        if not isinstance(destination_ty, ScalarType):
+            raise TypeError(
+                f"CUDA cast requires a scalar result element type, got {destination_ty}"
+            )
+
+        broadcast_axes = self.register_broadcast_axes(result.ty)
+
+        if broadcast_axes is None:
+            value = self.expression_operand(operand)
+            expression = self.cuda_cast_expression(
+                value,
+                source_ty,
+                destination_ty,
+            )
+            self.assign(result, expression)
+            return
+
+        register_layout = self.layout.register_tile_layout()
+
+        if register_layout.registers_per_thread == 1:
+            value = self.expression_operand(operand)
+            expression = self.cuda_cast_expression(
+                value,
+                source_ty,
+                destination_ty,
+            )
+            self.assign(result, expression)
+            return
+
+        result_ref = CudaRegisterTileRef(
+            base=f"v{result.id}",
+            layout=register_layout,
+            broadcast_axes=broadcast_axes,
+        )
+        cuda_ty = self.cuda_type(destination_ty)
+
+        for register_coordinate in result_ref.storage_coordinates():
+            value = self.register_expression_operand(
+                operand,
+                register_coordinate,
+                register_layout,
+            )
+            expression = self.cuda_cast_expression(
+                value,
+                source_ty,
+                destination_ty,
+            )
+            result_element = result_ref.element(register_coordinate)
+
+            self.lines.append(f"    {cuda_ty} {result_element} = {expression};")
+
+        self.values[result.id] = result_ref
+
+    def converted_numeric_operand(
+        self,
+        operand: SSAOperand,
+        expression: str,
+        destination_ty: ScalarType,
+    ) -> str:
+        source_ty = self.scalar_type(self.operand_type(operand))
+        if not isinstance(source_ty, ScalarType):
+            raise TypeError(f"CUDA numeric operand must be scalar, got {source_ty}")
+
+        return self.cuda_cast_expression(
+            expression,
+            source_ty,
+            destination_ty,
+        )
+
+    def emit_extremum(self, op: SSAOp, result: SSAValue) -> None:
+        result_ty = self.scalar_type(result.ty)
+        if not isinstance(result_ty, ScalarType) or result_ty not in NUMERIC_TYPES:
+            raise TypeError(
+                f"CUDA {op.opcode} requires numeric result elements, got {result_ty}"
+            )
+
+        comparison_ty = F32 if result_ty in FLOAT_TYPES else result_ty
+        lhs = self.converted_numeric_operand(
+            op.operands[0],
+            self.expression_operand(op.operands[0]),
+            comparison_ty,
+        )
+        rhs = self.converted_numeric_operand(
+            op.operands[1],
+            self.expression_operand(op.operands[1]),
+            comparison_ty,
+        )
+        symbol = ">" if op.opcode == "maximum" else "<"
+        expression = f"(({lhs}) {symbol} ({rhs}) ? ({lhs}) : ({rhs}))"
+
+        if comparison_ty == F32:
+            expression = (
+                f"(isnan({lhs}) ? ({lhs}) : (isnan({rhs}) ? ({rhs}) : {expression}))"
+            )
+
+        expression = self.cuda_cast_expression(
+            expression,
+            comparison_ty,
+            result_ty,
+        )
+        self.assign(result, expression)
+
+    def emit_select(self, op: SSAOp, result: SSAValue) -> None:
+        result_ty = self.scalar_type(result.ty)
+        if not isinstance(result_ty, ScalarType) or result_ty not in NUMERIC_TYPES:
+            raise TypeError(
+                f"CUDA select requires numeric result elements, got {result_ty}"
+            )
+
+        condition = self.expression_operand(op.operands[0])
+        true_value = self.converted_numeric_operand(
+            op.operands[1],
+            self.expression_operand(op.operands[1]),
+            result_ty,
+        )
+        false_value = self.converted_numeric_operand(
+            op.operands[2],
+            self.expression_operand(op.operands[2]),
+            result_ty,
+        )
+        self.assign(
+            result,
+            f"({condition} ? {true_value} : {false_value})",
+        )
 
     def operand(
         self, operand: SSAOperand
@@ -333,6 +630,11 @@ class SSACUDACodegen:
         global_column = f"{target.name}_global_column"
         source_index = f"{target.name}_source_index"
         in_bounds = f"{target.name}_in_bounds"
+        other = self.cuda_cast_expression(
+            source.other,
+            F32,
+            target.element_ty,
+        )
 
         self.lines.extend(
             [
@@ -357,7 +659,7 @@ class SSACUDACodegen:
                 (
                     f"        {target.element(row, column, stage=stage)} = "
                     f"{in_bounds} ? "
-                    f"{source.base}[{source_index}] : {source.other};"
+                    f"{source.base}[{source_index}] : {other};"
                 ),
                 "    }",
             ]
@@ -473,12 +775,22 @@ class SSACUDACodegen:
                 f"{self.layout.thread_shape}"
             ) from error
 
-        if (
-            result.ty.element != F32
-            or buffers.lhs.element_ty != F32
-            or buffers.rhs.element_ty != F32
-        ):
-            raise TypeError("CUDA-core dot currently supports only f32")
+        if result.ty.element != F32:
+            raise TypeError(
+                f"CUDA-core dot requires an f32 result, got {result.ty.element}"
+            )
+
+        if buffers.lhs.element_ty != buffers.rhs.element_ty:
+            raise TypeError(
+                "CUDA-core dot requires matching operand element types, "
+                f"got {buffers.lhs.element_ty} and {buffers.rhs.element_ty}"
+            )
+
+        operand_ty = buffers.lhs.element_ty
+        if operand_ty not in FLOAT_TYPES:
+            raise TypeError(
+                f"CUDA-core dot requires f16, bf16, or f32 operands, got {operand_ty}"
+            )
 
         result_ref = CudaRegisterTileRef(
             base=f"v{result.id}",
@@ -516,9 +828,18 @@ class SSACUDACodegen:
                 stage=stage,
             )
 
-            self.lines.append(
-                f"        {result_element} += {lhs_element} * {rhs_element};"
+            lhs_value = self.cuda_cast_expression(
+                lhs_element,
+                operand_ty,
+                F32,
             )
+            rhs_value = self.cuda_cast_expression(
+                rhs_element,
+                operand_ty,
+                F32,
+            )
+
+            self.lines.append(f"        {result_element} += {lhs_value} * {rhs_value};")
 
         self.lines.append("    }")
 
@@ -929,17 +1250,75 @@ class SSACUDACodegen:
         symbol = self.BINARY_OPS[op.opcode]
         broadcast_axes = self.register_broadcast_axes(result.ty)
 
+        arithmetic_ty: ScalarType | None = None
+        if op.opcode in ("add", "sub", "mul", "div"):
+            candidate_ty = self.scalar_type(result.ty)
+            if not isinstance(candidate_ty, ScalarType):
+                raise TypeError(
+                    f"CUDA arithmetic requires scalar elements, got {candidate_ty}"
+                )
+            arithmetic_ty = candidate_ty
+        elif op.opcode == "cmp_lt":
+            lhs_ty = self.scalar_type(self.operand_type(op.operands[0]))
+            rhs_ty = self.scalar_type(self.operand_type(op.operands[1]))
+
+            if not isinstance(lhs_ty, ScalarType):
+                raise TypeError(
+                    f"CUDA comparison requires scalar lhs elements, got {lhs_ty}"
+                )
+
+            if not isinstance(rhs_ty, ScalarType):
+                raise TypeError(
+                    f"CUDA comparison requires scalar rhs elements, got {rhs_ty}"
+                )
+
+            arithmetic_ty = promote_numeric_types(
+                lhs_ty,
+                rhs_ty,
+            )
+
+        def converted_operand(
+            operand: SSAOperand,
+            expression: str,
+        ) -> str:
+            if arithmetic_ty is None:
+                return expression
+
+            source_ty = self.scalar_type(self.operand_type(operand))
+            if not isinstance(source_ty, ScalarType):
+                raise TypeError(
+                    f"CUDA arithmetic requires scalar operands, got {source_ty}"
+                )
+
+            return self.cuda_cast_expression(
+                expression,
+                source_ty,
+                arithmetic_ty,
+            )
+
         if broadcast_axes is None:
-            lhs = self.expression_operand(op.operands[0])
-            rhs = self.expression_operand(op.operands[1])
+            lhs = converted_operand(
+                op.operands[0],
+                self.expression_operand(op.operands[0]),
+            )
+            rhs = converted_operand(
+                op.operands[1],
+                self.expression_operand(op.operands[1]),
+            )
             self.assign(result, f"({lhs} {symbol} {rhs})")
             return
 
         register_layout = self.layout.register_tile_layout()
 
         if register_layout.registers_per_thread == 1:
-            lhs = self.expression_operand(op.operands[0])
-            rhs = self.expression_operand(op.operands[1])
+            lhs = converted_operand(
+                op.operands[0],
+                self.expression_operand(op.operands[0]),
+            )
+            rhs = converted_operand(
+                op.operands[1],
+                self.expression_operand(op.operands[1]),
+            )
             self.assign(result, f"({lhs} {symbol} {rhs})")
             return
 
@@ -951,15 +1330,21 @@ class SSACUDACodegen:
         cuda_ty = self.cuda_type(result.ty)
 
         for register_coordinate in result_ref.storage_coordinates():
-            lhs = self.register_expression_operand(
+            lhs = converted_operand(
                 op.operands[0],
-                register_coordinate,
-                register_layout,
+                self.register_expression_operand(
+                    op.operands[0],
+                    register_coordinate,
+                    register_layout,
+                ),
             )
-            rhs = self.register_expression_operand(
+            rhs = converted_operand(
                 op.operands[1],
-                register_coordinate,
-                register_layout,
+                self.register_expression_operand(
+                    op.operands[1],
+                    register_coordinate,
+                    register_layout,
+                ),
             )
             result_element = result_ref.element(register_coordinate)
 
@@ -1025,6 +1410,25 @@ class SSACUDACodegen:
     def emit_store(self, op: SSAOp) -> None:
         pointer_operand, value_operand, mask_operand = op.operands
 
+        pointer_ty = self.scalar_type(self.operand_type(pointer_operand))
+        if not isinstance(pointer_ty, PointerType):
+            raise TypeError(f"CUDA store requires a pointer, got {pointer_ty}")
+
+        destination_ty = pointer_ty.element
+        source_ty = self.scalar_type(self.operand_type(value_operand))
+        if not isinstance(source_ty, ScalarType):
+            raise TypeError(f"CUDA store requires scalar values, got {source_ty}")
+
+        def converted_value(expression: str) -> str:
+            if source_ty == destination_ty:
+                return expression
+
+            return self.cuda_cast_expression(
+                expression,
+                source_ty,
+                destination_ty,
+            )
+
         operand_values = tuple(
             self.operand(operand) for operand in op.operands if operand is not None
         )
@@ -1039,7 +1443,7 @@ class SSACUDACodegen:
 
         if register_ref is None:
             ptr = self.pointer_operand(pointer_operand)
-            value = self.expression_operand(value_operand)
+            value = converted_value(self.expression_operand(value_operand))
             mask = (
                 None if mask_operand is None else self.expression_operand(mask_operand)
             )
@@ -1064,10 +1468,12 @@ class SSACUDACodegen:
                 register_coordinate,
                 register_layout,
             )
-            value = self.register_expression_operand(
-                value_operand,
-                register_coordinate,
-                register_layout,
+            value = converted_value(
+                self.register_expression_operand(
+                    value_operand,
+                    register_coordinate,
+                    register_layout,
+                )
             )
             mask = (
                 None
@@ -1248,11 +1654,11 @@ class SSACUDACodegen:
         elif op.opcode == "empty":
             self.declare(result)
         elif op.opcode == "full":
-            self.assign(result, self.expression_operand(op.operands[0]))
+            self.emit_full(op, result)
         elif op.opcode == "zeros":
-            element_ty = self.scalar_type(result.ty)
-            zero = False if element_ty == BOOL else 0.0 if element_ty == F32 else 0
-            self.assign(result, self.literal(zero))
+            self.emit_zeros(result)
+        elif op.opcode == "cast":
+            self.emit_cast(op, result)
         elif op.opcode == "dot":
             self.emit_dot(op, result)
         elif op.opcode in self.BINARY_OPS:
@@ -1260,33 +1666,9 @@ class SSACUDACodegen:
         elif op.opcode == "addptr":
             self.emit_addptr(op, result)
         elif op.opcode == "load":
-            ptr = self.pointer_operand(op.operands[0])
-            mask_operand = op.operands[1]
-            other_operand = op.operands[2]
-            mask = (
-                "true"
-                if mask_operand is None
-                else self.expression_operand(mask_operand)
-            )
-            if other_operand is None:
-                other = "0.0f" if self.scalar_type(result.ty) == F32 else "0"
-            else:
-                other = self.expression_operand(other_operand)
-            self.assign(
-                result,
-                f"({mask} ? {ptr.base}[{ptr.index}] : {other})",
-            )
+            self.emit_load(op, result)
         elif op.opcode in ("maximum", "minimum"):
-            lhs = self.expression_operand(op.operands[0])
-            rhs = self.expression_operand(op.operands[1])
-            symbol = ">" if op.opcode == "maximum" else "<"
-            comparison = f"(({lhs}) {symbol} ({rhs}) ? ({lhs}) : ({rhs}))"
-            if self.scalar_type(result.ty) == F32:
-                comparison = (
-                    f"(isnan({lhs}) ? ({lhs}) : "
-                    f"(isnan({rhs}) ? ({rhs}) : {comparison}))"
-                )
-            self.assign(result, comparison)
+            self.emit_extremum(op, result)
         elif op.opcode == "neg":
             value = self.expression_operand(op.operands[0])
             self.assign(result, f"-({value})")
@@ -1296,13 +1678,7 @@ class SSACUDACodegen:
                 raise TypeError(f"exp requires f32, got {result.ty}")
             self.assign(result, f"expf({value})")
         elif op.opcode == "select":
-            condition = self.expression_operand(op.operands[0])
-            true_value = self.expression_operand(op.operands[1])
-            false_value = self.expression_operand(op.operands[2])
-            self.assign(
-                result,
-                f"({condition} ? {true_value} : {false_value})",
-            )
+            self.emit_select(op, result)
         elif op.opcode in ("sum", "max", "min"):
             self.emit_reduction(op)
         elif op.opcode == "expand_dims":
@@ -1319,6 +1695,7 @@ class SSACUDACodegen:
         self.lines = []
         self.shared_lines = []
         self.shared_memory_bytes = 0
+        self.required_headers = set()
         self.values = {}
         self.definitions = SSADefinitions(ssa_ops)
         self.staging_analysis = CudaDotStagingAnalyzer(self.definitions).analyze()
@@ -1336,10 +1713,17 @@ class SSACUDACodegen:
             elif not self.is_staging_only(op):
                 self.emit(op)
 
-        body = [
-            'extern "C" __global__',
-            f"void {kernel_name}({signature}) {{",
-        ]
+        body = sorted(self.required_headers)
+
+        if body:
+            body.append("")
+
+        body.extend(
+            [
+                'extern "C" __global__',
+                f"void {kernel_name}({signature}) {{",
+            ]
+        )
 
         body.extend(self.shared_lines)
 

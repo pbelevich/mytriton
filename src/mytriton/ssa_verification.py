@@ -5,13 +5,16 @@ from .ssa import SSAForRange, SSAItem, SSAOp, SSAOperand, SSAValue
 from .trace import (
     BOOL,
     F32,
+    FLOAT_TYPES,
     I32,
+    NUMERIC_TYPES,
     BlockType,
     Const,
     Param,
     PointerType,
     ScalarType,
     Type,
+    promote_numeric_types,
 )
 
 
@@ -32,6 +35,7 @@ class SSAVerifier:
         "mul": 2,
         "div": 2,
         "cmp_lt": 2,
+        "cast": 1,
         "neg": 1,
         "exp": 1,
         "maximum": 2,
@@ -122,11 +126,20 @@ class SSAVerifier:
 
     def promote_numeric(self, index: int, op: SSAOp, *types: Type) -> ScalarType:
         elements = [self.element_type(ty) for ty in types]
-        if any(element not in (I32, F32) for element in elements):
+
+        if any(element not in NUMERIC_TYPES for element in elements):
             rendered = " and ".join(str(ty) for ty in types)
             self.fail(index, op, f"cannot combine {rendered}")
 
-        return F32 if F32 in elements else I32
+        lhs_element, rhs_element = elements
+
+        assert isinstance(lhs_element, ScalarType)
+        assert isinstance(rhs_element, ScalarType)
+
+        return promote_numeric_types(
+            lhs_element,
+            rhs_element,
+        )
 
     def is_convertible(self, source: Type, destination: ScalarType) -> bool:
         source_element = self.element_type(source)
@@ -134,7 +147,7 @@ class SSAVerifier:
         if source_element == destination:
             return True
 
-        return source_element in (I32, F32) and destination in (I32, F32)
+        return source_element in NUMERIC_TYPES and destination in NUMERIC_TYPES
 
     def check_binary_numeric(self, index: int, op: SSAOp) -> None:
         lhs_ty = self.require_operand_type(index, op, op.operands[0], "lhs")
@@ -148,6 +161,32 @@ class SSAVerifier:
         expected_ty = self.with_shape(index, op, element, lhs_ty, rhs_ty)
         self.require_type(index, op, result_ty, expected_ty)
 
+    def check_cast(self, index: int, op: SSAOp) -> None:
+        value_ty = self.require_operand_type(
+            index,
+            op,
+            op.operands[0],
+            "value",
+        )
+        result_ty = self.result_type(index, op)
+        dtype = op.attrs.get("dtype")
+
+        if dtype not in NUMERIC_TYPES:
+            self.fail(index, op, f"invalid cast dtype {dtype}")
+
+        assert isinstance(dtype, ScalarType)
+
+        if not self.is_convertible(value_ty, dtype):
+            self.fail(index, op, f"cannot cast {value_ty} to {dtype}")
+
+        expected_ty = self.with_shape(
+            index,
+            op,
+            dtype,
+            value_ty,
+        )
+        self.require_type(index, op, result_ty, expected_ty)
+
     def check_dot(self, index: int, op: SSAOp) -> None:
         lhs_ty = self.require_operand_type(index, op, op.operands[0], "lhs")
         rhs_ty = self.require_operand_type(index, op, op.operands[1], "rhs")
@@ -159,11 +198,27 @@ class SSAVerifier:
         if not isinstance(rhs_ty, BlockType) or rhs_ty.rank != 2:
             self.fail(index, op, f"dot rhs must be a rank-2 block, got {rhs_ty}")
 
-        if lhs_ty.element != F32:
-            self.fail(index, op, f"dot lhs must have f32 elements, got {lhs_ty}")
+        if lhs_ty.element not in FLOAT_TYPES:
+            self.fail(
+                index,
+                op,
+                f"dot lhs must have f16, bf16, or f32 elements, got {lhs_ty}",
+            )
 
-        if rhs_ty.element != F32:
-            self.fail(index, op, f"dot rhs must have f32 elements, got {rhs_ty}")
+        if rhs_ty.element not in FLOAT_TYPES:
+            self.fail(
+                index,
+                op,
+                f"dot rhs must have f16, bf16, or f32 elements, got {rhs_ty}",
+            )
+
+        if lhs_ty.element != rhs_ty.element:
+            self.fail(
+                index,
+                op,
+                "dot operand element types must match, "
+                f"got {lhs_ty.element} and {rhs_ty.element}",
+            )
 
         lhs_m, lhs_k = lhs_ty.shape
         rhs_k, rhs_n = rhs_ty.shape
@@ -538,7 +593,7 @@ class SSAVerifier:
         ):
             self.fail(index, op, f"invalid block shape {shape}")
 
-        if dtype not in (BOOL, I32, F32):
+        if dtype != BOOL and dtype not in NUMERIC_TYPES:
             self.fail(index, op, f"invalid block dtype {dtype}")
 
         assert isinstance(dtype, ScalarType)
@@ -597,6 +652,8 @@ class SSAVerifier:
 
             if op.opcode in {"add", "sub", "mul", "div", "cmp_lt"}:
                 self.check_binary_numeric(index, op)
+            elif op.opcode == "cast":
+                self.check_cast(index, op)
             elif op.opcode == "dot":
                 self.check_dot(index, op)
             elif op.opcode == "and":

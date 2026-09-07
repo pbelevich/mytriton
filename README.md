@@ -77,6 +77,12 @@ MLIR's GPU/NVVM stack to a cubin.
   shared-memory row padding for A tiles, compile-time-unrolled CUDA-core dot
   loops, two-stage ping-pong buffers for canonical runtime K loops, fewer block
   barriers, and conservative shared-memory budget validation.
+- [ver19](https://github.com/pbelevich/mytriton/tree/ver19): public
+  `tl.float16`/`tl.bfloat16` dtypes and `tl.cast`, shared numeric-promotion
+  rules across type inference, SSA verification, and CUDA lowering,
+  low-precision runtime pointer inference, explicit CUDA conversions,
+  two-byte shared-memory tiles, and `f16`/`bf16` CUDA-core `tl.dot` with
+  `f32` accumulation.
 
 ## AST frontend
 
@@ -164,10 +170,11 @@ temporary = tl.empty(BLOCK, tl.float32)
 ```
 
 The shape may be a positive integer or a non-empty tuple/list of positive
-integers. The supported public dtype objects are `tl.int1`, `tl.int32`, and
-`tl.float32`. `tl.full` accepts a scalar Boolean, integer, floating-point, or
-symbolic runtime value and converts numeric values to the requested numeric
-dtype. A block value cannot be used as the fill value.
+integers. The supported public dtype objects are `tl.int1`, `tl.int32`,
+`tl.float16`, `tl.bfloat16`, and `tl.float32`. `tl.full` accepts a scalar
+Boolean, integer, floating-point, or symbolic runtime value and converts
+numeric values to the requested numeric dtype. A block value cannot be used as
+the fill value.
 
 The constructors remain explicit in SSA, including their normalized shape and
 dtype:
@@ -256,11 +263,12 @@ cooperative shared-memory loads; those are the next CUDA lowering stage.
 
 ## `tl.dot` semantics
 
-Rank-2 `f32` blocks can be combined with the public `tl.dot` operation:
+Rank-2 `f16`, `bf16`, or `f32` blocks can be combined with the public `tl.dot`
+operation:
 
 ```python
-lhs = tl.zeros((BM, BK), tl.float32)
-rhs = tl.zeros((BK, BN), tl.float32)
+lhs = tl.zeros((BM, BK), tl.float16)
+rhs = tl.zeros((BK, BN), tl.float16)
 result = tl.dot(lhs, rhs)
 ```
 
@@ -268,16 +276,17 @@ The operands must have shapes `[M, K]` and `[K, N]`. Their inner dimensions
 must match, and the result has shape `[M, N]`:
 
 ```text
-%0 = zeros {shape=(4, 16), dtype=f32} : block<4x16 x f32>
-%1 = zeros {shape=(16, 8), dtype=f32} : block<16x8 x f32>
+%0 = zeros {shape=(4, 16), dtype=f16} : block<4x16 x f16>
+%1 = zeros {shape=(16, 8), dtype=f16} : block<16x8 x f16>
 %2 = dot %0, %1 : block<4x8 x f32>
 ```
 
 The expression-tree type inference and SSA verifier independently check operand
-rank, `f32` element types, matching reduction dimensions, and the exact result
-type. `dot` is a pure SSA operation, so duplicate operations are eligible for
-common subexpression elimination and unused operations can be removed by
-dead-code elimination.
+rank, floating-point element types, equal operand element types, matching
+reduction dimensions, and the exact result type. Both `f16 x f16` and
+`bf16 x bf16` dot products produce an `f32` result. `dot` is a pure SSA
+operation, so duplicate operations are eligible for common subexpression
+elimination and unused operations can be removed by dead-code elimination.
 
 Version 13 defines the language and IR semantics only. Version 14 adds
 cooperative shared-memory staging for canonical matrix loads, and Version 15
@@ -438,8 +447,9 @@ metadata and `cp.async` support needed to implement it safely.
 ## PyTorch tensor interoperability
 
 Runtime pointer arguments may be NumPy arrays, CuPy arrays, or PyTorch tensors.
-All three become the same `ptr<f32>` parameter in typed SSA, so the frontend,
-optimizer, and backend source are independent of the Python array framework.
+The runtime dtype determines whether an array becomes `ptr<f16>`, `ptr<bf16>`,
+or `ptr<f32>` in typed SSA, while the frontend, optimizer, and backend source
+remain independent of the Python array framework.
 
 CPU NumPy arrays and CPU PyTorch tensors are compilation-only inputs. A CUDA
 PyTorch tensor compiles and executes the kernel directly:
@@ -486,7 +496,85 @@ kernel remains correctly ordered without a global device synchronization.
 One launch must use either CuPy CUDA arrays or Torch CUDA tensors, not a mixture
 of the two frameworks. All array arguments must be on the same CUDA device.
 Mixing CPU and CUDA arrays is also rejected. As elsewhere in the current MVP,
-runtime arrays must be C-contiguous and have `float32` elements.
+runtime arrays must be C-contiguous and have `float16`, `bfloat16`, or `float32`
+elements.
+
+## Low-precision types and mixed-precision dot
+
+Version 19 adds the public `tl.float16` and `tl.bfloat16` dtype objects. NumPy,
+CuPy, and PyTorch `float16` arrays become `ptr<f16>` runtime parameters; PyTorch
+`bfloat16` tensors become `ptr<bf16>` parameters. Runtime arrays remain
+C-contiguous, and the currently supported element types are `float16`,
+`bfloat16`, and `float32`.
+
+Numeric operations use one shared promotion rule:
+
+```text
+same + same       -> same
+anything + f32    -> f32
+f16 + bf16        -> f32
+i32 + f16         -> f16
+i32 + bf16        -> bf16
+```
+
+The same rule is used independently when constructing expression types,
+verifying SSA, and emitting CUDA arithmetic and comparisons. Mixed operands are
+converted before applying the CUDA operator, rather than converting the result
+after a lower-precision operation.
+
+The public `tl.cast` operation performs an explicit elementwise numeric
+conversion while preserving the shape of a block:
+
+```python
+values = tl.load(source + offsets)
+converted = tl.cast(values, tl.float32)
+tl.store(destination + offsets, converted)
+```
+
+It remains explicit in SSA:
+
+```text
+%2 = load %1, none, none : vector<8 x f16>
+%3 = cast %2 {dtype=f32} : vector<8 x f32>
+```
+
+The CUDA backend conditionally includes `cuda_fp16.h` or `cuda_bf16.h` and uses
+the corresponding conversion intrinsics:
+
+```cuda
+float f16_value = __half2float(value);
+float bf16_value = __bfloat162float(value);
+__half rounded_f16 = __float2half_rn(value);
+__nv_bfloat16 rounded_bf16 = __float2bfloat16_rn(value);
+```
+
+Conversions are emitted independently for every element owned by a CUDA
+thread, including kernels whose logical rank-2 output is distributed across
+several registers per thread.
+
+Low-precision dot operands remain 16-bit while they are stored in global and
+shared memory. Each shared element therefore occupies two bytes instead of
+four. The current CUDA-core implementation converts both values to `float`
+inside the reduction loop and accumulates into an `f32` register:
+
+```cuda
+float accumulator = 0.0f;
+
+for (int k = 0; k < BK; ++k) {
+    accumulator +=
+        __half2float(shared_a[row * BK + k]) *
+        __half2float(shared_b[k * BN + column]);
+}
+```
+
+The `bf16` path uses `__bfloat162float` in the same way. Masked cooperative
+loads explicitly convert their zero fallback to the shared-buffer element type,
+avoiding ambiguous CUDA conditional expressions.
+
+This is still an ordinary CUDA-core implementation. Version 19 establishes the
+types, conversions, storage widths, and mixed-precision accumulation semantics
+needed by a later tensor-core lowering; it does not emit `mma.sync` or WMMA
+instructions yet.
 
 ## Example
 
@@ -664,8 +752,8 @@ carried inputs, region arguments, yielded values, and loop results. For block
 factory functions it checks that shapes are non-empty and positive, dtypes are
 supported, result block types match the declared shape/dtype, and `tl.full` has
 a scalar fill value convertible to the requested dtype. For `tl.dot`, it
-requires two rank-2 `f32` operands, matching inner dimensions, and an exact
-`[M, N]` rank-2 `f32` result.
+requires two rank-2 operands with equal `f16`, `bf16`, or `f32` element types,
+matching inner dimensions, and an exact `[M, N]` rank-2 `f32` result.
 
 Straight-line verified SSA then runs through a small optimization pipeline:
 
@@ -697,10 +785,10 @@ these rewrite passes because they are not region-aware yet.
   assigning to the induction variable is rejected. `if`/`while`,
   `break`/`continue`, `for/else`, and other symbolic Python control flow are not
   supported.
-- Runtime array arguments must be C-contiguous `float32` arrays. One execution
-  cannot mix CPU and CUDA arrays, CuPy and Torch CUDA arrays, or arrays from
-  different CUDA devices. Raw launches accept Torch tensors with
-  `requires_grad=True`, but do not participate in PyTorch autograd.
+- Runtime array arguments must be C-contiguous `float16`, `bfloat16`, or
+  `float32` arrays. One execution cannot mix CPU and CUDA arrays, CuPy and Torch
+  CUDA arrays, or arrays from different CUDA devices. Raw launches accept Torch
+  tensors with `requires_grad=True`, but do not participate in PyTorch autograd.
 - The launch grid is evaluated and used for CUDA execution, but it is not
   represented in the IR.
 - The CUDA kernel layout is inferred from block-shaped operands of observable
@@ -723,13 +811,15 @@ these rewrite passes because they are not region-aware yet.
   carried values. It also supports `tl.empty`, `tl.full`, and `tl.zeros` for
   rank-1 and rank-2 logical blocks. Reduction lowering internally emits the
   CUDA shared-memory scratch buffers and synchronization needed for block-local
-  reductions. Floating-point elementwise extrema propagate NaNs and choose the
-  right-hand operand when values compare equal. For canonical matrix-load
-  operands, `tl.dot` lowering emits shared-memory declarations, cooperative
-  masked loads with zero-filled boundaries, a CUDA-core FMA loop, and the
-  barriers required before reading and reusing the shared tiles. Runtime
-  `range` loops can accumulate multiple K-tiles into one result. Dot outputs,
-  their broadcasted row/column coordinates, pointer arithmetic, masks,
+  reductions. It supports explicit numeric `tl.cast`, including register-wise
+  conversion of rank-2 tiles, and emits the required CUDA `f16`/`bf16` headers
+  and conversion intrinsics. Floating-point elementwise extrema propagate NaNs
+  and choose the right-hand operand when values compare equal. For canonical
+  matrix-load operands, `tl.dot` lowering emits shared-memory declarations,
+  cooperative masked loads with zero-filled boundaries, a CUDA-core FMA loop,
+  and the barriers required before reading and reusing the shared tiles.
+  Runtime `range` loops can accumulate multiple K-tiles into one result. Dot
+  outputs, their broadcasted row/column coordinates, pointer arithmetic, masks,
   loop-carried accumulators, and stores support several register-resident
   results per CUDA thread.
 - Reductions are currently single-block reductions over the SSA vector width.
@@ -741,6 +831,9 @@ these rewrite passes because they are not region-aware yet.
   canonical `tl.dot` operands. A `[BM, BK]` and B `[BK, BN]` are loaded
   cooperatively into shared memory, each thread computes a rank-2 register tile
   of C elements, and a runtime CUDA loop can traverse the complete K dimension.
+  Operands may use matching `f16`, `bf16`, or `f32` element types; low-precision
+  tiles retain their two-byte representation in shared memory and are converted
+  to `f32` for CUDA-core multiplication and accumulation.
   Conflict-aware row padding reduces bank conflicts for A, and canonical K
   loops alternate between two shared-memory stages to remove a tile-reuse
   barrier. The implementation still has a fixed one-warp-at-most dot layout

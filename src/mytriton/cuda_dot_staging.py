@@ -2,13 +2,26 @@ from dataclasses import dataclass
 from math import gcd
 
 from .ssa import SSAForRange, SSAItem, SSAOp, SSAOperand, SSAValue
-from .trace import F32, I32, BlockType, Const, Param, PointerType, ScalarType
+from .trace import (
+    BF16,
+    BOOL,
+    F16,
+    F32,
+    I32,
+    BlockType,
+    Const,
+    Param,
+    PointerType,
+    ScalarType,
+)
 
 
 def cuda_scalar_nbytes(ty: ScalarType) -> int:
     if ty in (F32, I32):
         return 4
-    if ty.name == "bool":
+    if ty in (F16, BF16):
+        return 2
+    if ty == BOOL:
         return 1
 
     raise TypeError(f"cannot determine CUDA storage size for {ty}")

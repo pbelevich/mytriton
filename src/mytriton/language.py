@@ -1,9 +1,12 @@
 from .trace import (
     arange,
+    bfloat16,
+    cast,
     constexpr,
     dot,
     empty,
     exp,
+    float16,
     float32,
     full,
     int1,
@@ -23,10 +26,13 @@ from .trace import (
 
 __all__ = [
     "arange",
+    "bfloat16",
+    "cast",
     "constexpr",
     "dot",
     "empty",
     "exp",
+    "float16",
     "float32",
     "full",
     "int1",

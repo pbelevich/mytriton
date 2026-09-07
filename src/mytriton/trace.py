@@ -51,8 +51,11 @@ def _normalize_block_shape(shape: int | tuple[int, ...] | list[int]) -> tuple[in
 
 
 def _require_block_dtype(dtype: ScalarType) -> ScalarType:
-    if dtype not in (BOOL, I32, F32):
-        raise TypeError(f"block dtype must be int1, int32, or float32, got {dtype}")
+    if dtype not in (BOOL, I32, F16, BF16, F32):
+        raise TypeError(
+            "block dtype must be int1, int32, float16, bfloat16, "
+            f"or float32, got {dtype}"
+        )
     return dtype
 
 
@@ -82,6 +85,21 @@ def zeros(
     dtype: ScalarType,
 ) -> Value:
     return Value(Zeros(_normalize_block_shape(shape), _require_block_dtype(dtype)))
+
+
+def cast(
+    value: Value | int | float,
+    dtype: ScalarType,
+) -> Value:
+    if not isinstance(dtype, ScalarType) or dtype not in NUMERIC_TYPES:
+        raise TypeError(f"cast dtype must be numeric, got {dtype}")
+
+    return Value(
+        Cast(
+            value=unwrap(value),
+            dtype=dtype,
+        )
+    )
 
 
 def dot(lhs: Value, rhs: Value) -> Value:
@@ -233,12 +251,54 @@ Type = ScalarType | PointerType | BlockType
 
 
 I32 = ScalarType("i32")
+F16 = ScalarType("f16")
+BF16 = ScalarType("bf16")
 F32 = ScalarType("f32")
 BOOL = ScalarType("bool")
+
+FLOAT_TYPES = frozenset((F16, BF16, F32))
+NUMERIC_TYPES = frozenset((I32, F16, BF16, F32))
+
+
+def promote_numeric_types(
+    lhs: ScalarType,
+    rhs: ScalarType,
+) -> ScalarType:
+    if lhs not in NUMERIC_TYPES or rhs not in NUMERIC_TYPES:
+        raise TypeError(f"cannot promote non-numeric types {lhs} and {rhs}")
+
+    if lhs == rhs:
+        return lhs
+
+    if F32 in (lhs, rhs):
+        return F32
+
+    if {lhs, rhs} == {F16, BF16}:
+        return F32
+
+    if F16 in (lhs, rhs):
+        return F16
+
+    if BF16 in (lhs, rhs):
+        return BF16
+
+    raise AssertionError(f"unhandled numeric promotion: {lhs} and {rhs}")
+
+
+PTR_F16 = PointerType(F16)
+PTR_BF16 = PointerType(BF16)
 PTR_F32 = PointerType(F32)
+
+ARRAY_POINTER_TYPES: dict[str, PointerType] = {
+    "float16": PTR_F16,
+    "bfloat16": PTR_BF16,
+    "float32": PTR_F32,
+}
 
 int1 = BOOL
 int32 = I32
+float16 = F16
+bfloat16 = BF16
 float32 = F32
 
 
@@ -280,6 +340,12 @@ class Full:
 @dataclass
 class Zeros:
     shape: tuple[int, ...]
+    dtype: ScalarType
+
+
+@dataclass
+class Cast:
+    value: Expression
     dtype: ScalarType
 
 
@@ -401,6 +467,7 @@ Expression: TypeAlias = (
     | Empty
     | Full
     | Zeros
+    | Cast
     | Dot
     | BinOp
     | AddPtr
@@ -532,13 +599,17 @@ def _make_param(name, value) -> Param:
     array_info = array_arg_info(value)
 
     if array_info is not None:
-        if array_info.dtype_name != "float32":
-            raise TypeError(f"{name}: only float32 arrays are supported")
+        pointer_ty = ARRAY_POINTER_TYPES.get(array_info.dtype_name)
+
+        if pointer_ty is None:
+            raise TypeError(
+                f"{name}: only float16, bfloat16, or float32 arrays are supported"
+            )
 
         if not array_info.c_contiguous:
             raise TypeError(f"{name}: only C-contiguous arrays are supported")
 
-        return Param(name, PTR_F32)
+        return Param(name, pointer_ty)
 
     if isinstance(value, (int, np.integer)):
         return Param(name, I32)

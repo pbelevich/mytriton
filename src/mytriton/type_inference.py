@@ -4,11 +4,14 @@ from .block_shapes import broadcast_shapes
 from .trace import (
     BOOL,
     F32,
+    FLOAT_TYPES,
     I32,
+    NUMERIC_TYPES,
     AddPtr,
     Arange,
     BinOp,
     BlockType,
+    Cast,
     Const,
     Dot,
     Empty,
@@ -32,6 +35,7 @@ from .trace import (
     UnaryOp,
     Where,
     Zeros,
+    promote_numeric_types,
 )
 
 
@@ -63,10 +67,16 @@ class TypeInference:
         lhs_element = self.element_type(lhs)
         rhs_element = self.element_type(rhs)
 
-        if lhs_element not in (I32, F32) or rhs_element not in (I32, F32):
+        if lhs_element not in NUMERIC_TYPES or rhs_element not in NUMERIC_TYPES:
             raise TypeError(f"Cannot combine {lhs} and {rhs}")
 
-        return F32 if F32 in (lhs_element, rhs_element) else I32
+        assert isinstance(lhs_element, ScalarType)
+        assert isinstance(rhs_element, ScalarType)
+
+        return promote_numeric_types(
+            lhs_element,
+            rhs_element,
+        )
 
     def require_mask(self, mask: Type) -> None:
         if self.element_type(mask) != BOOL:
@@ -84,8 +94,7 @@ class TypeInference:
         if source_element == destination:
             return
 
-        numeric = (I32, F32)
-        if source_element in numeric and destination in numeric:
+        if source_element in NUMERIC_TYPES and destination in NUMERIC_TYPES:
             return
 
         raise TypeError(f"{context} must be convertible to {destination}, got {source}")
@@ -100,11 +109,21 @@ class TypeInference:
         if not isinstance(rhs_ty, BlockType) or rhs_ty.rank != 2:
             raise TypeError(f"dot rhs must be a rank-2 block, got {rhs_ty}")
 
-        if lhs_ty.element != F32:
-            raise TypeError(f"dot lhs must have f32 elements, got {lhs_ty}")
+        if lhs_ty.element not in FLOAT_TYPES:
+            raise TypeError(
+                f"dot lhs must have f16, bf16, or f32 elements, got {lhs_ty}"
+            )
 
-        if rhs_ty.element != F32:
-            raise TypeError(f"dot rhs must have f32 elements, got {rhs_ty}")
+        if rhs_ty.element not in FLOAT_TYPES:
+            raise TypeError(
+                f"dot rhs must have f16, bf16, or f32 elements, got {rhs_ty}"
+            )
+
+        if lhs_ty.element != rhs_ty.element:
+            raise TypeError(
+                "dot operand element types must match, "
+                f"got {lhs_ty.element} and {rhs_ty.element}"
+            )
 
         lhs_m, lhs_k = lhs_ty.shape
         rhs_k, rhs_n = rhs_ty.shape
@@ -172,6 +191,19 @@ class TypeInference:
                 context="full value",
             )
             ty = BlockType(expr.shape, expr.dtype)
+
+        elif isinstance(expr, Cast):
+            value_ty = self.infer(expr.value)
+
+            if expr.dtype not in NUMERIC_TYPES:
+                raise TypeError(f"cast dtype must be numeric, got {expr.dtype}")
+
+            self.require_convertible(
+                value_ty,
+                expr.dtype,
+                context="cast value",
+            )
+            ty = self.with_shape(expr.dtype, value_ty)
 
         elif isinstance(expr, Dot):
             ty = self.infer_dot(expr)
