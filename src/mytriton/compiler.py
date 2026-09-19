@@ -8,6 +8,7 @@ from typing import Any, Generic, Literal, ParamSpec, TypeAlias, cast
 from .ast_frontend import trace
 from .block_shapes import cuda_threads_per_block
 from .cuda_codegen import SSACUDACodegen
+from .cuda_target import DEFAULT_CUDA_TARGET, CudaTarget
 from .cuda_utils import (
     CudaKernelCache,
     CudaUnavailableError,
@@ -116,7 +117,14 @@ class CompiledKernel(Generic[P]):
             params = make_runtime_params(self.signature, bound.arguments)
             backend = self._resolve_backend()
             chip = None
-            if backend == "mlir":
+            cuda_target = DEFAULT_CUDA_TARGET
+            if backend == "cuda":
+                if cuda_execution_required(runtime_args, backend_name="CUDA"):
+                    chip = cuda_chip(runtime_args)
+                    cuda_target = CudaTarget.from_chip(chip)
+                else:
+                    chip = cuda_target.chip
+            else:
                 try:
                     chip = cuda_chip(runtime_args)
                 except CudaUnavailableError:
@@ -165,7 +173,7 @@ class CompiledKernel(Generic[P]):
                 if backend == "mlir":
                     src = MLIRCodegen().generate(self.fn.__name__, ssa_ops, params)
                 else:
-                    src = SSACUDACodegen().generate(
+                    src = SSACUDACodegen(target=cuda_target).generate(
                         self.fn.__name__,
                         ssa_ops,
                         params,

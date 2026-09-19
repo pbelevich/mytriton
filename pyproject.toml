@@ -11,8 +11,8 @@ requires-python = ">=3.10"
 dependencies = ["numpy>=2"]
 
 [project.optional-dependencies]
-cuda12 = ["cupy-cuda12x>=13"]
-cuda13 = ["cupy-cuda13x>=14"]
+cuda12 = ["cupy-cuda12x>=13", "ml_dtypes>=0.5"]
+cuda13 = ["cupy-cuda13x>=14", "ml_dtypes>=0.5"]
 test = ["pytest>=8"]
 dev = [
     "mypy>=1.14",

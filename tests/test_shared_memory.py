@@ -2560,6 +2560,17 @@ def test_double_buffering_matcher_accepts_canonical_k_loop() -> None:
     )
     assert dot.result is not None
 
+    accumulation = next(
+        item
+        for item in loop.body
+        if (
+            isinstance(item, SSAOp)
+            and item.opcode == "add"
+            and dot.result in item.operands
+        )
+    )
+    assert accumulation.result is not None
+
     analysis = CudaDotStagingAnalyzer(SSADefinitions(ssa_ops)).analyze()
 
     assert match_cuda_dot_double_buffering(
@@ -2567,6 +2578,7 @@ def test_double_buffering_matcher_accepts_canonical_k_loop() -> None:
         analysis,
     ) == CudaDotDoubleBufferingPlan(
         dot_result_id=dot.result.id,
+        accumulation_result_id=accumulation.result.id,
     )
 
     loop.step = Const(BK // 2)
@@ -2601,15 +2613,6 @@ def test_double_buffering_matcher_accepts_canonical_k_loop() -> None:
     )
 
     loop.start = Const(0)
-    accumulation = next(
-        item
-        for item in loop.body
-        if (
-            isinstance(item, SSAOp)
-            and item.opcode == "add"
-            and dot.result in item.operands
-        )
-    )
     accumulation.opcode = "mul"
 
     assert (

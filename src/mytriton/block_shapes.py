@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from .trace import BlockType
+from .trace import F16, F32, BlockType, ScalarType
 
 if TYPE_CHECKING:
     from .ssa import SSAItem
@@ -14,6 +14,142 @@ def prod(shape: tuple[int, ...]) -> int:
     for dim in shape:
         result *= dim
     return result
+
+
+@dataclass(frozen=True)
+class CudaMmaM16N8K8Layout:
+    """Per-lane fragment layout for PTX mma.m16n8k8."""
+
+    lhs_shape = (16, 8)
+    rhs_shape = (8, 8)
+    result_shape = (16, 8)
+    threads_per_warp = 32
+    thread_shape = (4, 8)
+
+    def lane_parts(self, lane: int) -> tuple[int, int]:
+        if type(lane) is not int or not 0 <= lane < self.threads_per_warp:
+            raise ValueError(f"MMA lane must be between 0 and 31, got {lane}")
+
+        group_id = lane // 4
+        thread_id_in_group = lane % 4
+        return group_id, thread_id_in_group
+
+    def lhs_coordinates(
+        self,
+        lane: int,
+    ) -> tuple[
+        tuple[int, int],
+        tuple[int, int],
+        tuple[int, int],
+        tuple[int, int],
+    ]:
+        group_id, thread_id = self.lane_parts(lane)
+        first_column = thread_id * 2
+
+        return (
+            (group_id, first_column),
+            (group_id, first_column + 1),
+            (group_id + 8, first_column),
+            (group_id + 8, first_column + 1),
+        )
+
+    def rhs_coordinates(
+        self,
+        lane: int,
+    ) -> tuple[
+        tuple[int, int],
+        tuple[int, int],
+    ]:
+        group_id, thread_id = self.lane_parts(lane)
+        first_row = thread_id * 2
+
+        return (
+            (first_row, group_id),
+            (first_row + 1, group_id),
+        )
+
+    def accumulator_coordinates(
+        self,
+        lane: int,
+    ) -> tuple[
+        tuple[int, int],
+        tuple[int, int],
+        tuple[int, int],
+        tuple[int, int],
+    ]:
+        group_id, thread_id = self.lane_parts(lane)
+        first_column = thread_id * 2
+
+        return (
+            (group_id, first_column),
+            (group_id, first_column + 1),
+            (group_id + 8, first_column),
+            (group_id + 8, first_column + 1),
+        )
+
+
+def is_cuda_mma_m16n8k8_dot(
+    op: SSAItem,
+    *,
+    operand_types: frozenset[ScalarType] = frozenset((F16,)),
+) -> bool:
+    """Whether an SSA dot matches a supported m16n8k8 MMA contract."""
+
+    from .ssa import SSAOp, SSAValue
+
+    if not isinstance(op, SSAOp) or op.opcode != "dot":
+        return False
+
+    if op.result is None or len(op.operands) != 2:
+        return False
+
+    lhs, rhs = op.operands
+    if not isinstance(lhs, SSAValue) or not isinstance(rhs, SSAValue):
+        return False
+
+    layout = CudaMmaM16N8K8Layout()
+
+    if not isinstance(lhs.ty, BlockType) or not isinstance(rhs.ty, BlockType):
+        return False
+
+    operand_ty = lhs.ty.element
+
+    return (
+        operand_ty in operand_types
+        and lhs.ty == BlockType(layout.lhs_shape, operand_ty)
+        and rhs.ty == BlockType(layout.rhs_shape, operand_ty)
+        and op.result.ty == BlockType(layout.result_shape, F32)
+    )
+
+
+def cuda_mma_m16n8k8_dot_result_ids(
+    ssa_ops: list[SSAItem],
+    *,
+    operand_types: frozenset[ScalarType] = frozenset((F16,)),
+) -> frozenset[int]:
+    """Collect tensor-core-compatible dot result IDs recursively."""
+
+    from .ssa import SSAForRange
+
+    result_ids: set[int] = set()
+
+    for item in ssa_ops:
+        if isinstance(item, SSAForRange):
+            result_ids.update(
+                cuda_mma_m16n8k8_dot_result_ids(
+                    item.body,
+                    operand_types=operand_types,
+                )
+            )
+            continue
+
+        if not is_cuda_mma_m16n8k8_dot(item, operand_types=operand_types):
+            continue
+
+        assert item.result is not None
+        result_ids.add(item.result.id)
+
+    return frozenset(result_ids)
 
 
 @dataclass(frozen=True)
