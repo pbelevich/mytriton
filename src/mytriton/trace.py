@@ -1,7 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Annotated, Any, TypeAlias, get_args, get_origin
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    TypeAlias,
+    get_args,
+    get_origin,
+    overload,
+)
 
 import numpy as np
 
@@ -33,6 +41,31 @@ def program_id(axis: int) -> Value:
 
 def arange(start: int, end: int) -> Value:
     return Value(Arange(start, end))
+
+
+@overload
+def cdiv(x: int, div: int) -> int: ...
+
+
+@overload
+def cdiv(x: Value, div: Value | int) -> Value: ...
+
+
+@overload
+def cdiv(x: int, div: Value) -> Value: ...
+
+
+def cdiv(x: Value | int, div: Value | int) -> Value | int:
+    """Compute ceiling division for constexpr or symbolic integer values."""
+
+    if isinstance(x, int) and isinstance(div, int):
+        return (x + div - 1) // div
+
+    if isinstance(x, Value):
+        return (x + div - 1) / div
+
+    assert isinstance(div, Value)
+    return (div.__radd__(x) - 1) / div
 
 
 def _normalize_block_shape(shape: int | tuple[int, ...] | list[int]) -> tuple[int, ...]:

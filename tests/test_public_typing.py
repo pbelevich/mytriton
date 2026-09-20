@@ -8,6 +8,7 @@ def _mypy_contract() -> None:
     tl.load(1)  # type: ignore[arg-type]
     tl.store(1, 2.0)  # type: ignore[arg-type]
     tl.arange(0, 1.0)  # type: ignore[arg-type]
+    tl.cdiv(1.0, 2)  # type: ignore[call-overload]
     tl.where(1, 1.0, 2.0)  # type: ignore[arg-type]
     tl.where(True, "negative", 2.0)  # type: ignore[arg-type]
     triton.cdiv(1.0, 2)  # type: ignore[arg-type]
@@ -23,6 +24,7 @@ def test_public_dsl_functions_have_annotations():
     for function in (
         tl.program_id,
         tl.arange,
+        tl.cdiv,
         tl.load,
         tl.store,
         tl.minimum,

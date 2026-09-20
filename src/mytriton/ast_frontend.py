@@ -4,6 +4,7 @@ import ast
 import inspect
 import textwrap
 from collections.abc import Mapping
+from contextlib import suppress
 from typing import Any
 
 from . import language as tl
@@ -25,6 +26,10 @@ from .trace import (
 
 class ASTFrontendError(TypeError):
     pass
+
+
+class _KernelReturn(Exception):
+    """Stop tracing after an unconditional bare kernel return."""
 
 
 def _find_function_def(fn) -> ast.FunctionDef:
@@ -113,9 +118,12 @@ class ASTTracer(ast.NodeVisitor):
         env: dict[str, Any],
         external_env: Mapping[str, Any],
         capture_env: Mapping[str, Any] | None = None,
+        *,
+        allow_return: bool = True,
     ) -> None:
         self.env = env
         self.external_env = external_env
+        self.allow_return = allow_return
         self._capture_ids = {
             id(unwrap(value))
             for value in (capture_env or {}).values()
@@ -297,6 +305,7 @@ class ASTTracer(ast.NodeVisitor):
                 body_env,
                 self.external_env,
                 capture_env=capture_env,
+                allow_return=False,
             )
             body_tracer.visit_stmt_list(node.body)
 
@@ -331,7 +340,16 @@ class ASTTracer(ast.NodeVisitor):
         # Names created only inside the loop do not leak in this MVP.
 
     def visit_Return(self, node: ast.Return) -> None:
-        raise ASTFrontendError("return statements are not supported in kernels")
+        if node.value is not None:
+            raise ASTFrontendError("kernel return values are not supported")
+
+        if not self.allow_return:
+            raise ASTFrontendError("return inside a runtime for loop is not supported")
+
+        raise _KernelReturn
+
+    def visit_Pass(self, node: ast.Pass) -> None:
+        pass
 
     # ----------------------------
     # Expressions
@@ -497,7 +515,7 @@ def trace(fn, signature, bound_args, runtime_params=None):
         **closure_vars.nonlocals,
     }
 
-    with Builder() as builder:
+    with Builder() as builder, suppress(_KernelReturn):
         ASTTracer(env, external_env).visit_stmt_list(function_def.body)
 
     return builder.ops, runtime_params
