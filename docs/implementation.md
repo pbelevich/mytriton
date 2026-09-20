@@ -89,6 +89,10 @@ MLIR's GPU/NVVM stack to a cubin.
   warp-fragment layouts, packed 16-bit PTX operands, fused loop-carried `f32`
   accumulation across K-tiles, fragment redistribution for masked stores,
   and CUDA execution tests covering partial boundary tiles.
+- Version 21 (unreleased): composable one-warp MMA tiles whose M, N, and K
+  dimensions are positive multiples of 16, 8, and 8, respectively; logical
+  dots are decomposed into grids of `mma.sync.m16n8k8` instructions with one
+  FP32 accumulator fragment per `16 x 8` output region.
 
 ## AST frontend
 
@@ -584,8 +588,8 @@ instructions yet.
 
 ## Tensor-core dot
 
-Version 20 adds the first specialized tensor-core lowering. The CUDA backend
-recognizes this dot contract for matching operand types `T`:
+Version 20 introduced the first specialized tensor-core lowering. Its hardware
+atom is this dot contract for matching operand types `T`:
 
 ```text
 A: T[16, 8]
@@ -606,15 +610,88 @@ the otherwise identical native BF16 variant:
 mma.sync.aligned.m16n8k8.row.col.f32.bf16.bf16.f32
 ```
 
-Other shapes and `f32` operands continue to use the existing CUDA-core
-implementation. BF16 also falls back to CUDA cores on pre-Ampere targets,
-instead of emitting an unsupported PTX instruction. CUDA compilation artifacts
-are cached per architecture so code selected for `sm_80` cannot be reused on an
-incompatible device. Compilation-only calls with CPU arrays conservatively use
-`sm_75`.
+BF16 falls back to CUDA cores on pre-Ampere targets instead of emitting an
+unsupported PTX instruction. CUDA compilation artifacts are cached per
+architecture so code selected for `sm_80` cannot be reused on an incompatible
+device. Compilation-only calls with CPU arrays conservatively use `sm_75`.
 
-Tensor-core operands are warp fragments rather than ordinary per-thread
-register tiles. For lane `lane`, the backend computes:
+### Composable warp MMA tiles
+
+Version 21 separates the physical `m16n8k8` instruction from the logical tile
+computed by one warp. A low-precision dot is eligible when its dimensions are
+positive multiples of the instruction dimensions:
+
+```text
+A: T[M, K]    M % 16 == 0
+B: T[K, N]    N % 8  == 0
+C: f32[M, N]  K % 8  == 0
+```
+
+`CudaMmaWarpTileLayout` records the logical `(M, N, K)` shape and derives the
+number of physical atoms along each axis:
+
+```text
+m_tiles = M / 16
+n_tiles = N / 8
+k_tiles = K / 8
+
+instruction_count = m_tiles * n_tiles * k_tiles
+```
+
+For example, a `32 x 16 x 16` dot becomes:
+
+```text
+m_tiles = 2
+n_tiles = 2
+k_tiles = 2
+instruction_count = 2 * 2 * 2 = 8
+```
+
+The instructions are emitted in `(m_tile, n_tile, k_tile)` order:
+
+```text
+(0, 0, 0)  (0, 0, 1)
+(0, 1, 0)  (0, 1, 1)
+(1, 0, 0)  (1, 0, 1)
+(1, 1, 0)  (1, 1, 1)
+```
+
+Each `(m_tile, n_tile)` pair owns one independent four-register FP32
+accumulator fragment. Instructions with different `k_tile` values update the
+same fragment, implementing the reduction over K. The fragment index is:
+
+```text
+fragment_index = m_tile * n_tiles + n_tile
+```
+
+Consequently, each lane owns:
+
+```text
+4 * m_tiles * n_tiles
+```
+
+FP32 accumulator registers. The `32 x 16` output above has four fragments and
+therefore 16 accumulator registers per lane.
+
+The layout also offsets the physical fragment coordinates into the logical
+tile. For instruction `(m_tile, n_tile, k_tile)`, A receives row and K offsets,
+B receives K and column offsets, and C receives row and column offsets:
+
+```text
+A offset: (m_tile * 16, k_tile * 8)
+B offset: (k_tile * 8, n_tile * 8)
+C offset: (m_tile * 16, n_tile * 8)
+```
+
+The SSA matcher returns a mapping from each eligible dot result ID to its
+`CudaMmaWarpTileLayout`. CUDA generation uses this mapping both for standalone
+dots and for dots nested in runtime K-loops. Shapes that do not satisfy the
+instruction multiples, `f32` operands, and unsupported target/type
+combinations retain the CUDA-core implementation.
+
+Within each physical instruction, tensor-core operands are warp fragments
+rather than ordinary per-thread register tiles. For lane `lane`, the backend
+computes:
 
 ```text
 group = lane >> 2
@@ -647,9 +724,10 @@ C[group + 8, thread * 2 + 1]
 ```
 
 The cooperative loading machinery from the earlier shared-memory versions
-first copies the global A and B tiles into shared memory. Every pair of adjacent
-16-bit values is then packed into one 32-bit PTX operand register. FP16 extracts
-the bits with `__half_as_ushort`:
+first copies the complete logical A and B tiles into shared memory. For each
+physical instruction, the scalar fragment loader applies the logical tile
+offsets above and packs every pair of adjacent 16-bit values into one 32-bit
+PTX operand register. FP16 extracts the bits with `__half_as_ushort`:
 
 ```cuda
 unsigned packed =
@@ -658,8 +736,11 @@ unsigned packed =
 ```
 
 BF16 extracts the same two raw 16-bit payloads from `__nv_bfloat16_raw` before
-packing them. The fragment coordinates and the four FP32 accumulator registers
-are shared by both operand types.
+packing them. The fragment coordinates and FP32 accumulator layout are shared
+by both operand types. Version 21 deliberately materializes a separate operand
+register set for every instruction, even when two instructions could reuse the
+same A or B fragment. A later `ldmatrix` lowering will replace this readable
+scalar path and make fragment reuse explicit.
 
 A lane supplies two packed A registers and one packed B register to
 `mma.sync`. Four `f32` registers contain its accumulator fragment:
@@ -677,17 +758,18 @@ asm volatile(
 ```
 
 The `+f` constraints make every accumulator register both an input and an
-output. A standalone `tl.dot` initializes these registers with zero, producing
-`A x B + 0`.
+output. A standalone `tl.dot` initializes every logical C fragment with zero.
+Successive K atoms feed the same four registers back into `mma.sync`, producing
+the complete reduction rather than independent partial results.
 
-A tiled matrix multiplication carries the same four-register fragment across
+A tiled matrix multiplication carries all of its accumulator fragments across
 runtime K-loop iterations:
 
 ```python
 acc = tl.zeros((BM, BN), tl.float32)
 
 for k_base in range(0, K, BK):
-    # Load A [16, 8] and B [8, 8] tiles.
+    # For example, load A [32, 16] and B [16, 16] tiles.
     acc = acc + tl.dot(a_values, b_values)
 
 tl.store(output_pointers, acc, mask=output_mask)
@@ -711,16 +793,19 @@ next_acc = mma(a, b, acc)
 ```
 
 The separate CUDA `add` is not emitted. Instead, the previous loop-carried
-fragment initializes the four `+f` operands of `mma.sync`, and the instruction's
-results become the accumulator for the next K-tile.
+fragments initialize the `+f` operands of their corresponding `mma.sync`
+instructions, and the instruction results become the accumulator for the next
+K-tile. The number of loop-carried registers is derived from the logical warp
+layout rather than being fixed at four.
 
 A tensor-core accumulator has a different lane-to-element mapping from the
 ordinary output register tile used by pointer arithmetic, masks, and stores.
-After the K loop, each lane writes its four accumulator registers into a
-row-major shared-memory result tile. A block barrier makes the complete tile
-visible, after which the existing register-tile store path reads the appropriate
-elements and performs masked global stores. This redistribution also preserves
-correctness for partial M and N boundary tiles.
+After the K loop, each lane writes every four-register fragment into its
+`16 x 8` region of a row-major shared-memory result tile. A block barrier makes
+the complete logical tile visible, after which the existing register-tile
+store path reads the appropriate elements and performs masked global stores.
+This redistribution also preserves correctness for partial M and N boundary
+tiles.
 
 Partial K-tiles reuse the existing masked cooperative loads. Out-of-bounds A
 and B elements are written as a zero of the operand type into shared memory, so
@@ -732,10 +817,12 @@ pytest output. The CUDA optional dependencies include `ml_dtypes`, which CuPy
 needs to consume PyTorch BF16 storage through DLPack.
 
 The current implementation focuses on correctness and a visible end-to-end
-tensor-core lowering. It uses one warp, one fixed MMA shape, synchronous
-shared-memory loading, and an extra shared-memory redistribution before the
-store. It does not yet provide multiple warps per output tile, asynchronous
-copies, software pipelining, fragment swizzling, or autotuning.
+tensor-core lowering. A logical tile may contain multiple physical MMA atoms,
+but it is still owned by one warp. Operand fragments use repeated scalar
+shared-memory reads and packing, and the result uses an extra shared-memory
+redistribution before the store. The backend does not yet provide `ldmatrix`,
+multiple warps per output tile, asynchronous copies, software pipelining,
+fragment swizzling, or autotuning.
 
 ## Example
 
@@ -999,12 +1086,13 @@ these rewrite passes because they are not region-aware yet.
   to `f32` for CUDA-core multiplication and accumulation.
   Conflict-aware row padding reduces bank conflicts for A, and canonical K
   loops alternate between two shared-memory stages to remove a tile-reuse
-  barrier. Canonical `f16`/`bf16` `m16n8k8` dots use Tensor Core `mma.sync`
-  when the CUDA target supports them; other operand types, shapes, and targets
-  retain the CUDA-core path. The implementation still has a fixed
-  one-warp-at-most dot layout policy and no vectorized loads, general
-  shared-memory swizzling, overlapped prefetching, asynchronous copies, or
-  autotuning.
+  barrier. Eligible `f16`/`bf16` dots whose M, N, and K dimensions are
+  divisible by 16, 8, and 8 are composed from Tensor Core
+  `mma.sync.m16n8k8` instructions when the CUDA target supports them; other
+  operand types, shapes, and targets retain the CUDA-core path. The
+  implementation still assigns one warp to the complete dot tile and has no
+  `ldmatrix`, vectorized operand loads, general shared-memory swizzling,
+  overlapped prefetching, asynchronous copies, or autotuning.
   `tl.empty`, `tl.full`, and `tl.zeros` continue to represent logical
   per-thread values rather than shared-memory allocations.
 - MLIR lowering currently supports only `ptr<f32>` parameters as

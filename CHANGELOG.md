@@ -4,6 +4,13 @@ Each release tag marks one lesson-sized compiler milestone. The project does
 not use semantic versioning yet; `verN` records the order in which features
 were built.
 
+## Unreleased
+
+- Added composable one-warp Tensor Core tiles that lower larger FP16/BF16
+  `tl.dot` operations into grids of `mma.sync.m16n8k8` instructions, carry
+  multiple accumulator fragments across runtime K-loops, and redistribute the
+  complete logical result through shared memory.
+
 ## [ver20](https://github.com/pbelevich/mytriton/tree/ver20) — 2026-09-19
 
 - Lowered canonical FP16/BF16 `tl.dot` to target-aware Tensor Core

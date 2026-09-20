@@ -5,9 +5,10 @@ from typing import ClassVar
 from .block_shapes import (
     CudaKernelLayout,
     CudaMmaM16N8K8Layout,
+    CudaMmaWarpTileLayout,
     CudaRegisterTileLayout,
     cuda_kernel_layout,
-    cuda_mma_m16n8k8_dot_result_ids,
+    cuda_mma_warp_tile_layouts,
 )
 from .cuda_dot_staging import (
     CudaDotSharedBuffers,
@@ -117,22 +118,55 @@ class CudaRegisterTileRef:
 
 @dataclass(frozen=True)
 class CudaMmaAccumulatorRef:
-    """Four f32 accumulator registers owned by one MMA lane."""
+    """The f32 accumulator registers owned by one MMA warp lane."""
 
     base: str
-    layout: CudaMmaM16N8K8Layout
+    layout: CudaMmaM16N8K8Layout | CudaMmaWarpTileLayout
+
+    @property
+    def warp_tile_layout(self) -> CudaMmaWarpTileLayout:
+        if isinstance(self.layout, CudaMmaWarpTileLayout):
+            return self.layout
+
+        return CudaMmaWarpTileLayout(
+            m=self.layout.result_shape[0],
+            n=self.layout.result_shape[1],
+            k=self.layout.lhs_shape[1],
+        )
 
     @property
     def elements_per_lane(self) -> int:
-        return len(self.layout.accumulator_coordinates(0))
+        return self.warp_tile_layout.accumulator_elements_per_lane
 
     def element(self, index: int) -> str:
         if type(index) is not int or not 0 <= index < self.elements_per_lane:
             raise ValueError(
-                f"MMA accumulator element must be between 0 and 3, got {index}"
+                "MMA accumulator element must be between "
+                f"0 and {self.elements_per_lane - 1}, got {index}"
             )
 
         return f"{self.base}_{index}"
+
+    def fragment_elements(
+        self,
+        *,
+        m_tile: int,
+        n_tile: int,
+    ) -> tuple[str, ...]:
+        layout = self.warp_tile_layout
+        fragment_index = layout.accumulator_fragment_index(
+            m_tile=m_tile,
+            n_tile=n_tile,
+        )
+        elements_per_fragment = len(
+            layout.instruction_layout.accumulator_coordinates(0)
+        )
+        first_element = fragment_index * elements_per_fragment
+
+        return tuple(
+            self.element(first_element + index)
+            for index in range(elements_per_fragment)
+        )
 
     def elements(self) -> tuple[str, ...]:
         return tuple(self.element(index) for index in range(self.elements_per_lane))
@@ -173,7 +207,10 @@ class SSACUDACodegen:
             dot_plans={},
             staging_only_ids=frozenset(),
         )
-        self.mma_dot_result_ids: frozenset[int] = frozenset()
+        self.mma_dot_layouts: dict[
+            int,
+            CudaMmaWarpTileLayout,
+        ] = {}
 
     def cuda_type(self, ty: Type) -> str:
         if isinstance(ty, BlockType):
@@ -420,6 +457,216 @@ class SSACUDACodegen:
             rhs_register,
         )
 
+    def emit_mma_warp_tile_operand_registers(
+        self,
+        *,
+        result_id: int,
+        buffers: CudaDotSharedBuffers,
+        layout: CudaMmaWarpTileLayout,
+        stage: str | None = None,
+    ) -> tuple[
+        tuple[tuple[str, str], str],
+        ...,
+    ]:
+        """Load packed operands for every m16n8k8 instruction in a warp tile."""
+
+        if self.layout.threads_per_block != layout.threads_per_warp:
+            raise TypeError(
+                "warp MMA tile requires exactly 32 CUDA threads, "
+                f"got {self.layout.threads_per_block}"
+            )
+
+        if (
+            buffers.lhs.logical_shape != layout.lhs_shape
+            or buffers.rhs.logical_shape != layout.rhs_shape
+        ):
+            raise TypeError(
+                "warp MMA tile requires shared tiles "
+                f"{layout.lhs_shape} and {layout.rhs_shape}, got "
+                f"{buffers.lhs.logical_shape} and "
+                f"{buffers.rhs.logical_shape}"
+            )
+
+        operand_ty = buffers.lhs.element_ty
+        if operand_ty not in (F16, BF16) or buffers.rhs.element_ty != operand_ty:
+            raise TypeError(
+                "warp MMA tile requires matching f16 or bf16 "
+                "shared-memory operands, got "
+                f"{buffers.lhs.element_ty} and "
+                f"{buffers.rhs.element_ty}"
+            )
+
+        if operand_ty == F16 and not self.target.supports_f16_mma_m16n8k8:
+            raise TypeError(f"m16n8k8 f16 MMA requires sm_75+, got {self.target.chip}")
+
+        if operand_ty == BF16 and not self.target.supports_bf16_mma_m16n8k8:
+            raise TypeError(f"m16n8k8 bf16 MMA requires sm_80+, got {self.target.chip}")
+
+        group = f"mma_group_{result_id}"
+        thread = f"mma_thread_{result_id}"
+
+        self.lines.extend(
+            [
+                f"    int {group} = threadIdx.x >> 2;",
+                f"    int {thread} = threadIdx.x & 3;",
+            ]
+        )
+
+        instruction_m, instruction_n, instruction_k = layout.instruction_shape
+        half_instruction_m = instruction_m // 2
+        thread_pair = f"{thread} * 2"
+
+        def add_offset(expression: str, offset: int) -> str:
+            if offset == 0:
+                return expression
+            return f"{expression} + {offset}"
+
+        instruction_operands: list[tuple[tuple[str, str], str]] = []
+
+        for m_tile, n_tile, k_tile in layout.instruction_coordinates():
+            m_offset = m_tile * instruction_m
+            n_offset = n_tile * instruction_n
+            k_offset = k_tile * instruction_k
+
+            lhs_row_0 = add_offset(group, m_offset)
+            lhs_row_1 = add_offset(
+                group,
+                m_offset + half_instruction_m,
+            )
+            lhs_column_0 = add_offset(thread_pair, k_offset)
+            lhs_column_1 = add_offset(thread_pair, k_offset + 1)
+
+            rhs_row_0 = add_offset(thread_pair, k_offset)
+            rhs_row_1 = add_offset(thread_pair, k_offset + 1)
+            rhs_column = add_offset(group, n_offset)
+
+            lhs_0_low = buffers.lhs.element(
+                lhs_row_0,
+                lhs_column_0,
+                stage=stage,
+            )
+            lhs_0_high = buffers.lhs.element(
+                lhs_row_0,
+                lhs_column_1,
+                stage=stage,
+            )
+            lhs_1_low = buffers.lhs.element(
+                lhs_row_1,
+                lhs_column_0,
+                stage=stage,
+            )
+            lhs_1_high = buffers.lhs.element(
+                lhs_row_1,
+                lhs_column_1,
+                stage=stage,
+            )
+
+            rhs_low = buffers.rhs.element(
+                rhs_row_0,
+                rhs_column,
+                stage=stage,
+            )
+            rhs_high = buffers.rhs.element(
+                rhs_row_1,
+                rhs_column,
+                stage=stage,
+            )
+
+            register_suffix = f"{result_id}_{m_tile}_{n_tile}_{k_tile}"
+            lhs_register_0 = f"mma_a_{register_suffix}_0"
+            lhs_register_1 = f"mma_a_{register_suffix}_1"
+            rhs_register = f"mma_b_{register_suffix}_0"
+
+            packed_lhs_0 = self.pack_mma_operand_pair(
+                lhs_0_low,
+                lhs_0_high,
+                operand_ty,
+            )
+            packed_lhs_1 = self.pack_mma_operand_pair(
+                lhs_1_low,
+                lhs_1_high,
+                operand_ty,
+            )
+            packed_rhs = self.pack_mma_operand_pair(
+                rhs_low,
+                rhs_high,
+                operand_ty,
+            )
+
+            self.lines.extend(
+                [
+                    (f"    unsigned {lhs_register_0} = {packed_lhs_0};"),
+                    (f"    unsigned {lhs_register_1} = {packed_lhs_1};"),
+                    (f"    unsigned {rhs_register} = {packed_rhs};"),
+                ]
+            )
+
+            instruction_operands.append(
+                (
+                    (
+                        lhs_register_0,
+                        lhs_register_1,
+                    ),
+                    rhs_register,
+                )
+            )
+
+        return tuple(instruction_operands)
+
+    def emit_mma_m16n8k8_instruction(
+        self,
+        *,
+        accumulator_registers: tuple[str, str, str, str],
+        lhs_registers: tuple[str, str],
+        rhs_register: str,
+        operand_ty: ScalarType,
+    ) -> None:
+        """Emit one physical mma.sync.m16n8k8 instruction."""
+
+        if operand_ty == F16:
+            if not self.target.supports_f16_mma_m16n8k8:
+                raise TypeError(
+                    f"m16n8k8 f16 MMA requires sm_75+, got {self.target.chip}"
+                )
+            ptx_operand_ty = "f16"
+        elif operand_ty == BF16:
+            if not self.target.supports_bf16_mma_m16n8k8:
+                raise TypeError(
+                    f"m16n8k8 bf16 MMA requires sm_80+, got {self.target.chip}"
+                )
+            ptx_operand_ty = "bf16"
+        else:
+            raise TypeError(f"m16n8k8 MMA does not support {operand_ty} operands")
+
+        result_0, result_1, result_2, result_3 = accumulator_registers
+        lhs_register_0, lhs_register_1 = lhs_registers
+
+        self.lines.extend(
+            [
+                "    asm volatile(",
+                (
+                    '        "mma.sync.aligned.m16n8k8.row.col.f32.'
+                    f'{ptx_operand_ty}.{ptx_operand_ty}.f32 "'
+                ),
+                '        "{%0, %1, %2, %3}, "',
+                '        "{%4, %5}, "',
+                '        "{%6}, "',
+                '        "{%0, %1, %2, %3};"',
+                (
+                    f'        : "+f"({result_0}), '
+                    f'"+f"({result_1}), '
+                    f'"+f"({result_2}), '
+                    f'"+f"({result_3})'
+                ),
+                (
+                    f'        : "r"({lhs_register_0}), '
+                    f'"r"({lhs_register_1}), '
+                    f'"r"({rhs_register})'
+                ),
+                "    );",
+            ]
+        )
+
     def emit_mma_m16n8k8(
         self,
         *,
@@ -449,21 +696,6 @@ class SSACUDACodegen:
                 f"got {accumulator.layout}"
             )
 
-        if operand_ty == F16:
-            if not self.target.supports_f16_mma_m16n8k8:
-                raise TypeError(
-                    f"m16n8k8 f16 MMA requires sm_75+, got {self.target.chip}"
-                )
-            ptx_operand_ty = "f16"
-        elif operand_ty == BF16:
-            if not self.target.supports_bf16_mma_m16n8k8:
-                raise TypeError(
-                    f"m16n8k8 bf16 MMA requires sm_80+, got {self.target.chip}"
-                )
-            ptx_operand_ty = "bf16"
-        else:
-            raise TypeError(f"m16n8k8 MMA does not support {operand_ty} operands")
-
         result_ref = CudaMmaAccumulatorRef(
             base=f"v{result.id}",
             layout=mma_layout,
@@ -476,36 +708,130 @@ class SSACUDACodegen:
             )
             self.lines.append(f"    float {element} = {initial_value};")
 
-        lhs_register_0, lhs_register_1 = lhs_registers
         result_0, result_1, result_2, result_3 = result_elements
 
-        self.lines.extend(
-            [
-                "    asm volatile(",
-                (
-                    '        "mma.sync.aligned.m16n8k8.row.col.f32.'
-                    f'{ptx_operand_ty}.{ptx_operand_ty}.f32 "'
-                ),
-                '        "{%0, %1, %2, %3}, "',
-                '        "{%4, %5}, "',
-                '        "{%6}, "',
-                '        "{%0, %1, %2, %3};"',
-                (
-                    f'        : "+f"({result_0}), '
-                    f'"+f"({result_1}), '
-                    f'"+f"({result_2}), '
-                    f'"+f"({result_3})'
-                ),
-                (
-                    f'        : "r"({lhs_register_0}), '
-                    f'"r"({lhs_register_1}), '
-                    f'"r"({rhs_register})'
-                ),
-                "    );",
-            ]
+        self.emit_mma_m16n8k8_instruction(
+            accumulator_registers=(
+                result_0,
+                result_1,
+                result_2,
+                result_3,
+            ),
+            lhs_registers=lhs_registers,
+            rhs_register=rhs_register,
+            operand_ty=operand_ty,
         )
 
         self.values[result.id] = result_ref
+        return result_ref
+
+    def emit_mma_warp_tile(
+        self,
+        *,
+        result: SSAValue,
+        layout: CudaMmaWarpTileLayout,
+        instruction_operands: tuple[
+            tuple[tuple[str, str], str],
+            ...,
+        ],
+        operand_ty: ScalarType,
+        accumulator: CudaMmaAccumulatorRef | None = None,
+    ) -> CudaMmaAccumulatorRef:
+        """Compose one logical warp tile from m16n8k8 instructions."""
+
+        expected_result_ty = BlockType(
+            layout.result_shape,
+            F32,
+        )
+        if result.ty != expected_result_ty:
+            raise TypeError(
+                "warp MMA tile requires result type "
+                f"{expected_result_ty}, got {result.ty}"
+            )
+
+        if len(instruction_operands) != layout.instruction_count:
+            raise ValueError(
+                "warp MMA tile requires "
+                f"{layout.instruction_count} instruction operands, "
+                f"got {len(instruction_operands)}"
+            )
+
+        if accumulator is not None and accumulator.warp_tile_layout != layout:
+            raise TypeError(
+                "warp MMA tile requires a compatible accumulator layout, "
+                f"got {accumulator.layout}"
+            )
+
+        result_ref = CudaMmaAccumulatorRef(
+            base=f"v{result.id}",
+            layout=layout,
+        )
+
+        for index, element in enumerate(result_ref.elements()):
+            initial_value = (
+                "0.0f" if accumulator is None else accumulator.element(index)
+            )
+            self.lines.append(f"    float {element} = {initial_value};")
+
+        for coordinates, operands in zip(
+            layout.instruction_coordinates(),
+            instruction_operands,
+            strict=True,
+        ):
+            m_tile, n_tile, _ = coordinates
+            lhs_registers, rhs_register = operands
+
+            fragment = result_ref.fragment_elements(
+                m_tile=m_tile,
+                n_tile=n_tile,
+            )
+            result_0, result_1, result_2, result_3 = fragment
+
+            self.emit_mma_m16n8k8_instruction(
+                accumulator_registers=(
+                    result_0,
+                    result_1,
+                    result_2,
+                    result_3,
+                ),
+                lhs_registers=lhs_registers,
+                rhs_register=rhs_register,
+                operand_ty=operand_ty,
+            )
+
+        self.values[result.id] = result_ref
+        return result_ref
+
+    def emit_mma_warp_tile_from_shared_memory(
+        self,
+        result: SSAValue,
+        buffers: CudaDotSharedBuffers,
+        layout: CudaMmaWarpTileLayout,
+        *,
+        accumulator: CudaMmaAccumulatorRef | None = None,
+        stage: str | None = None,
+        emit_reuse_barrier: bool = True,
+    ) -> CudaMmaAccumulatorRef:
+        """Lower one composable warp MMA tile from shared memory."""
+
+        instruction_operands = self.emit_mma_warp_tile_operand_registers(
+            result_id=result.id,
+            buffers=buffers,
+            layout=layout,
+            stage=stage,
+        )
+
+        result_ref = self.emit_mma_warp_tile(
+            result=result,
+            layout=layout,
+            instruction_operands=instruction_operands,
+            operand_ty=buffers.lhs.element_ty,
+            accumulator=accumulator,
+        )
+
+        if emit_reuse_barrier:
+            self.emit_block_barrier()
+
         return result_ref
 
     def emit_mma_from_shared_memory(
@@ -543,17 +869,13 @@ class SSACUDACodegen:
         value_id: int,
         value: CudaMmaAccumulatorRef,
     ) -> CudaSharedBuffer:
-        """Convert an MMA accumulator fragment to row-major shared memory."""
+        """Convert an MMA warp tile to row-major shared memory."""
 
-        mma_layout = CudaMmaM16N8K8Layout()
-        if value.layout != mma_layout:
-            raise TypeError(
-                f"cannot spill incompatible MMA accumulator layout, got {value.layout}"
-            )
+        layout = value.warp_tile_layout
 
         buffer = CudaSharedBuffer(
             name=f"mma_result_{value_id}",
-            logical_shape=mma_layout.result_shape,
+            logical_shape=layout.result_shape,
             element_ty=F32,
         )
         self.reserve_shared_memory(buffer.nbytes)
@@ -569,17 +891,46 @@ class SSACUDACodegen:
             ]
         )
 
-        coordinates = (
-            (group, f"{thread} * 2"),
-            (group, f"{thread} * 2 + 1"),
-            (f"{group} + 8", f"{thread} * 2"),
-            (f"{group} + 8", f"{thread} * 2 + 1"),
-        )
+        instruction_m, instruction_n, _ = layout.instruction_shape
+        half_instruction_m = instruction_m // 2
+        thread_pair = f"{thread} * 2"
 
-        for index, (row, column) in enumerate(coordinates):
-            destination = buffer.element(row, column)
-            source = value.element(index)
-            self.lines.append(f"    {destination} = {source};")
+        def add_offset(expression: str, offset: int) -> str:
+            if offset == 0:
+                return expression
+            return f"{expression} + {offset}"
+
+        for m_tile in range(layout.m_tiles):
+            for n_tile in range(layout.n_tiles):
+                m_offset = m_tile * instruction_m
+                n_offset = n_tile * instruction_n
+
+                row_0 = add_offset(group, m_offset)
+                row_1 = add_offset(
+                    group,
+                    m_offset + half_instruction_m,
+                )
+                column_0 = add_offset(thread_pair, n_offset)
+                column_1 = add_offset(thread_pair, n_offset + 1)
+
+                coordinates = (
+                    (row_0, column_0),
+                    (row_0, column_1),
+                    (row_1, column_0),
+                    (row_1, column_1),
+                )
+                fragment = value.fragment_elements(
+                    m_tile=m_tile,
+                    n_tile=n_tile,
+                )
+
+                for (row, column), source in zip(
+                    coordinates,
+                    fragment,
+                    strict=True,
+                ):
+                    destination = buffer.element(row, column)
+                    self.lines.append(f"    {destination} = {source};")
 
         self.emit_block_barrier()
         return buffer
@@ -1520,10 +1871,12 @@ class SSACUDACodegen:
             self.staging_analysis,
         )
 
-        tensor_core_loop = (
-            double_buffering is not None
-            and double_buffering.dot_result_id in self.mma_dot_result_ids
+        mma_loop_layout = (
+            self.mma_dot_layouts.get(double_buffering.dot_result_id)
+            if double_buffering is not None
+            else None
         )
+        tensor_core_loop = mma_loop_layout is not None
 
         start = self.expression_operand(loop.start)
         stop = self.expression_operand(loop.stop)
@@ -1539,24 +1892,23 @@ class SSACUDACodegen:
             loop.results,
             strict=True,
         ):
-            if tensor_core_loop:
-                mma_layout = CudaMmaM16N8K8Layout()
+            if mma_loop_layout is not None:
                 expected_ty = BlockType(
-                    mma_layout.result_shape,
+                    mma_loop_layout.result_shape,
                     F32,
                 )
 
                 if result.ty != expected_ty:
                     raise TypeError(
                         "tensor-core loop requires an f32 "
-                        f"{mma_layout.result_shape} accumulator, "
+                        f"{mma_loop_layout.result_shape} accumulator, "
                         f"got {result.ty}"
                     )
 
                 initial_value = self.operand(carried_input)
                 mma_result_ref = CudaMmaAccumulatorRef(
                     base=f"v{result.id}",
-                    layout=mma_layout,
+                    layout=mma_loop_layout,
                 )
 
                 for index, name in enumerate(mma_result_ref.elements()):
@@ -1566,10 +1918,11 @@ class SSACUDACodegen:
                         initial_value,
                         CudaMmaAccumulatorRef,
                     ):
-                        if initial_value.layout != mma_layout:
+                        if initial_value.warp_tile_layout != mma_loop_layout:
                             raise TypeError(
                                 "tensor-core loop received an incompatible "
-                                f"accumulator layout: {initial_value.layout}"
+                                "accumulator layout: "
+                                f"{initial_value.layout}"
                             )
                         initial_element = initial_value.element(index)
                     else:
@@ -1718,7 +2071,7 @@ class SSACUDACodegen:
                         f"got {yielded_value}"
                     )
 
-                if yielded_value.layout != carried_value.layout:
+                if yielded_value.warp_tile_layout != carried_value.warp_tile_layout:
                     raise TypeError(
                         "tensor-core loop yielded an incompatible "
                         f"accumulator layout: {yielded_value.layout}"
@@ -2163,10 +2516,13 @@ class SSACUDACodegen:
             stage=stage,
         )
 
-        if result.id in self.mma_dot_result_ids:
-            self.emit_mma_from_shared_memory(
+        mma_layout = self.mma_dot_layouts.get(result.id)
+
+        if mma_layout is not None:
+            self.emit_mma_warp_tile_from_shared_memory(
                 result,
                 buffers,
+                mma_layout,
                 accumulator=accumulator,
                 stage=stage,
                 emit_reuse_barrier=emit_reuse_barrier,
@@ -2265,9 +2621,11 @@ class SSACUDACodegen:
             mma_operand_types.add(F16)
         if self.target.supports_bf16_mma_m16n8k8:
             mma_operand_types.add(BF16)
-        self.mma_dot_result_ids = cuda_mma_m16n8k8_dot_result_ids(
+        supported_mma_operand_types = frozenset(mma_operand_types)
+
+        self.mma_dot_layouts = cuda_mma_warp_tile_layouts(
             ssa_ops,
-            operand_types=frozenset(mma_operand_types),
+            operand_types=supported_mma_operand_types,
         )
         self.layout = cuda_kernel_layout(ssa_ops)
 
