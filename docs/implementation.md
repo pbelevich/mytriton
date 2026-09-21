@@ -90,15 +90,17 @@ MLIR's GPU/NVVM stack to a cubin.
   accumulation across K-tiles, fragment redistribution for masked stores,
   and CUDA execution tests covering partial boundary tiles.
 - [ver21](https://github.com/pbelevich/mytriton/tree/ver21): composable
-  one-warp MMA tiles whose M, N, and K
-  dimensions are positive multiples of 16, 8, and 8, respectively; logical
-  dots are decomposed into grids of `mma.sync.m16n8k8` instructions with one
-  FP32 accumulator fragment per `16 x 8` output region.
+  one-warp MMA tiles whose M, N, and K dimensions are positive multiples of
+  16, 8, and 8, respectively; logical dots are decomposed into grids of
+  `mma.sync.m16n8k8` instructions with one FP32 accumulator fragment per
+  `16 x 8` output region.
 - [ver22](https://github.com/pbelevich/mytriton/tree/ver22): multi-warp CTA
   tiles that partition a larger output tile across a two-dimensional warp
   grid, cooperatively stage and reuse CTA-wide A/B operands, carry independent
   per-warp MMA fragments through the runtime K-loop, and redistribute the
-  complete CTA result for masked stores.
+  complete CTA result for masked stores. Tensor Core operands use aligned,
+  padded shared-memory layouts and grouped `ldmatrix.x1`, `x2`, and `x4`
+  loads, including transposed B-fragment loading.
 
 ## AST frontend
 
@@ -731,24 +733,112 @@ C[group + 8, thread * 2]
 C[group + 8, thread * 2 + 1]
 ```
 
-The cooperative loading machinery from the earlier shared-memory versions
-first copies the complete logical A and B tiles into shared memory. For each
-physical instruction, the scalar fragment loader applies the logical tile
-offsets above and packs every pair of adjacent 16-bit values into one 32-bit
-PTX operand register. FP16 extracts the bits with `__half_as_ushort`:
+#### Operand loading with `ldmatrix`
+
+Version 22 replaces per-element shared-memory reads and manual 16-bit packing
+with warp-cooperative `ldmatrix` instructions. The existing cooperative loader
+still stages the complete logical A and B tiles from global memory into shared
+memory, but the Tensor Core path now gives those buffers a layout suitable for
+hardware fragment loads.
+
+Both operand buffers are explicitly aligned to 16 bytes. Their row strides are
+multiples of eight 16-bit elements, and an extra eight-element padding is added
+when consecutive logical rows would otherwise start in the same shared-memory
+bank group. This padding changes only physical shared-memory addresses; logical
+matrix coordinates and `tl.dot` semantics remain unchanged.
+
+Before issuing `ldmatrix`, CUDA converts the generic shared-memory pointer to
+the 32-bit address representation expected by PTX:
 
 ```cuda
-unsigned packed =
-    static_cast<unsigned>(__half_as_ushort(low)) |
-    (static_cast<unsigned>(__half_as_ushort(high)) << 16);
+unsigned address = static_cast<unsigned>(
+    __cvta_generic_to_shared(&shared_tile[row * stride + column])
+);
 ```
 
-BF16 extracts the same two raw 16-bit payloads from `__nv_bfloat16_raw` before
-packing them. The fragment coordinates and FP32 accumulator layout are shared
-by both operand types. Version 21 deliberately materializes a separate operand
-register set for every instruction, even when two instructions could reuse the
-same A or B fragment. A later `ldmatrix` lowering will replace this readable
-scalar path and make fragment reuse explicit.
+The low-level emitter supports the three matrix counts provided by PTX:
+`ldmatrix.x1`, `ldmatrix.x2`, and `ldmatrix.x4`. It also supports the
+transposing forms used for B.
+
+One A fragment for `mma.m16n8k8` contains two row-major `8 x 8` matrices and
+can therefore be loaded with `ldmatrix.x2`:
+
+```cuda
+asm volatile(
+    "ldmatrix.sync.aligned.m8n8.x2.shared.b16 "
+    "{%0, %1}, [%2];"
+    : "=r"(a0), "=r"(a1)
+    : "r"(address)
+    : "memory"
+);
+```
+
+When two adjacent M fragments are available, the backend combines their four
+`8 x 8` matrices into one `ldmatrix.x4`:
+
+```cuda
+asm volatile(
+    "ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
+    "{%0, %1, %2, %3}, [%4];"
+    : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
+    : "r"(address)
+    : "memory"
+);
+```
+
+For `x2`, the lower four bits of the lane ID select the 16 required row
+addresses. For `x4`, all 32 lanes supply one row address. Register pairs
+`(a0, a1)` and `(a2, a3)` are then assigned to the two logical M fragments.
+An unpaired final M fragment falls back to `x2`.
+
+The B operand is stored row-major in shared memory, while
+`mma.sync.m16n8k8.row.col` expects its B fragment in column-major form.
+The backend therefore uses transposing `ldmatrix` instructions.
+
+Up to four adjacent N fragments are grouped into one `x4.trans`:
+
+```cuda
+asm volatile(
+    "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
+    "{%0, %1, %2, %3}, [%4];"
+    : "=r"(b0), "=r"(b1), "=r"(b2), "=r"(b3)
+    : "r"(address)
+    : "memory"
+);
+```
+
+Groups of two use `x2.trans`, and a single remaining N fragment uses
+`x1.trans`. Each group of eight lanes supplies the row addresses for one
+transposed `8 x 8` matrix.
+
+Operand registers are reused across the logical warp tile. An A fragment is
+identified by `(m_tile, k_tile)` and is shared by every MMA atom with a
+different `n_tile`. A B fragment is identified by `(k_tile, n_tile)` and is
+shared by atoms with different `m_tile` values.
+
+For a logical warp tile, the instruction counts are:
+
+```text
+A x4 count       = (m_tiles // 2) * k_tiles
+A x2 count       = (m_tiles % 2) * k_tiles
+
+B x4.trans count = (n_tiles // 4) * k_tiles
+B x2.trans count = ((n_tiles % 4) // 2) * k_tiles
+B x1.trans count = (n_tiles % 2) * k_tiles
+
+MMA count        = m_tiles * n_tiles * k_tiles
+```
+
+For example, a `32 x 16 x 16` dot contains eight MMA instructions and requires
+only two `ldmatrix.x4` instructions for A plus two `ldmatrix.x2.trans`
+instructions for B. The previous ungrouped lowering required eight separate
+`ldmatrix` instructions, while the Version 21 scalar path materialized and
+packed operands separately for every MMA atom.
+
+`ldmatrix` moves raw 16-bit payloads, so the same loading instructions serve
+both FP16 and BF16 operands. The operand type remains encoded by the following
+`mma.sync` instruction. FP16 remains available on `sm_75+`, while native BF16
+MMA still requires `sm_80+`.
 
 A lane supplies two packed A registers and one packed B register to
 `mma.sync`. Four `f32` registers contain its accumulator fragment:
@@ -824,10 +914,11 @@ current checkout, validates FP16/BF16 GPU support, and streams the complete
 pytest output. The CUDA optional dependencies include `ml_dtypes`, which CuPy
 needs to consume PyTorch BF16 storage through DLPack.
 
-Version 21 focuses on one-warp composition. Operand fragments use repeated
-scalar shared-memory reads and packing, and the result uses an extra
-shared-memory redistribution before the store. Version 22 retains those
-readable mechanisms while extending ownership from one warp to a complete CTA.
+Version 21 focuses on one-warp composition and uses repeated scalar
+shared-memory reads to pack operand fragments. Version 22 replaces those reads
+with grouped `ldmatrix` instructions while extending ownership from one warp
+to a complete CTA. The result still uses an extra shared-memory redistribution
+before the store.
 
 ### Multi-warp CTA tiles
 
@@ -922,13 +1013,13 @@ warp offsets, CTA-wide spill/store redistribution, and the pre-Ampere BF16
 fallback.
 
 The [A100 benchmark and Nsight Compute report](../benchmarks/matmul_multi_warp_a100_report.md)
-measures the four-warp `64 x 16 x 64` BF16 tile at approximately 24 TFLOP/s.
-That is about 1.8-2.0x faster than the one-warp baseline, demonstrating that
-CTA-wide operand reuse is valuable. It remains 8-12x behind `torch.mm`.
-Profiling attributes the remaining gap primarily to scalar `LDS.U16` fragment
-loads, an average 3.3-way shared-memory bank conflict, long-scoreboard stalls,
-and roughly 30% occupancy. The backend still lacks a fragment-compatible
-swizzled layout, `ldmatrix`, vectorized global-to-shared copies, `cp.async`, a
+measures the pre-`ldmatrix` four-warp `64 x 16 x 64` BF16 tile at approximately
+24 TFLOP/s. That is about 1.8-2.0x faster than the one-warp baseline and shows
+the value of CTA-wide operand reuse. The original profile identified scalar
+`LDS.U16` fragment loads, shared-memory bank conflicts, long-scoreboard stalls,
+and roughly 30% occupancy as important remaining costs. Grouped `ldmatrix`
+loads address the scalar fragment loads; the backend still lacks vectorized
+global-to-shared copies, a general fragment-compatible swizzle, `cp.async`, a
 true overlapped software pipeline, and autotuning.
 
 ## Example
@@ -1199,9 +1290,11 @@ these rewrite passes because they are not region-aware yet.
   operand types, shapes, and targets retain the CUDA-core path. Compatible
   output tiles divisible by `32 x 32` can be partitioned across a
   two-dimensional multi-warp CTA; smaller compatible tiles retain the one-warp
-  path. The current fixed warp-tile policy is not autotuned and still has no
-  `ldmatrix`, vectorized operand loads, general shared-memory swizzling,
-  overlapped prefetching, or asynchronous copies.
+  path. The implementation uses aligned and padded low-precision shared buffers
+  together with grouped `ldmatrix.x1`, `x2`, and `x4` operand loads. The current
+  fixed warp-tile policy is not autotuned and still has no vectorized
+  global-to-shared loads, general shared-memory swizzling, overlapped
+  prefetching, or asynchronous copies.
   `tl.empty`, `tl.full`, and `tl.zeros` continue to represent logical
   per-thread values rather than shared-memory allocations.
 - MLIR lowering currently supports only `ptr<f32>` parameters as

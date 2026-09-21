@@ -85,6 +85,18 @@ class CudaMmaM16N8K8Layout:
             (first_row + 1, group_id),
         )
 
+    def lhs_ldmatrix_address(self, lane: int) -> tuple[int, int]:
+        """Return this lane's row-start address for ldmatrix.x2."""
+
+        self.lane_parts(lane)
+        return (lane % self.lhs_shape[0], 0)
+
+    def rhs_ldmatrix_address(self, lane: int) -> tuple[int, int]:
+        """Return this lane's row-start address for ldmatrix.x1.trans."""
+
+        self.lane_parts(lane)
+        return (lane % self.rhs_shape[0], 0)
+
     def accumulator_coordinates(
         self,
         lane: int,
@@ -241,6 +253,46 @@ class CudaMmaWarpTileLayout:
             self.instruction_layout.rhs_coordinates(lane),
             row_offset=k_tile * instruction_k,
             column_offset=n_tile * instruction_n,
+        )
+
+    def lhs_ldmatrix_address(
+        self,
+        *,
+        lane: int,
+        m_tile: int,
+        k_tile: int,
+    ) -> tuple[int, int]:
+        """Return a logical shared coordinate for an A ldmatrix.x2 load."""
+
+        self._require_tile_index("M", m_tile, self.m_tiles)
+        self._require_tile_index("K", k_tile, self.k_tiles)
+
+        row, column = self.instruction_layout.lhs_ldmatrix_address(lane)
+        instruction_m, _, instruction_k = self.instruction_shape
+
+        return (
+            row + m_tile * instruction_m,
+            column + k_tile * instruction_k,
+        )
+
+    def rhs_ldmatrix_address(
+        self,
+        *,
+        lane: int,
+        k_tile: int,
+        n_tile: int,
+    ) -> tuple[int, int]:
+        """Return a logical shared coordinate for a B ldmatrix.x1.trans load."""
+
+        self._require_tile_index("K", k_tile, self.k_tiles)
+        self._require_tile_index("N", n_tile, self.n_tiles)
+
+        row, column = self.instruction_layout.rhs_ldmatrix_address(lane)
+        _, instruction_n, instruction_k = self.instruction_shape
+
+        return (
+            row + k_tile * instruction_k,
+            column + n_tile * instruction_n,
         )
 
     def accumulator_fragment_index(

@@ -22,6 +22,7 @@ from .cuda_dot_staging import (
     CudaGlobalTilePlan,
     CudaSharedBuffer,
     SSADefinitions,
+    cuda_b16_ldmatrix_row_padding,
     cuda_f32_shared_row_padding,
     cuda_scalar_nbytes,
     match_cuda_dot_double_buffering,
@@ -328,162 +329,94 @@ class SSACUDACodegen:
 
         raise TypeError(f"Cannot convert CUDA value to {destination_ty}")
 
-    def pack_f16x2(
-        self,
-        low: str,
-        high: str,
-    ) -> str:
-        """Pack two f16 values into one PTX .f16x2 register."""
-
-        self.required_headers.add("#include <cuda_fp16.h>")
-
-        return (
-            "(static_cast<unsigned>("
-            f"__half_as_ushort({low})) | "
-            "(static_cast<unsigned>("
-            f"__half_as_ushort({high})) << 16))"
-        )
-
-    def pack_bf16x2(
-        self,
-        low: str,
-        high: str,
-    ) -> str:
-        """Pack two bf16 values into one PTX .bf16x2 register."""
-
-        self.required_headers.add("#include <cuda_bf16.h>")
-
-        return (
-            "(static_cast<unsigned>("
-            f"static_cast<__nv_bfloat16_raw>({low}).x) | "
-            "(static_cast<unsigned>("
-            f"static_cast<__nv_bfloat16_raw>({high}).x) << 16))"
-        )
-
-    def pack_mma_operand_pair(
-        self,
-        low: str,
-        high: str,
-        operand_ty: ScalarType,
-    ) -> str:
-        if operand_ty == F16:
-            return self.pack_f16x2(low, high)
-        if operand_ty == BF16:
-            return self.pack_bf16x2(low, high)
-
-        raise TypeError(f"m16n8k8 MMA does not support {operand_ty} operands")
-
-    def emit_mma_operand_registers(
+    def emit_shared_u32_address(
         self,
         *,
-        result_id: int,
-        buffers: CudaDotSharedBuffers,
-        stage: str | None = None,
-    ) -> tuple[tuple[str, str], str]:
-        """Load one lane's packed A and B fragments from shared memory."""
+        name: str,
+        element: str,
+    ) -> str:
+        """Convert a generic CUDA pointer to a 32-bit shared address."""
 
-        mma_layout = CudaMmaM16N8K8Layout()
+        self.lines.append(
+            f"    unsigned {name} = static_cast<unsigned>("
+            f"__cvta_generic_to_shared(&{element}));"
+        )
+        return name
 
-        if self.layout.threads_per_block != mma_layout.threads_per_warp:
-            raise TypeError(
-                "m16n8k8 MMA requires exactly 32 CUDA threads, "
-                f"got {self.layout.threads_per_block}"
+    def emit_ldmatrix_m8n8(
+        self,
+        *,
+        result_prefix: str,
+        address: str,
+        matrix_count: int,
+        transpose: bool = False,
+    ) -> tuple[str, ...]:
+        """Load one, two, or four 8x8 b16 matrices from shared memory."""
+
+        if not self.target.supports_ldmatrix_m8n8_b16:
+            raise TypeError(f"ldmatrix requires sm_75+, got {self.target.chip}")
+
+        if type(matrix_count) is not int or matrix_count not in (1, 2, 4):
+            raise ValueError(
+                f"ldmatrix matrix count must be one of 1, 2, or 4, got {matrix_count}"
             )
 
-        if (
-            buffers.lhs.logical_shape != mma_layout.lhs_shape
-            or buffers.rhs.logical_shape != mma_layout.rhs_shape
-        ):
-            raise TypeError(
-                "m16n8k8 MMA requires shared tiles "
-                f"{mma_layout.lhs_shape} and "
-                f"{mma_layout.rhs_shape}, got "
-                f"{buffers.lhs.logical_shape} and "
-                f"{buffers.rhs.logical_shape}"
-            )
-
-        operand_ty = buffers.lhs.element_ty
-        if operand_ty not in (F16, BF16) or buffers.rhs.element_ty != operand_ty:
-            raise TypeError(
-                "m16n8k8 MMA requires matching f16 or bf16 shared-memory operands, "
-                f"got {buffers.lhs.element_ty} and "
-                f"{buffers.rhs.element_ty}"
-            )
-
-        if operand_ty == F16 and not self.target.supports_f16_mma_m16n8k8:
-            raise TypeError(f"m16n8k8 f16 MMA requires sm_75+, got {self.target.chip}")
-
-        if operand_ty == BF16 and not self.target.supports_bf16_mma_m16n8k8:
-            raise TypeError(f"m16n8k8 bf16 MMA requires sm_80+, got {self.target.chip}")
-
-        group = f"mma_group_{result_id}"
-        thread = f"mma_thread_{result_id}"
-        lhs_register_0 = f"mma_a_{result_id}_0"
-        lhs_register_1 = f"mma_a_{result_id}_1"
-        rhs_register = f"mma_b_{result_id}_0"
+        registers = tuple(f"{result_prefix}_{index}" for index in range(matrix_count))
+        register_placeholders = ", ".join(f"%{index}" for index in range(matrix_count))
+        output_constraints = ", ".join(f'"=r"({register})' for register in registers)
+        transpose_suffix = ".trans" if transpose else ""
 
         self.lines.extend(
             [
-                f"    int {group} = threadIdx.x >> 2;",
-                f"    int {thread} = threadIdx.x & 3;",
+                *(f"    unsigned {register};" for register in registers),
+                "    asm volatile(",
+                (
+                    "        "
+                    f'"ldmatrix.sync.aligned.m8n8.x{matrix_count}'
+                    f'{transpose_suffix}.shared.b16 "'
+                ),
+                (f'        "{{{register_placeholders}}}, [%{matrix_count}];"'),
+                f"        : {output_constraints}",
+                f'        : "r"({address})',
+                '        : "memory"',
+                "    );",
             ]
         )
 
-        lhs_0_low = buffers.lhs.element(
-            group,
-            f"{thread} * 2",
-            stage=stage,
-        )
-        lhs_0_high = buffers.lhs.element(
-            group,
-            f"{thread} * 2 + 1",
-            stage=stage,
-        )
-        lhs_1_low = buffers.lhs.element(
-            f"{group} + 8",
-            f"{thread} * 2",
-            stage=stage,
-        )
-        lhs_1_high = buffers.lhs.element(
-            f"{group} + 8",
-            f"{thread} * 2 + 1",
-            stage=stage,
-        )
+        return registers
 
-        rhs_low = buffers.rhs.element(
-            f"{thread} * 2",
-            group,
-            stage=stage,
-        )
-        rhs_high = buffers.rhs.element(
-            f"{thread} * 2 + 1",
-            group,
-            stage=stage,
-        )
+    def emit_ldmatrix_m8n8_x2(
+        self,
+        *,
+        result_prefix: str,
+        address: str,
+    ) -> tuple[str, str]:
+        """Load two row-major 8x8 b16 matrices from shared memory."""
 
-        self.lines.extend(
-            [
-                (
-                    f"    unsigned {lhs_register_0} = "
-                    f"{self.pack_mma_operand_pair(lhs_0_low, lhs_0_high, operand_ty)};"
-                ),
-                (
-                    f"    unsigned {lhs_register_1} = "
-                    f"{self.pack_mma_operand_pair(lhs_1_low, lhs_1_high, operand_ty)};"
-                ),
-                (
-                    f"    unsigned {rhs_register} = "
-                    f"{self.pack_mma_operand_pair(rhs_low, rhs_high, operand_ty)};"
-                ),
-            ]
+        registers = self.emit_ldmatrix_m8n8(
+            result_prefix=result_prefix,
+            address=address,
+            matrix_count=2,
         )
+        return registers[0], registers[1]
 
-        return (
-            (lhs_register_0, lhs_register_1),
-            rhs_register,
+    def emit_ldmatrix_m8n8_x1_trans(
+        self,
+        *,
+        result_prefix: str,
+        address: str,
+    ) -> str:
+        """Load one transposed 8x8 b16 matrix from shared memory."""
+
+        registers = self.emit_ldmatrix_m8n8(
+            result_prefix=result_prefix,
+            address=address,
+            matrix_count=1,
+            transpose=True,
         )
+        return registers[0]
 
-    def emit_mma_warp_tile_operand_registers(
+    def emit_ldmatrix_mma_warp_tile_operand_registers(
         self,
         *,
         result_id: int,
@@ -491,17 +424,14 @@ class SSACUDACodegen:
         layout: CudaMmaWarpTileLayout,
         cta_layout: CudaMmaCtaTileLayout | None = None,
         stage: str | None = None,
-    ) -> tuple[
-        tuple[tuple[str, str], str],
-        ...,
-    ]:
-        """Load packed operands for every m16n8k8 instruction in a warp tile."""
+    ) -> tuple[tuple[tuple[str, str], str], ...]:
+        """Load unique warp-tile fragments with ldmatrix."""
 
         if cta_layout is None:
             expected_threads = layout.threads_per_warp
             expected_lhs_shape = layout.lhs_shape
             expected_rhs_shape = layout.rhs_shape
-            lane = "threadIdx.x"
+            lane = f"mma_lane_{result_id}"
             lhs_warp_row_offset: str | None = None
             rhs_warp_column_offset: str | None = None
         else:
@@ -520,7 +450,7 @@ class SSACUDACodegen:
 
         if self.layout.threads_per_block != expected_threads:
             raise TypeError(
-                "warp MMA tile requires "
+                "warp ldmatrix requires "
                 f"{expected_threads} CUDA threads, "
                 f"got {self.layout.threads_per_block}"
             )
@@ -530,7 +460,7 @@ class SSACUDACodegen:
             or buffers.rhs.logical_shape != expected_rhs_shape
         ):
             raise TypeError(
-                "warp MMA tile requires shared tiles "
+                "warp ldmatrix requires shared tiles "
                 f"{expected_lhs_shape} and {expected_rhs_shape}, got "
                 f"{buffers.lhs.logical_shape} and "
                 f"{buffers.rhs.logical_shape}"
@@ -539,135 +469,150 @@ class SSACUDACodegen:
         operand_ty = buffers.lhs.element_ty
         if operand_ty not in (F16, BF16) or buffers.rhs.element_ty != operand_ty:
             raise TypeError(
-                "warp MMA tile requires matching f16 or bf16 "
-                "shared-memory operands, got "
-                f"{buffers.lhs.element_ty} and "
+                "warp ldmatrix requires matching f16 or bf16 operands, "
+                f"got {buffers.lhs.element_ty} and "
                 f"{buffers.rhs.element_ty}"
             )
 
-        if operand_ty == F16 and not self.target.supports_f16_mma_m16n8k8:
-            raise TypeError(f"m16n8k8 f16 MMA requires sm_75+, got {self.target.chip}")
+        shared_buffers = (buffers.lhs, buffers.rhs)
 
-        if operand_ty == BF16 and not self.target.supports_bf16_mma_m16n8k8:
-            raise TypeError(f"m16n8k8 bf16 MMA requires sm_80+, got {self.target.chip}")
+        if any(
+            buffer.alignment is None or buffer.alignment < 16
+            for buffer in shared_buffers
+        ):
+            raise TypeError("ldmatrix requires 16-byte-aligned shared buffers")
 
-        group = f"mma_group_{result_id}"
-        thread = f"mma_thread_{result_id}"
+        if any(buffer.row_stride % 8 != 0 for buffer in shared_buffers):
+            raise TypeError("ldmatrix requires shared row strides divisible by 8")
 
-        self.lines.extend(
-            [
-                f"    int {group} = {lane} >> 2;",
-                f"    int {thread} = {lane} & 3;",
-            ]
-        )
+        if cta_layout is None:
+            self.lines.append(f"    int {lane} = threadIdx.x & 31;")
 
         instruction_m, instruction_n, instruction_k = layout.instruction_shape
-        half_instruction_m = instruction_m // 2
-        thread_pair = f"{thread} * 2"
+        lhs_lane_row = f"({lane} & 15)"
+        rhs_lane_row = f"({lane} & 7)"
 
-        def add_offset(expression: str, offset: int) -> str:
-            if offset == 0:
-                return expression
-            return f"{expression} + {offset}"
+        lhs_fragments: dict[tuple[int, int], tuple[str, str]] = {}
+        rhs_fragments: dict[tuple[int, int], str] = {}
 
-        instruction_operands: list[tuple[tuple[str, str], str]] = []
+        lhs_m_tiles_per_x4 = 2
 
-        for m_tile, n_tile, k_tile in layout.instruction_coordinates():
-            m_offset = m_tile * instruction_m
-            n_offset = n_tile * instruction_n
-            k_offset = k_tile * instruction_k
-
-            lhs_row_0 = add_offset(group, m_offset)
-            lhs_row_1 = add_offset(
-                group,
-                m_offset + half_instruction_m,
-            )
-            lhs_column_0 = add_offset(thread_pair, k_offset)
-            lhs_column_1 = add_offset(thread_pair, k_offset + 1)
-
-            rhs_row_0 = add_offset(thread_pair, k_offset)
-            rhs_row_1 = add_offset(thread_pair, k_offset + 1)
-            rhs_column = add_offset(group, n_offset)
-
-            if lhs_warp_row_offset is not None:
-                lhs_row_0 = f"{lhs_warp_row_offset} + {lhs_row_0}"
-                lhs_row_1 = f"{lhs_warp_row_offset} + {lhs_row_1}"
-
-            if rhs_warp_column_offset is not None:
-                rhs_column = f"{rhs_warp_column_offset} + {rhs_column}"
-
-            lhs_0_low = buffers.lhs.element(
-                lhs_row_0,
-                lhs_column_0,
-                stage=stage,
-            )
-            lhs_0_high = buffers.lhs.element(
-                lhs_row_0,
-                lhs_column_1,
-                stage=stage,
-            )
-            lhs_1_low = buffers.lhs.element(
-                lhs_row_1,
-                lhs_column_0,
-                stage=stage,
-            )
-            lhs_1_high = buffers.lhs.element(
-                lhs_row_1,
-                lhs_column_1,
-                stage=stage,
-            )
-
-            rhs_low = buffers.rhs.element(
-                rhs_row_0,
-                rhs_column,
-                stage=stage,
-            )
-            rhs_high = buffers.rhs.element(
-                rhs_row_1,
-                rhs_column,
-                stage=stage,
-            )
-
-            register_suffix = f"{result_id}_{m_tile}_{n_tile}_{k_tile}"
-            lhs_register_0 = f"mma_a_{register_suffix}_0"
-            lhs_register_1 = f"mma_a_{register_suffix}_1"
-            rhs_register = f"mma_b_{register_suffix}_0"
-
-            packed_lhs_0 = self.pack_mma_operand_pair(
-                lhs_0_low,
-                lhs_0_high,
-                operand_ty,
-            )
-            packed_lhs_1 = self.pack_mma_operand_pair(
-                lhs_1_low,
-                lhs_1_high,
-                operand_ty,
-            )
-            packed_rhs = self.pack_mma_operand_pair(
-                rhs_low,
-                rhs_high,
-                operand_ty,
-            )
-
-            self.lines.extend(
-                [
-                    (f"    unsigned {lhs_register_0} = {packed_lhs_0};"),
-                    (f"    unsigned {lhs_register_1} = {packed_lhs_1};"),
-                    (f"    unsigned {rhs_register} = {packed_rhs};"),
-                ]
-            )
-
-            instruction_operands.append(
-                (
-                    (
-                        lhs_register_0,
-                        lhs_register_1,
-                    ),
-                    rhs_register,
+        for k_tile in range(layout.k_tiles):
+            for first_m_tile in range(
+                0,
+                layout.m_tiles,
+                lhs_m_tiles_per_x4,
+            ):
+                loaded_m_tiles = min(
+                    lhs_m_tiles_per_x4,
+                    layout.m_tiles - first_m_tile,
                 )
-            )
+                matrix_count = loaded_m_tiles * 2
 
-        return tuple(instruction_operands)
+                row_offset = first_m_tile * instruction_m
+                column_offset = k_tile * instruction_k
+
+                lane_row = lane if matrix_count == 4 else lhs_lane_row
+
+                lhs_row = lane_row if row_offset == 0 else f"{lane_row} + {row_offset}"
+                if lhs_warp_row_offset is not None:
+                    lhs_row = f"{lhs_warp_row_offset} + {lhs_row}"
+
+                lhs_element = buffers.lhs.element(
+                    lhs_row,
+                    str(column_offset),
+                    stage=stage,
+                )
+
+                prefix = f"mma_a_{result_id}_{first_m_tile}_{k_tile}"
+                address = self.emit_shared_u32_address(
+                    name=f"{prefix}_address",
+                    element=lhs_element,
+                )
+                registers = self.emit_ldmatrix_m8n8(
+                    result_prefix=prefix,
+                    address=address,
+                    matrix_count=matrix_count,
+                )
+
+                for local_m_tile in range(loaded_m_tiles):
+                    m_tile = first_m_tile + local_m_tile
+                    register_offset = local_m_tile * 2
+
+                    lhs_fragments[(m_tile, k_tile)] = (
+                        registers[register_offset],
+                        registers[register_offset + 1],
+                    )
+
+        for k_tile in range(layout.k_tiles):
+            first_n_tile = 0
+
+            while first_n_tile < layout.n_tiles:
+                remaining_n_tiles = layout.n_tiles - first_n_tile
+
+                if remaining_n_tiles >= 4:
+                    matrix_count = 4
+                    lane_n_tile = f"({lane} >> 3)"
+                elif remaining_n_tiles >= 2:
+                    matrix_count = 2
+                    lane_n_tile = f"(({lane} & 15) >> 3)"
+                else:
+                    matrix_count = 1
+                    lane_n_tile = None
+
+                row_offset = k_tile * instruction_k
+                column_offset = first_n_tile * instruction_n
+
+                rhs_row = (
+                    rhs_lane_row
+                    if row_offset == 0
+                    else f"{rhs_lane_row} + {row_offset}"
+                )
+
+                if lane_n_tile is None:
+                    rhs_column = str(column_offset)
+                else:
+                    lane_column = f"{lane_n_tile} * {instruction_n}"
+                    rhs_column = (
+                        lane_column
+                        if column_offset == 0
+                        else f"{lane_column} + {column_offset}"
+                    )
+
+                if rhs_warp_column_offset is not None:
+                    rhs_column = f"{rhs_warp_column_offset} + {rhs_column}"
+
+                rhs_element = buffers.rhs.element(
+                    rhs_row,
+                    rhs_column,
+                    stage=stage,
+                )
+
+                prefix = f"mma_b_{result_id}_{k_tile}_{first_n_tile}"
+                address = self.emit_shared_u32_address(
+                    name=f"{prefix}_address",
+                    element=rhs_element,
+                )
+                registers = self.emit_ldmatrix_m8n8(
+                    result_prefix=prefix,
+                    address=address,
+                    matrix_count=matrix_count,
+                    transpose=True,
+                )
+
+                for local_n_tile, register in enumerate(registers):
+                    n_tile = first_n_tile + local_n_tile
+                    rhs_fragments[(k_tile, n_tile)] = register
+
+                first_n_tile += matrix_count
+
+        return tuple(
+            (
+                lhs_fragments[(m_tile, k_tile)],
+                rhs_fragments[(k_tile, n_tile)],
+            )
+            for m_tile, n_tile, k_tile in layout.instruction_coordinates()
+        )
 
     def emit_mma_m16n8k8_instruction(
         self,
@@ -885,7 +830,7 @@ class SSACUDACodegen:
     ) -> CudaMmaAccumulatorRef:
         """Lower one composable warp MMA tile from shared memory."""
 
-        instruction_operands = self.emit_mma_warp_tile_operand_registers(
+        instruction_operands = self.emit_ldmatrix_mma_warp_tile_operand_registers(
             result_id=result.id,
             buffers=buffers,
             layout=layout,
@@ -899,35 +844,6 @@ class SSACUDACodegen:
             instruction_operands=instruction_operands,
             operand_ty=buffers.lhs.element_ty,
             cta_layout=cta_layout,
-            accumulator=accumulator,
-        )
-
-        if emit_reuse_barrier:
-            self.emit_block_barrier()
-
-        return result_ref
-
-    def emit_mma_from_shared_memory(
-        self,
-        result: SSAValue,
-        buffers: CudaDotSharedBuffers,
-        *,
-        accumulator: CudaMmaAccumulatorRef | None = None,
-        stage: str | None = None,
-        emit_reuse_barrier: bool = True,
-    ) -> CudaMmaAccumulatorRef:
-        """Lower a staged low-precision dot to one m16n8k8 MMA instruction."""
-
-        lhs_registers, rhs_register = self.emit_mma_operand_registers(
-            result_id=result.id,
-            buffers=buffers,
-            stage=stage,
-        )
-        result_ref = self.emit_mma_m16n8k8(
-            result=result,
-            lhs_registers=lhs_registers,
-            rhs_register=rhs_register,
-            operand_ty=buffers.lhs.element_ty,
             accumulator=accumulator,
         )
 
@@ -1449,8 +1365,11 @@ class SSACUDACodegen:
 
     def append_shared_buffer_declaration(self, buffer: CudaSharedBuffer) -> None:
         cuda_ty = self.cuda_type(buffer.element_ty)
+        alignment = (
+            f"__align__({buffer.alignment}) " if buffer.alignment is not None else ""
+        )
         self.shared_lines.append(
-            f"    __shared__ {cuda_ty} {buffer.name}[{buffer.size}];"
+            f"    {alignment}__shared__ {cuda_ty} {buffer.name}[{buffer.size}];"
         )
 
     def declare_shared_buffer(
@@ -1544,6 +1463,7 @@ class SSACUDACodegen:
         *,
         stage_count: int = 1,
         stage: str | None = None,
+        use_ldmatrix_layout: bool = False,
     ) -> CudaDotSharedBuffers:
         if len(lhs_shape) != 2 or len(rhs_shape) != 2 or lhs_shape[1] != rhs_shape[0]:
             raise ValueError(
@@ -1551,14 +1471,30 @@ class SSACUDACodegen:
                 f"got {lhs_shape} and {rhs_shape}"
             )
 
-        lhs_row_padding = (
-            cuda_f32_shared_row_padding(
+        if use_ldmatrix_layout:
+            if element_ty not in (F16, BF16):
+                raise TypeError(
+                    f"ldmatrix staging requires f16 or bf16 operands, got {element_ty}"
+                )
+
+            lhs_row_padding = cuda_b16_ldmatrix_row_padding(
                 columns=lhs_shape[1],
-                simultaneous_rows=self.layout.thread_shape[0],
             )
-            if element_ty == F32
-            else 0
-        )
+            rhs_row_padding = cuda_b16_ldmatrix_row_padding(
+                columns=rhs_shape[1],
+            )
+            alignment = 16
+        else:
+            lhs_row_padding = (
+                cuda_f32_shared_row_padding(
+                    columns=lhs_shape[1],
+                    simultaneous_rows=self.layout.thread_shape[0],
+                )
+                if element_ty == F32
+                else 0
+            )
+            rhs_row_padding = 0
+            alignment = None
 
         lhs = CudaSharedBuffer(
             name=f"dot_lhs_{dot_result_id}",
@@ -1566,12 +1502,15 @@ class SSACUDACodegen:
             element_ty=element_ty,
             row_padding=lhs_row_padding,
             stage_count=stage_count,
+            alignment=alignment,
         )
         rhs = CudaSharedBuffer(
             name=f"dot_rhs_{dot_result_id}",
             logical_shape=rhs_shape,
             element_ty=element_ty,
+            row_padding=rhs_row_padding,
             stage_count=stage_count,
+            alignment=alignment,
         )
 
         # Reserve both operands before mutating the generated CUDA fragment.
@@ -1746,6 +1685,7 @@ class SSACUDACodegen:
         *,
         stage_count: int = 1,
         stage: str | None = None,
+        use_ldmatrix_layout: bool = False,
     ) -> CudaDotSharedBuffers:
         if op.opcode != "dot":
             raise TypeError(
@@ -1794,6 +1734,7 @@ class SSACUDACodegen:
             rhs_source=rhs_source,
             stage_count=stage_count,
             stage=stage,
+            use_ldmatrix_layout=use_ldmatrix_layout,
         )
 
     def is_staging_only(self, op: SSAOp) -> bool:
@@ -2653,18 +2594,20 @@ class SSACUDACodegen:
             raise TypeError("CUDA lowering for tl.dot is not implemented")
 
         plan = self.staging_analysis.plan_for(result.id)
-        buffers = self.emit_dot_operand_staging_from_ssa(
-            op,
-            plan,
-            stage_count=stage_count,
-            stage=stage,
-        )
-
         cta_layout = self.mma_cta_dot_layouts.get(result.id)
         mma_layout = (
             cta_layout.warp_tile
             if cta_layout is not None
             else self.mma_dot_layouts.get(result.id)
+        )
+        use_ldmatrix = mma_layout is not None
+
+        buffers = self.emit_dot_operand_staging_from_ssa(
+            op,
+            plan,
+            stage_count=stage_count,
+            stage=stage,
+            use_ldmatrix_layout=use_ldmatrix,
         )
 
         if mma_layout is not None:

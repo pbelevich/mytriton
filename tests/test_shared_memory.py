@@ -26,6 +26,7 @@ from mytriton.cuda_dot_staging import (
     CudaGlobalTilePlan,
     CudaSharedBuffer,
     SSADefinitions,
+    cuda_b16_ldmatrix_row_padding,
     cuda_f32_shared_row_padding,
     match_cuda_dot_double_buffering,
 )
@@ -39,6 +40,7 @@ from mytriton.ssa import (
 )
 from mytriton.trace import (
     BOOL,
+    F16,
     F32,
     I32,
     PTR_F32,
@@ -187,6 +189,38 @@ def test_cuda_codegen_declares_shared_buffer() -> None:
     assert codegen.shared_lines == [
         "    __shared__ float dot_lhs_7[64];",
     ]
+
+
+def test_cuda_codegen_declares_aligned_shared_buffer() -> None:
+    codegen = SSACUDACodegen()
+    buffer = CudaSharedBuffer(
+        name="tile",
+        logical_shape=(16, 8),
+        element_ty=F16,
+        alignment=16,
+    )
+
+    codegen.append_shared_buffer_declaration(buffer)
+
+    assert codegen.shared_lines == [
+        "    __align__(16) __shared__ __half tile[128];",
+    ]
+
+
+@pytest.mark.parametrize("alignment", [0, -16, 3, 12, True])
+def test_cuda_shared_buffer_rejects_invalid_alignment(
+    alignment: int,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="positive power of two",
+    ):
+        CudaSharedBuffer(
+            name="tile",
+            logical_shape=(16, 8),
+            element_ty=F16,
+            alignment=alignment,
+        )
 
 
 def test_cuda_codegen_emits_cooperative_masked_load() -> None:
@@ -366,6 +400,95 @@ def test_cuda_codegen_stages_both_dot_operands() -> None:
     )
 
     assert codegen.lines[-1] == "    __syncthreads();"
+
+
+def test_cuda_codegen_stages_aligned_padded_ldmatrix_operands() -> None:
+    codegen = SSACUDACodegen()
+    codegen.layout = CudaKernelLayout(
+        output_tile_shape=(32, 32),
+        thread_shape=(4, 8),
+    )
+
+    buffers = codegen.emit_dot_operand_staging(
+        dot_result_id=7,
+        lhs_shape=(32, 16),
+        rhs_shape=(16, 32),
+        element_ty=F16,
+        lhs_source=CudaGlobalTile(
+            base="a",
+            row_offset="blockIdx.x * 32",
+            column_offset="k_base",
+            row_stride="K",
+            row_bound="M",
+            column_bound="K",
+        ),
+        rhs_source=CudaGlobalTile(
+            base="b",
+            row_offset="k_base",
+            column_offset="blockIdx.y * 32",
+            row_stride="N",
+            row_bound="K",
+            column_bound="N",
+        ),
+        stage_count=2,
+        stage="stage",
+        use_ldmatrix_layout=True,
+    )
+
+    assert buffers.lhs.row_stride == 24
+    assert buffers.lhs.stage_size == 768
+    assert buffers.lhs.size == 1536
+    assert buffers.lhs.alignment == 16
+
+    assert buffers.rhs.row_stride == 40
+    assert buffers.rhs.stage_size == 640
+    assert buffers.rhs.size == 1280
+    assert buffers.rhs.alignment == 16
+
+    assert codegen.shared_memory_bytes == 5632
+    assert codegen.shared_lines == [
+        "    __align__(16) __shared__ __half dot_lhs_7[1536];",
+        "    __align__(16) __shared__ __half dot_rhs_7[1280];",
+    ]
+
+    cuda = "\n".join(codegen.lines)
+
+    assert (
+        "dot_lhs_7[((stage) * 768) + (dot_lhs_7_row) * 24 + (dot_lhs_7_column)]"
+    ) in cuda
+    assert (
+        "dot_rhs_7[((stage) * 640) + (dot_rhs_7_row) * 40 + (dot_rhs_7_column)]"
+    ) in cuda
+
+
+def test_cuda_codegen_rejects_f32_ldmatrix_staging() -> None:
+    codegen = SSACUDACodegen()
+    codegen.layout = CudaKernelLayout(
+        output_tile_shape=(16, 8),
+        thread_shape=(4, 8),
+    )
+    source = CudaGlobalTile(
+        base="x",
+        row_offset="0",
+        column_offset="0",
+        row_stride="8",
+        row_bound="16",
+        column_bound="8",
+    )
+
+    with pytest.raises(
+        TypeError,
+        match="ldmatrix staging requires f16 or bf16",
+    ):
+        codegen.emit_dot_operand_staging(
+            dot_result_id=7,
+            lhs_shape=(16, 8),
+            rhs_shape=(8, 8),
+            element_ty=F32,
+            lhs_source=source,
+            rhs_source=source,
+            use_ldmatrix_layout=True,
+        )
 
 
 def test_dot_operand_staging_rejects_incompatible_shapes() -> None:
@@ -2373,6 +2496,55 @@ def test_cuda_f32_shared_row_padding_rejects_invalid_arguments(
             columns=columns,
             simultaneous_rows=simultaneous_rows,
         )
+
+
+@pytest.mark.parametrize(
+    ("columns", "expected_padding"),
+    [
+        (8, 0),
+        (16, 8),
+        (24, 0),
+        (32, 8),
+        (40, 0),
+        (48, 8),
+    ],
+)
+def test_cuda_b16_ldmatrix_row_padding(
+    columns: int,
+    expected_padding: int,
+) -> None:
+    assert cuda_b16_ldmatrix_row_padding(columns=columns) == expected_padding
+
+
+@pytest.mark.parametrize("columns", [0, -8, 7, 12, True])
+def test_cuda_b16_ldmatrix_row_padding_rejects_invalid_columns(
+    columns: int,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="positive multiple of 8",
+    ):
+        cuda_b16_ldmatrix_row_padding(columns=columns)
+
+
+@pytest.mark.parametrize("columns", [8, 16, 24, 32, 40, 48])
+def test_cuda_b16_ldmatrix_padding_uses_distinct_bank_groups(
+    columns: int,
+) -> None:
+    buffer = CudaSharedBuffer(
+        name="tile",
+        logical_shape=(8, columns),
+        element_ty=F16,
+        row_padding=cuda_b16_ldmatrix_row_padding(columns=columns),
+    )
+
+    row_bank_groups = [
+        {(buffer.offset(row, column) * 2 // 4) % 32 for column in range(8)}
+        for row in range(8)
+    ]
+
+    assert all(len(group) == 4 for group in row_bank_groups)
+    assert len(set().union(*row_bank_groups)) == 32
 
 
 def test_cuda_shared_buffer_supports_multiple_stages() -> None:
