@@ -6,7 +6,10 @@ from dataclasses import dataclass, replace
 from typing import Any, Generic, Literal, ParamSpec, TypeAlias, cast
 
 from .ast_frontend import trace
-from .block_shapes import cuda_threads_per_block
+from .block_shapes import (
+    cuda_mma_m16n8k8_operand_types,
+    cuda_threads_per_block,
+)
 from .cuda_codegen import SSACUDACodegen
 from .cuda_target import DEFAULT_CUDA_TARGET, CudaTarget
 from .cuda_utils import (
@@ -147,7 +150,13 @@ class CompiledKernel(Generic[P]):
                     runtime_params=params,
                 )
                 ssa_ops = SSALowering().lower(ops)
-                threads_per_block = cuda_threads_per_block(ssa_ops)
+                supported_mma_operand_types = cuda_mma_m16n8k8_operand_types(
+                    cuda_target
+                )
+                threads_per_block = cuda_threads_per_block(
+                    ssa_ops,
+                    mma_operand_types=supported_mma_operand_types,
+                )
 
                 # The optimizer assumes lowering produced valid SSA.
                 verifier = SSAVerifier(threads_per_block)
@@ -166,7 +175,10 @@ class CompiledKernel(Generic[P]):
 
                 # Recompute after optimization: DCE/CSE may remove the vector
                 # ops that originally determined the CUDA block size.
-                threads_per_block = cuda_threads_per_block(ssa_ops)
+                threads_per_block = cuda_threads_per_block(
+                    ssa_ops,
+                    mma_operand_types=supported_mma_operand_types,
+                )
                 SSAVerifier(threads_per_block).verify(ssa_ops)
 
                 cubin = None

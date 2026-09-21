@@ -19,6 +19,12 @@ compiler notes live in the [implementation guide](implementation.md).
 - [Low-precision dot](implementation.md#low-precision-types-and-mixed-precision-dot)
 - [Tensor-core `mma.sync`](implementation.md#tensor-core-dot)
 - [Composable warp MMA tiles](implementation.md#composable-warp-mma-tiles)
+- [Multi-warp CTA tiles](implementation.md#multi-warp-cta-tiles)
+
+## Performance
+
+- [Version 21 A100 baseline](../benchmarks/matmul_a100_report.md)
+- [Version 22 multi-warp A100 profile](../benchmarks/matmul_multi_warp_a100_report.md)
 
 ## Runtime and development
 

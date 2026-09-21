@@ -4,7 +4,16 @@ Each release tag marks one lesson-sized compiler milestone. The project does
 not use semantic versioning yet; `verN` records the order in which features
 were built.
 
-## Unreleased
+## [ver22](https://github.com/pbelevich/mytriton/tree/ver22) — 2026-09-21
+
+- Added multi-warp Tensor Core CTA tiles with a two-dimensional warp grid,
+  shared A/B tile reuse, target-aware block sizing, loop-carried per-warp MMA
+  accumulators, and shared-memory result redistribution.
+- Added FP16 and BF16 execution coverage for partial `64 x 64` output tiles,
+  Colab upload and benchmark helpers, and an A100 benchmark/`ncu` profile of
+  the four-warp kernel.
+
+## [ver21](https://github.com/pbelevich/mytriton/tree/ver21) — 2026-09-20
 
 - Added composable one-warp Tensor Core tiles that lower larger FP16/BF16
   `tl.dot` operations into grids of `mma.sync.m16n8k8` instructions, carry

@@ -28,21 +28,13 @@ import torch
 
 import mytriton as triton
 import mytriton.language as tl
-from mytriton.block_shapes import cuda_threads_per_block
+from mytriton.block_shapes import cuda_mma_m16n8k8_operand_types, cuda_threads_per_block
+from mytriton.cuda_target import CudaTarget
 from mytriton.cuda_utils import cuda_module
 
 Tile = tuple[int, int, int]
 
-DEFAULT_TILES: tuple[Tile, ...] = (
-    (16, 16, 16),
-    (16, 16, 32),
-    (16, 32, 16),
-    (16, 32, 32),
-    (32, 16, 16),
-    (32, 16, 32),
-    (32, 32, 16),
-    (32, 32, 32),
-)
+DEFAULT_TILES: tuple[Tile, ...] = ((64, 16, 64),)
 
 
 @triton.jit
@@ -292,6 +284,7 @@ def benchmark_size(
 
     cp = cuda_module()
     device_attributes = cp.cuda.Device().attributes
+    cuda_target = CudaTarget(*torch.cuda.get_device_capability())
     tile_results = []
 
     for bm, bk, bn in tiles:
@@ -315,7 +308,10 @@ def benchmark_size(
         _ops, ssa_ops, cuda_source = run_wrapper()
         torch.cuda.synchronize()
 
-        threads_per_block = cuda_threads_per_block(ssa_ops)
+        threads_per_block = cuda_threads_per_block(
+            ssa_ops,
+            mma_operand_types=cuda_mma_m16n8k8_operand_types(cuda_target),
+        )
         raw_kernel = find_raw_kernel(cuda_source)
         cupy_a = cp.from_dlpack(a.detach())
         cupy_b = cp.from_dlpack(b.detach())

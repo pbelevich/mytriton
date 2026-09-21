@@ -6,9 +6,16 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 OUTPUT_ROOT=${1:-"$REPO_ROOT/benchmarks/artifacts"}
 MYTRITON_PYTHON=${MYTRITON_PYTHON:-python}
+PROFILE_TILE=${MYTRITON_PROFILE_TILE:-64x16x64}
 RUN_STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 RUN_DIR="$OUTPUT_ROOT/a100-sm80-$RUN_STAMP"
 CUPY_CACHE="$RUN_DIR/cupy-cache"
+
+if [[ ! "$PROFILE_TILE" =~ ^[1-9][0-9]*x[1-9][0-9]*x[1-9][0-9]*$ ]]; then
+    echo "invalid MYTRITON_PROFILE_TILE: $PROFILE_TILE" >&2
+    exit 2
+fi
+IFS=x read -r BM BK BN <<< "$PROFILE_TILE"
 
 mkdir -p "$CUPY_CACHE"
 
@@ -17,7 +24,7 @@ export CUPY_CACHE_SAVE_CUDA_SOURCE=1
 
 "$MYTRITON_PYTHON" "$SCRIPT_DIR/benchmark_matmul.py" \
     --sizes 4096 \
-    --tiles 32x16x32 \
+    --tiles "$PROFILE_TILE" \
     --dtype bf16 \
     --warmup 3 \
     --repeats 10 \
@@ -25,8 +32,8 @@ export CUPY_CACHE_SAVE_CUDA_SOURCE=1
     --output "$RUN_DIR/benchmark.json" \
     | tee "$RUN_DIR/benchmark.txt"
 
-SOURCE="$RUN_DIR/matmul_bf16_m4096_n4096_k4096_bm32_bk16_bn32.cu"
-SOURCE_METADATA="$RUN_DIR/matmul_bf16_m4096_n4096_k4096_bm32_bk16_bn32.json"
+SOURCE="$RUN_DIR/matmul_bf16_m4096_n4096_k4096_bm${BM}_bk${BK}_bn${BN}.cu"
+SOURCE_METADATA="$RUN_DIR/matmul_bf16_m4096_n4096_k4096_bm${BM}_bk${BK}_bn${BN}.json"
 NVRTC_CUBIN="$RUN_DIR/matmul_bf16_sm80_nvrtc.cubin"
 NVCC_PTX="$RUN_DIR/matmul_bf16_sm80_nvcc.ptx"
 
@@ -88,7 +95,7 @@ ncu \
     --export "$NCU_REPORT_BASE" \
     "$MYTRITON_PYTHON" "$SCRIPT_DIR/benchmark_matmul.py" \
         --sizes 4096 \
-        --tiles 32x16x32 \
+        --tiles "$PROFILE_TILE" \
         --dtype bf16 \
         --warmup 0 \
         --repeats 1 \
