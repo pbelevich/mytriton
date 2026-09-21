@@ -295,6 +295,48 @@ def test_composable_mma_warp_tile_offsets_instruction_fragments() -> None:
     )
 
 
+def test_composable_mma_warp_tile_offsets_ldmatrix_addresses() -> None:
+    layout = CudaMmaWarpTileLayout(m=32, n=16, k=16)
+
+    assert layout.lhs_ldmatrix_address(
+        lane=0,
+        m_tile=1,
+        k_tile=1,
+    ) == (16, 8)
+
+    assert layout.lhs_ldmatrix_address(
+        lane=15,
+        m_tile=1,
+        k_tile=1,
+    ) == (31, 8)
+
+    # Lanes 16-31 duplicate the addresses supplied by lanes 0-15.
+    assert layout.lhs_ldmatrix_address(
+        lane=16,
+        m_tile=1,
+        k_tile=1,
+    ) == (16, 8)
+
+    assert layout.rhs_ldmatrix_address(
+        lane=0,
+        k_tile=1,
+        n_tile=1,
+    ) == (8, 8)
+
+    assert layout.rhs_ldmatrix_address(
+        lane=7,
+        k_tile=1,
+        n_tile=1,
+    ) == (15, 8)
+
+    # Every group of eight lanes supplies the same eight row addresses.
+    assert layout.rhs_ldmatrix_address(
+        lane=8,
+        k_tile=1,
+        n_tile=1,
+    ) == (8, 8)
+
+
 @pytest.mark.parametrize(
     ("m", "n", "k", "message"),
     [
@@ -395,6 +437,42 @@ def test_mma_m16n8k8_fragment_coordinates() -> None:
         (15, 6),
         (15, 7),
     )
+
+
+@pytest.mark.parametrize(
+    ("lane", "expected_lhs", "expected_rhs"),
+    [
+        (0, (0, 0), (0, 0)),
+        (7, (7, 0), (7, 0)),
+        (8, (8, 0), (0, 0)),
+        (15, (15, 0), (7, 0)),
+        (16, (0, 0), (0, 0)),
+        (31, (15, 0), (7, 0)),
+    ],
+)
+def test_mma_m16n8k8_ldmatrix_addresses(
+    lane: int,
+    expected_lhs: tuple[int, int],
+    expected_rhs: tuple[int, int],
+) -> None:
+    layout = CudaMmaM16N8K8Layout()
+
+    assert layout.lhs_ldmatrix_address(lane) == expected_lhs
+    assert layout.rhs_ldmatrix_address(lane) == expected_rhs
+
+
+def test_mma_m16n8k8_ldmatrix_addresses_cover_matrix_rows() -> None:
+    layout = CudaMmaM16N8K8Layout()
+
+    lhs_addresses = {
+        layout.lhs_ldmatrix_address(lane) for lane in range(layout.threads_per_warp)
+    }
+    rhs_addresses = {
+        layout.rhs_ldmatrix_address(lane) for lane in range(layout.threads_per_warp)
+    }
+
+    assert lhs_addresses == {(row, 0) for row in range(16)}
+    assert rhs_addresses == {(row, 0) for row in range(8)}
 
 
 def test_mma_m16n8k8_fragments_cover_every_matrix_element_once() -> None:
@@ -872,92 +950,150 @@ def test_mma_accumulator_ref_rejects_invalid_element(
         ref.element(index)
 
 
-def test_cuda_codegen_packs_two_f16_values_for_ptx() -> None:
+def test_cuda_codegen_emits_u32_shared_memory_address() -> None:
     codegen = SSACUDACodegen()
 
-    packed = codegen.pack_f16x2(
-        "shared_tile[first]",
-        "shared_tile[second]",
+    address = codegen.emit_shared_u32_address(
+        name="mma_a_7_address",
+        element="dot_lhs_7[(row) * 24 + (column)]",
     )
 
-    assert packed == (
-        "(static_cast<unsigned>("
-        "__half_as_ushort(shared_tile[first])) | "
-        "(static_cast<unsigned>("
-        "__half_as_ushort(shared_tile[second])) << 16))"
-    )
-    assert "#include <cuda_fp16.h>" in codegen.required_headers
-
-
-def test_cuda_codegen_packs_two_bf16_values_for_ptx() -> None:
-    codegen = SSACUDACodegen(target=CudaTarget.from_chip("sm_80"))
-
-    packed = codegen.pack_bf16x2(
-        "shared_tile[first]",
-        "shared_tile[second]",
-    )
-
-    assert packed == (
-        "(static_cast<unsigned>("
-        "static_cast<__nv_bfloat16_raw>(shared_tile[first]).x) | "
-        "(static_cast<unsigned>("
-        "static_cast<__nv_bfloat16_raw>(shared_tile[second]).x) << 16))"
-    )
-    assert "#include <cuda_bf16.h>" in codegen.required_headers
-
-
-def test_cuda_codegen_loads_mma_operand_registers_from_shared_memory() -> None:
-    codegen = SSACUDACodegen()
-    codegen.layout = CudaKernelLayout(
-        output_tile_shape=(16, 8),
-        thread_shape=(4, 8),
-    )
-
-    buffers = CudaDotSharedBuffers(
-        lhs=CudaSharedBuffer(
-            name="dot_lhs_7",
-            logical_shape=(16, 8),
-            element_ty=F16,
+    assert address == "mma_a_7_address"
+    assert codegen.lines == [
+        (
+            "    unsigned mma_a_7_address = static_cast<unsigned>("
+            "__cvta_generic_to_shared("
+            "&dot_lhs_7[(row) * 24 + (column)]));"
         ),
-        rhs=CudaSharedBuffer(
-            name="dot_rhs_7",
-            logical_shape=(8, 8),
-            element_ty=F16,
-        ),
+    ]
+
+
+def test_cuda_codegen_emits_ldmatrix_m8n8_x2() -> None:
+    codegen = SSACUDACodegen(
+        target=CudaTarget.from_chip("sm_75"),
     )
 
-    lhs_registers, rhs_register = codegen.emit_mma_operand_registers(
-        result_id=7,
-        buffers=buffers,
+    registers = codegen.emit_ldmatrix_m8n8_x2(
+        result_prefix="mma_a_7",
+        address="mma_a_7_address",
     )
 
-    assert lhs_registers == (
+    assert registers == (
         "mma_a_7_0",
         "mma_a_7_1",
     )
-    assert rhs_register == "mma_b_7_0"
-
-    assert codegen.lines[:2] == [
-        "    int mma_group_7 = threadIdx.x >> 2;",
-        "    int mma_thread_7 = threadIdx.x & 3;",
+    assert codegen.lines == [
+        "    unsigned mma_a_7_0;",
+        "    unsigned mma_a_7_1;",
+        "    asm volatile(",
+        '        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 "',
+        '        "{%0, %1}, [%2];"',
+        '        : "=r"(mma_a_7_0), "=r"(mma_a_7_1)',
+        '        : "r"(mma_a_7_address)',
+        '        : "memory"',
+        "    );",
     ]
 
-    cuda = "\n".join(codegen.lines)
 
-    assert ("dot_lhs_7[(mma_group_7) * 8 + (mma_thread_7 * 2)]") in cuda
-    assert ("dot_lhs_7[(mma_group_7) * 8 + (mma_thread_7 * 2 + 1)]") in cuda
-    assert ("dot_lhs_7[(mma_group_7 + 8) * 8 + (mma_thread_7 * 2)]") in cuda
-    assert ("dot_lhs_7[(mma_group_7 + 8) * 8 + (mma_thread_7 * 2 + 1)]") in cuda
+def test_cuda_codegen_rejects_ldmatrix_before_sm75() -> None:
+    codegen = SSACUDACodegen(
+        target=CudaTarget.from_chip("sm_70"),
+    )
 
-    assert ("dot_rhs_7[(mma_thread_7 * 2) * 8 + (mma_group_7)]") in cuda
-    assert ("dot_rhs_7[(mma_thread_7 * 2 + 1) * 8 + (mma_group_7)]") in cuda
+    with pytest.raises(
+        TypeError,
+        match=r"ldmatrix requires sm_75\+",
+    ):
+        codegen.emit_ldmatrix_m8n8_x2(
+            result_prefix="mma_a_7",
+            address="mma_a_7_address",
+        )
 
-    assert cuda.count("__half_as_ushort") == 6
-    assert len(codegen.lines) == 5
+    assert codegen.lines == []
 
 
-def test_cuda_codegen_loads_composable_mma_operands_from_shared_memory() -> None:
+def test_cuda_codegen_emits_ldmatrix_m8n8_x1_trans() -> None:
+    codegen = SSACUDACodegen(
+        target=CudaTarget.from_chip("sm_75"),
+    )
+
+    register = codegen.emit_ldmatrix_m8n8_x1_trans(
+        result_prefix="mma_b_7",
+        address="mma_b_7_address",
+    )
+
+    assert register == "mma_b_7_0"
+    assert codegen.lines == [
+        "    unsigned mma_b_7_0;",
+        "    asm volatile(",
+        '        "ldmatrix.sync.aligned.m8n8.x1.trans.shared.b16 "',
+        '        "{%0}, [%1];"',
+        '        : "=r"(mma_b_7_0)',
+        '        : "r"(mma_b_7_address)',
+        '        : "memory"',
+        "    );",
+    ]
+
+
+def test_cuda_codegen_emits_ldmatrix_m8n8_x4_trans() -> None:
+    codegen = SSACUDACodegen(
+        target=CudaTarget.from_chip("sm_75"),
+    )
+
+    registers = codegen.emit_ldmatrix_m8n8(
+        result_prefix="mma_b_7",
+        address="mma_b_7_address",
+        matrix_count=4,
+        transpose=True,
+    )
+
+    assert registers == (
+        "mma_b_7_0",
+        "mma_b_7_1",
+        "mma_b_7_2",
+        "mma_b_7_3",
+    )
+    assert codegen.lines == [
+        "    unsigned mma_b_7_0;",
+        "    unsigned mma_b_7_1;",
+        "    unsigned mma_b_7_2;",
+        "    unsigned mma_b_7_3;",
+        "    asm volatile(",
+        '        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "',
+        '        "{%0, %1, %2, %3}, [%4];"',
+        (
+            '        : "=r"(mma_b_7_0), "=r"(mma_b_7_1), '
+            '"=r"(mma_b_7_2), "=r"(mma_b_7_3)'
+        ),
+        '        : "r"(mma_b_7_address)',
+        '        : "memory"',
+        "    );",
+    ]
+
+
+@pytest.mark.parametrize("matrix_count", [0, 3, 8, True])
+def test_cuda_codegen_rejects_invalid_ldmatrix_matrix_count(
+    matrix_count: int,
+) -> None:
     codegen = SSACUDACodegen()
+
+    with pytest.raises(
+        ValueError,
+        match="matrix count must be one of 1, 2, or 4",
+    ):
+        codegen.emit_ldmatrix_m8n8(
+            result_prefix="mma_a_7",
+            address="mma_a_7_address",
+            matrix_count=matrix_count,
+        )
+
+    assert codegen.lines == []
+
+
+def test_cuda_codegen_loads_composable_mma_operands_with_ldmatrix() -> None:
+    codegen = SSACUDACodegen(
+        target=CudaTarget.from_chip("sm_75"),
+    )
     codegen.layout = CudaKernelLayout(
         output_tile_shape=(32, 16),
         thread_shape=(4, 8),
@@ -972,15 +1108,19 @@ def test_cuda_codegen_loads_composable_mma_operands_from_shared_memory() -> None
             name="dot_lhs_7",
             logical_shape=(32, 16),
             element_ty=F16,
+            row_padding=8,
+            alignment=16,
         ),
         rhs=CudaSharedBuffer(
             name="dot_rhs_7",
             logical_shape=(16, 16),
             element_ty=F16,
+            row_padding=8,
+            alignment=16,
         ),
     )
 
-    instruction_operands = codegen.emit_mma_warp_tile_operand_registers(
+    instruction_operands = codegen.emit_ldmatrix_mma_warp_tile_operand_registers(
         result_id=7,
         buffers=buffers,
         layout=layout,
@@ -990,63 +1130,187 @@ def test_cuda_codegen_loads_composable_mma_operands_from_shared_memory() -> None
 
     assert instruction_operands[0] == (
         (
-            "mma_a_7_0_0_0_0",
-            "mma_a_7_0_0_0_1",
+            "mma_a_7_0_0_0",
+            "mma_a_7_0_0_1",
         ),
-        "mma_b_7_0_0_0_0",
+        "mma_b_7_0_0_0",
     )
     assert instruction_operands[-1] == (
         (
-            "mma_a_7_1_1_1_0",
-            "mma_a_7_1_1_1_1",
+            "mma_a_7_0_1_2",
+            "mma_a_7_0_1_3",
         ),
-        "mma_b_7_1_1_1_0",
+        "mma_b_7_1_0_1",
     )
 
-    assert codegen.lines[:2] == [
-        "    int mma_group_7 = threadIdx.x >> 2;",
-        "    int mma_thread_7 = threadIdx.x & 3;",
-    ]
+    # A[m, k] is reused across different N atoms.
+    assert instruction_operands[0][0] == instruction_operands[2][0]
+
+    # B[k, n] is reused across different M atoms.
+    assert instruction_operands[0][1] == instruction_operands[4][1]
 
     cuda = "\n".join(codegen.lines)
 
-    assert ("dot_lhs_7[(mma_group_7 + 16) * 16 + (mma_thread_7 * 2 + 8)]") in cuda
-    assert ("dot_lhs_7[(mma_group_7 + 24) * 16 + (mma_thread_7 * 2 + 9)]") in cuda
+    assert cuda.count("ldmatrix.sync.aligned.m8n8.x4.shared.b16") == 2
+    assert "ldmatrix.sync.aligned.m8n8.x2.shared.b16" not in cuda
+    assert cuda.count("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16") == 2
+    assert "ldmatrix.sync.aligned.m8n8.x1.trans.shared.b16" not in cuda
 
-    assert ("dot_rhs_7[(mma_thread_7 * 2 + 8) * 16 + (mma_group_7 + 8)]") in cuda
-    assert ("dot_rhs_7[(mma_thread_7 * 2 + 9) * 16 + (mma_group_7 + 8)]") in cuda
+    assert ("__cvta_generic_to_shared(&dot_lhs_7[(mma_lane_7) * 24 + (8)])") in cuda
+    assert (
+        "__cvta_generic_to_shared("
+        "&dot_rhs_7[((mma_lane_7 & 7) + 8) * 24 "
+        "+ (((mma_lane_7 & 15) >> 3) * 8)])"
+    ) in cuda
 
-    assert cuda.count("__half_as_ushort") == 48
+    assert "__half_as_ushort" not in cuda
 
 
-def test_cuda_codegen_loads_bf16_mma_operand_registers() -> None:
-    codegen = SSACUDACodegen(target=CudaTarget.from_chip("sm_80"))
+def test_cuda_codegen_ldmatrix_uses_x2_for_unpaired_lhs_m_tile() -> None:
+    codegen = SSACUDACodegen(
+        target=CudaTarget.from_chip("sm_75"),
+    )
+    codegen.layout = CudaKernelLayout(
+        output_tile_shape=(48, 8),
+        thread_shape=(4, 8),
+    )
+    layout = CudaMmaWarpTileLayout(
+        m=48,
+        n=8,
+        k=8,
+    )
+    buffers = CudaDotSharedBuffers(
+        lhs=CudaSharedBuffer(
+            name="lhs",
+            logical_shape=(48, 8),
+            element_ty=F16,
+            alignment=16,
+        ),
+        rhs=CudaSharedBuffer(
+            name="rhs",
+            logical_shape=(8, 8),
+            element_ty=F16,
+            alignment=16,
+        ),
+    )
+
+    instruction_operands = codegen.emit_ldmatrix_mma_warp_tile_operand_registers(
+        result_id=7,
+        buffers=buffers,
+        layout=layout,
+    )
+
+    assert instruction_operands == (
+        (
+            ("mma_a_7_0_0_0", "mma_a_7_0_0_1"),
+            "mma_b_7_0_0_0",
+        ),
+        (
+            ("mma_a_7_0_0_2", "mma_a_7_0_0_3"),
+            "mma_b_7_0_0_0",
+        ),
+        (
+            ("mma_a_7_2_0_0", "mma_a_7_2_0_1"),
+            "mma_b_7_0_0_0",
+        ),
+    )
+
+    cuda = "\n".join(codegen.lines)
+
+    assert cuda.count("ldmatrix.sync.aligned.m8n8.x4.shared.b16") == 1
+    assert cuda.count("ldmatrix.sync.aligned.m8n8.x2.shared.b16") == 1
+    assert cuda.count("ldmatrix.sync.aligned.m8n8.x1.trans.shared.b16") == 1
+
+
+def test_cuda_codegen_ldmatrix_groups_rhs_n_tiles() -> None:
+    codegen = SSACUDACodegen(
+        target=CudaTarget.from_chip("sm_75"),
+    )
+    codegen.layout = CudaKernelLayout(
+        output_tile_shape=(16, 56),
+        thread_shape=(4, 8),
+    )
+    layout = CudaMmaWarpTileLayout(
+        m=16,
+        n=56,
+        k=8,
+    )
+    buffers = CudaDotSharedBuffers(
+        lhs=CudaSharedBuffer(
+            name="lhs",
+            logical_shape=(16, 8),
+            element_ty=F16,
+            alignment=16,
+        ),
+        rhs=CudaSharedBuffer(
+            name="rhs",
+            logical_shape=(8, 56),
+            element_ty=F16,
+            alignment=16,
+        ),
+    )
+
+    instruction_operands = codegen.emit_ldmatrix_mma_warp_tile_operand_registers(
+        result_id=7,
+        buffers=buffers,
+        layout=layout,
+    )
+
+    rhs_registers = tuple(
+        rhs_register for _lhs_registers, rhs_register in instruction_operands
+    )
+
+    assert rhs_registers == (
+        "mma_b_7_0_0_0",
+        "mma_b_7_0_0_1",
+        "mma_b_7_0_0_2",
+        "mma_b_7_0_0_3",
+        "mma_b_7_0_4_0",
+        "mma_b_7_0_4_1",
+        "mma_b_7_0_6_0",
+    )
+
+    cuda = "\n".join(codegen.lines)
+
+    assert cuda.count("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16") == 1
+    assert cuda.count("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16") == 1
+    assert cuda.count("ldmatrix.sync.aligned.m8n8.x1.trans.shared.b16") == 1
+
+
+def test_cuda_codegen_rejects_unaligned_ldmatrix_operands() -> None:
+    codegen = SSACUDACodegen()
     codegen.layout = CudaKernelLayout(
         output_tile_shape=(16, 8),
         thread_shape=(4, 8),
     )
     buffers = CudaDotSharedBuffers(
         lhs=CudaSharedBuffer(
-            name="dot_lhs_7",
+            name="lhs",
             logical_shape=(16, 8),
-            element_ty=BF16,
+            element_ty=F16,
         ),
         rhs=CudaSharedBuffer(
-            name="dot_rhs_7",
+            name="rhs",
             logical_shape=(8, 8),
-            element_ty=BF16,
+            element_ty=F16,
         ),
     )
 
-    codegen.emit_mma_operand_registers(
-        result_id=7,
-        buffers=buffers,
-    )
+    with pytest.raises(
+        TypeError,
+        match="16-byte-aligned shared buffers",
+    ):
+        codegen.emit_ldmatrix_mma_warp_tile_operand_registers(
+            result_id=7,
+            buffers=buffers,
+            layout=CudaMmaWarpTileLayout(
+                m=16,
+                n=8,
+                k=8,
+            ),
+        )
 
-    cuda = "\n".join(codegen.lines)
-    assert cuda.count("static_cast<__nv_bfloat16_raw>") == 6
-    assert "__half_as_ushort" not in cuda
-    assert "#include <cuda_bf16.h>" in codegen.required_headers
+    assert codegen.lines == []
 
 
 def test_cuda_codegen_emits_mma_m16n8k8_instruction() -> None:
@@ -1219,63 +1483,10 @@ def test_cuda_codegen_rejects_bf16_mma_before_sm80() -> None:
         )
 
 
-def test_cuda_codegen_computes_mma_from_shared_memory() -> None:
-    codegen = SSACUDACodegen()
-    codegen.layout = CudaKernelLayout(
-        output_tile_shape=(16, 8),
-        thread_shape=(4, 8),
-    )
-
-    buffers = CudaDotSharedBuffers(
-        lhs=CudaSharedBuffer(
-            name="dot_lhs_7",
-            logical_shape=(16, 8),
-            element_ty=F16,
-        ),
-        rhs=CudaSharedBuffer(
-            name="dot_rhs_7",
-            logical_shape=(8, 8),
-            element_ty=F16,
-        ),
-    )
-    result = SSAValue(
-        id=7,
-        ty=BlockType((16, 8), F32),
-    )
-
-    accumulator = CudaMmaAccumulatorRef(
-        base="v3",
-        layout=CudaMmaM16N8K8Layout(),
-    )
-
-    result_ref = codegen.emit_mma_from_shared_memory(
-        result=result,
-        buffers=buffers,
-        accumulator=accumulator,
-    )
-
-    assert isinstance(result_ref, CudaMmaAccumulatorRef)
-    assert codegen.values[result.id] == result_ref
-
-    cuda = "\n".join(codegen.lines)
-
-    assert "    float v7_0 = v3_0;" in codegen.lines
-    assert "    float v7_1 = v3_1;" in codegen.lines
-    assert "    float v7_2 = v3_2;" in codegen.lines
-    assert "    float v7_3 = v3_3;" in codegen.lines
-
-    operand_position = cuda.index("unsigned mma_a_7_0")
-    instruction_position = cuda.index("mma.sync.aligned.m16n8k8")
-    barrier_position = cuda.rindex("__syncthreads();")
-
-    assert operand_position < instruction_position < barrier_position
-    assert cuda.count("mma.sync.aligned.m16n8k8") == 1
-    assert "for (int dot_k_7" not in cuda
-    assert codegen.lines[-1] == "    __syncthreads();"
-
-
 def test_cuda_codegen_computes_composable_mma_warp_tile_from_shared_memory() -> None:
-    codegen = SSACUDACodegen()
+    codegen = SSACUDACodegen(
+        target=CudaTarget.from_chip("sm_75"),
+    )
     codegen.layout = CudaKernelLayout(
         output_tile_shape=(32, 16),
         thread_shape=(4, 8),
@@ -1290,11 +1501,15 @@ def test_cuda_codegen_computes_composable_mma_warp_tile_from_shared_memory() -> 
             name="dot_lhs_7",
             logical_shape=(32, 16),
             element_ty=F16,
+            row_padding=8,
+            alignment=16,
         ),
         rhs=CudaSharedBuffer(
             name="dot_rhs_7",
             logical_shape=(16, 16),
             element_ty=F16,
+            row_padding=8,
+            alignment=16,
         ),
     )
     result = SSAValue(
@@ -1319,17 +1534,23 @@ def test_cuda_codegen_computes_composable_mma_warp_tile_from_shared_memory() -> 
     )
     assert codegen.values[result.id] == result_ref
 
+    cuda = "\n".join(codegen.lines)
+
     assert "    float v7_0 = v3_0;" in codegen.lines
     assert "    float v7_15 = v3_15;" in codegen.lines
 
-    cuda = "\n".join(codegen.lines)
+    assert cuda.count("ldmatrix.sync.aligned.m8n8.x4.shared.b16") == 2
+    assert "ldmatrix.sync.aligned.m8n8.x2.shared.b16" not in cuda
+    assert cuda.count("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16") == 2
+    assert "ldmatrix.sync.aligned.m8n8.x1.trans.shared.b16" not in cuda
+    assert cuda.count("mma.sync.aligned.m16n8k8") == 8
 
-    operand_position = cuda.index("unsigned mma_a_7_0_0_0_0")
-    instruction_position = cuda.index("mma.sync.aligned.m16n8k8")
+    ldmatrix_position = cuda.index("ldmatrix.sync.aligned.m8n8.x4.shared.b16")
+    mma_position = cuda.index("mma.sync.aligned.m16n8k8")
     barrier_position = cuda.rindex("__syncthreads();")
 
-    assert operand_position < instruction_position < barrier_position
-    assert cuda.count("mma.sync.aligned.m16n8k8") == 8
+    assert ldmatrix_position < mma_position < barrier_position
+    assert "__half_as_ushort" not in cuda
     assert codegen.lines[-1] == "    __syncthreads();"
 
 
@@ -1596,12 +1817,14 @@ def test_f16_m16n8k8_dot_lowers_to_tensor_core(
         "int M, int N, int K, int k_base)"
     ) in cuda_src
 
-    assert "__shared__ __half dot_lhs_" in cuda_src
-    assert "__shared__ __half dot_rhs_" in cuda_src
+    assert "__align__(16) __shared__ __half dot_lhs_" in cuda_src
+    assert "__align__(16) __shared__ __half dot_rhs_" in cuda_src
     assert "__shared__ float mma_result_" in cuda_src
 
     assert cuda_src.count("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32") == 1
-    assert cuda_src.count("__half_as_ushort") == 6
+    assert cuda_src.count("ldmatrix.sync.aligned.m8n8.x2.shared.b16") == 1
+    assert cuda_src.count("ldmatrix.sync.aligned.m8n8.x1.trans.shared.b16") == 1
+    assert "__half_as_ushort" not in cuda_src
 
     assert "for (int dot_k_" not in cuda_src
     assert "__half2float(dot_lhs_" not in cuda_src
@@ -1651,10 +1874,14 @@ def test_f16_composable_warp_tile_dot_lowers_to_tensor_core(
     )
 
     assert cuda_src.count("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32") == 8
-    assert cuda_src.count("__half_as_ushort") == 48
+    assert cuda_src.count("ldmatrix.sync.aligned.m8n8.x4.shared.b16") == 2
+    assert "ldmatrix.sync.aligned.m8n8.x2.shared.b16" not in cuda_src
+    assert cuda_src.count("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16") == 2
+    assert "ldmatrix.sync.aligned.m8n8.x1.trans.shared.b16" not in cuda_src
+    assert "__half_as_ushort" not in cuda_src
 
-    assert f"mma_a_{dot.result.id}_0_0_0_0" in cuda_src
-    assert f"mma_b_{dot.result.id}_1_1_1_0" in cuda_src
+    assert f"mma_a_{dot.result.id}_0_0_0" in cuda_src
+    assert f"mma_b_{dot.result.id}_1_0_1" in cuda_src
 
     assert "__shared__ float mma_result_" in cuda_src
     assert "for (int dot_k_" not in cuda_src
@@ -1714,20 +1941,20 @@ def test_f16_multi_warp_cta_dot_lowers_to_tensor_core(
     assert "int mma_warp_n = mma_warp_id % 2;" in cuda_src
 
     assert cuda_src.count("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32") == 16
-    assert cuda_src.count("__half_as_ushort") == 96
+    assert cuda_src.count("ldmatrix.sync.aligned.m8n8.x4.shared.b16") == 2
+    assert cuda_src.count("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16") == 2
+    assert "__half_as_ushort" not in cuda_src
 
     result_id = dot.result.id
 
     assert (
-        f"dot_lhs_{result_id}["
-        f"(mma_warp_m * 32 + mma_group_{result_id}) * 16 + "
-        f"(mma_thread_{result_id} * 2)]"
+        f"dot_lhs_{result_id}[(mma_warp_m * 32 + mma_lane_id) * 24 + (0)]"
     ) in cuda_src
 
     assert (
         f"dot_rhs_{result_id}["
-        f"(mma_thread_{result_id} * 2) * 64 + "
-        f"(mma_warp_n * 32 + mma_group_{result_id})]"
+        "((mma_lane_id & 7)) * 72 + "
+        "(mma_warp_n * 32 + (mma_lane_id >> 3) * 8)]"
     ) in cuda_src
 
     assert (
@@ -1781,10 +2008,12 @@ def test_bf16_m16n8k8_dot_lowers_to_tensor_core_for_sm80(
     assert cuda_threads_per_block(ssa_ops) == 32
     assert cuda_src.startswith("#include <cuda_bf16.h>\n\n")
     assert "#include <cuda_fp16.h>" not in cuda_src
-    assert "__shared__ __nv_bfloat16 dot_lhs_" in cuda_src
-    assert "__shared__ __nv_bfloat16 dot_rhs_" in cuda_src
+    assert "__align__(16) __shared__ __nv_bfloat16 dot_lhs_" in cuda_src
+    assert "__align__(16) __shared__ __nv_bfloat16 dot_rhs_" in cuda_src
     assert cuda_src.count("mma.sync.aligned.m16n8k8.row.col.f32.bf16.bf16.f32") == 1
-    assert cuda_src.count("static_cast<__nv_bfloat16_raw>") == 6
+    assert cuda_src.count("ldmatrix.sync.aligned.m8n8.x2.shared.b16") == 1
+    assert cuda_src.count("ldmatrix.sync.aligned.m8n8.x1.trans.shared.b16") == 1
+    assert "static_cast<__nv_bfloat16_raw>" not in cuda_src
     assert "for (int dot_k_" not in cuda_src
     assert "__bfloat162float(dot_lhs_" not in cuda_src
 
@@ -1854,7 +2083,11 @@ def test_bf16_composable_warp_tile_lowers_to_tensor_core_for_sm80(
     assert "#include <cuda_fp16.h>" not in cuda_src
 
     assert cuda_src.count("mma.sync.aligned.m16n8k8.row.col.f32.bf16.bf16.f32") == 8
-    assert cuda_src.count("static_cast<__nv_bfloat16_raw>") == 48
+    assert cuda_src.count("ldmatrix.sync.aligned.m8n8.x4.shared.b16") == 2
+    assert "ldmatrix.sync.aligned.m8n8.x2.shared.b16" not in cuda_src
+    assert cuda_src.count("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16") == 2
+    assert "ldmatrix.sync.aligned.m8n8.x1.trans.shared.b16" not in cuda_src
+    assert "static_cast<__nv_bfloat16_raw>" not in cuda_src
 
     assert "mma.sync.aligned.m16n8k8.row.col.f32.f16" not in cuda_src
     assert "__half_as_ushort" not in cuda_src
@@ -1945,7 +2178,9 @@ def test_bf16_multi_warp_cta_lowers_k_loop_for_sm80(
         == cta_layout.warp_tile.instruction_count
         == 16
     )
-    assert cuda_src.count("static_cast<__nv_bfloat16_raw>") == 96
+    assert cuda_src.count("ldmatrix.sync.aligned.m8n8.x4.shared.b16") == 2
+    assert cuda_src.count("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16") == 2
+    assert "static_cast<__nv_bfloat16_raw>" not in cuda_src
 
     assert "#include <cuda_bf16.h>" in cuda_src
     assert "#include <cuda_fp16.h>" not in cuda_src
@@ -2242,8 +2477,8 @@ def test_f16_composable_mma_lowers_k_loop_to_tensor_core(
     )
     assert "for (int dot_k_" not in cuda_src
 
-    assert f"mma_a_{dot.result.id}_0_0_0_0" in cuda_src
-    assert f"mma_b_{dot.result.id}_1_1_1_0" in cuda_src
+    assert f"mma_a_{dot.result.id}_0_0_0" in cuda_src
+    assert f"mma_b_{dot.result.id}_1_0_1" in cuda_src
 
     for index in range(layout.accumulator_elements_per_lane):
         assert (
@@ -2255,6 +2490,30 @@ def test_f16_composable_mma_lowers_k_loop_to_tensor_core(
         assert (f"v{loop_result.id}_{index} = v{dot.result.id}_{index};") in cuda_src
 
     assert f"v{accumulation.result.id}_" not in cuda_src
+
+    assert (
+        cuda_src.count("ldmatrix.sync.aligned.m8n8.x4.shared.b16")
+        == (layout.m_tiles // 2) * layout.k_tiles
+    )
+    assert (
+        cuda_src.count("ldmatrix.sync.aligned.m8n8.x2.shared.b16")
+        == (layout.m_tiles % 2) * layout.k_tiles
+    )
+
+    assert (
+        cuda_src.count("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16")
+        == (layout.n_tiles // 4) * layout.k_tiles
+    )
+    assert (
+        cuda_src.count("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16")
+        == ((layout.n_tiles % 4) // 2) * layout.k_tiles
+    )
+    assert (
+        cuda_src.count("ldmatrix.sync.aligned.m8n8.x1.trans.shared.b16")
+        == (layout.n_tiles % 2) * layout.k_tiles
+    )
+
+    assert "__half_as_ushort" not in cuda_src
 
 
 @pytest.mark.codegen
@@ -2327,8 +2586,14 @@ def test_f16_multi_warp_cta_lowers_k_loop_to_tensor_core(
     )
     assert "for (int dot_k_" not in cuda_src
 
-    assert (f"__shared__ __half dot_lhs_{dot.result.id}[2048];") in cuda_src
-    assert (f"__shared__ __half dot_rhs_{dot.result.id}[2048];") in cuda_src
+    assert (
+        f"__align__(16) __shared__ __half dot_lhs_{dot.result.id}[3072];"
+    ) in cuda_src
+    assert (
+        f"__align__(16) __shared__ __half dot_rhs_{dot.result.id}[2304];"
+    ) in cuda_src
+    assert cuda_src.count("ldmatrix.sync.aligned.m8n8.x4.shared.b16") == 2
+    assert cuda_src.count("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16") == 2
 
     for index in range(cta_layout.warp_tile.accumulator_elements_per_lane):
         assert (

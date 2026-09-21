@@ -41,5 +41,15 @@ def test_cuda_target_reports_mma_features() -> None:
     assert sm_80.supports_bf16_mma_m16n8k8
 
 
+def test_cuda_target_reports_ldmatrix_support() -> None:
+    sm_70 = CudaTarget.from_chip("sm_70")
+    sm_75 = CudaTarget.from_chip("sm_75")
+    sm_80 = CudaTarget.from_chip("sm_80")
+
+    assert not sm_70.supports_ldmatrix_m8n8_b16
+    assert sm_75.supports_ldmatrix_m8n8_b16
+    assert sm_80.supports_ldmatrix_m8n8_b16
+
+
 def test_default_cuda_target_is_sm75() -> None:
     assert CudaTarget.from_chip("sm_75") == DEFAULT_CUDA_TARGET
