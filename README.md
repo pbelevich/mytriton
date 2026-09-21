@@ -11,8 +11,8 @@ Triton-style Python kernel becomes GPU code. It parses kernel source, builds a
 symbolic IR, lowers it to verified typed SSA, and emits CUDA C++ with inline
 PTX. The current development version includes shared-memory tiled matrix
 multiplication, FP16/BF16 inputs, FP32 accumulation, and composable one-warp
-Tensor Core tiles combined into multi-warp CTA tiles built from NVIDIA
-`mma.sync` instructions.
+Tensor Core tiles combined into multi-warp CTAs and fed by NVIDIA `ldmatrix`
+and `mma.sync` instructions.
 
 ```text
 Python kernel
@@ -55,7 +55,7 @@ full [changelog](CHANGELOG.md) and the accompanying
 | [`ver19`](https://github.com/pbelevich/mytriton/tree/ver19) | [Mixed-precision types and casts](https://pbelevich.github.io/2026/09/12/My_Triton_From_Scratch_Part_19_Mixed_Precision_Types.html) |
 | [`ver20`](https://github.com/pbelevich/mytriton/tree/ver20) | [Tensor-core `mma.sync` lowering](https://pbelevich.github.io/2026/09/13/My_Triton_From_Scratch_Part_20_Tensor_Cores.html) |
 | [`ver21`](https://github.com/pbelevich/mytriton/tree/ver21) | [Composable warp MMA tiles](docs/implementation.md#composable-warp-mma-tiles) |
-| [`ver22`](https://github.com/pbelevich/mytriton/tree/ver22) | [Multi-warp CTA tiles](docs/implementation.md#multi-warp-cta-tiles) |
+| [`ver22`](https://github.com/pbelevich/mytriton/tree/ver22) | [Multi-warp CTA and `ldmatrix`](docs/implementation.md#multi-warp-cta-tiles) |
 
 ## Tensor-core matmul
 
@@ -140,7 +140,20 @@ torch.testing.assert_close(out, expected, rtol=3e-3, atol=3e-3)
 A logical `64 x 16 x 64` dot is divided among four warps in a `2 x 2` grid.
 Each warp computes a `32 x 32` result tile with 16 physical `m16n8k8`
 instructions, while the CTA cooperatively stages and reuses the larger A and B
-tiles in shared memory. Every physical instruction has the canonical form:
+tiles in shared memory. Shared-memory operands are loaded cooperatively into
+packed register fragments before each group of MMA operations:
+
+```cuda
+asm volatile(
+    "ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
+    "{%0, %1, %2, %3}, [%4];"
+    : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
+    : "r"(shared_address)
+    : "memory"
+);
+```
+
+Each physical Tensor Core instruction then has the canonical form:
 
 ```cuda
 asm volatile(
@@ -155,12 +168,14 @@ asm volatile(
 ```
 
 FP16 MMA requires `sm_75+`; native BF16 MMA requires `sm_80+`. Unsupported
-types, shapes, and targets retain the CUDA-core fallback. See the
+types, shapes, and targets retain the CUDA-core fallback. Operand fragments
+use aligned, padded shared-memory layouts and grouped `ldmatrix.x1`, `x2`, or
+`x4` loads. See the
 [implementation guide](docs/implementation.md#multi-warp-cta-tiles) for warp
-mapping, fragment composition, accumulation, and current performance
-limitations. The accompanying
+mapping, fragment composition, operand loading, accumulation, and current
+performance limitations. The accompanying
 [A100 benchmark and profile](benchmarks/matmul_multi_warp_a100_report.md)
-measures the four-warp kernel at approximately 24 TFLOP/s.
+measures the multi-warp implementation.
 
 ## Documentation
 

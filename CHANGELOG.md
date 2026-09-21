@@ -9,6 +9,9 @@ were built.
 - Added multi-warp Tensor Core CTA tiles with a two-dimensional warp grid,
   shared A/B tile reuse, target-aware block sizing, loop-carried per-warp MMA
   accumulators, and shared-memory result redistribution.
+- Replaced scalar Tensor Core operand packing with aligned, padded
+  shared-memory tiles and grouped `ldmatrix.x1`, `x2`, and `x4` loads,
+  including transposed B-fragment loading and target validation.
 - Added FP16 and BF16 execution coverage for partial `64 x 64` output tiles,
   Colab upload and benchmark helpers, and an A100 benchmark/`ncu` profile of
   the four-warp kernel.

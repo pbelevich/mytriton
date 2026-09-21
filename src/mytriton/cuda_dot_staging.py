@@ -59,6 +59,28 @@ def cuda_f32_shared_row_padding(
     return int(simultaneous_rows > distinct_banks)
 
 
+def cuda_b16_ldmatrix_row_padding(*, columns: int) -> int:
+    """Pad rows so ldmatrix touches distinct four-bank groups."""
+
+    elements_per_ldmatrix_row = 8
+
+    if (
+        type(columns) is not int
+        or columns <= 0
+        or columns % elements_per_ldmatrix_row != 0
+    ):
+        raise ValueError(
+            f"ldmatrix columns must be a positive multiple of 8, got {columns}"
+        )
+
+    row_vectors = columns // elements_per_ldmatrix_row
+
+    if row_vectors % 2 == 1:
+        return 0
+
+    return elements_per_ldmatrix_row
+
+
 @dataclass(frozen=True)
 class CudaSharedBuffer:
     name: str
@@ -66,6 +88,7 @@ class CudaSharedBuffer:
     element_ty: ScalarType
     row_padding: int = 0
     stage_count: int = 1
+    alignment: int | None = None
 
     def __post_init__(self) -> None:
         if len(self.logical_shape) != 2 or any(
@@ -87,6 +110,19 @@ class CudaSharedBuffer:
                 "shared buffer stage count must be a positive integer, "
                 f"got {self.stage_count}"
             )
+
+        if self.alignment is not None:
+            alignment = self.alignment
+
+            if (
+                type(alignment) is not int
+                or alignment <= 0
+                or alignment & (alignment - 1) != 0
+            ):
+                raise ValueError(
+                    "shared buffer alignment must be a positive power of two, "
+                    f"got {alignment}"
+                )
 
     @property
     def rows(self) -> int:
