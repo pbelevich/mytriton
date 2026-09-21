@@ -22,10 +22,12 @@ dist/
 htmlcov/
 coverage.xml
 
+# Local GPU profiling captures
+benchmarks/artifacts/
+
 # Editors and operating systems
 .idea/
 .vscode/
 .DS_Store
 *.swp
 *.swo
-

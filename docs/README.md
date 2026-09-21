@@ -18,6 +18,7 @@ compiler notes live in the [implementation guide](implementation.md).
 - [Shared-memory layout optimization](implementation.md#shared-memory-layout-optimization)
 - [Low-precision dot](implementation.md#low-precision-types-and-mixed-precision-dot)
 - [Tensor-core `mma.sync`](implementation.md#tensor-core-dot)
+- [Composable warp MMA tiles](implementation.md#composable-warp-mma-tiles)
 
 ## Runtime and development
 

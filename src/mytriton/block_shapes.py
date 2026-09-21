@@ -88,38 +88,281 @@ class CudaMmaM16N8K8Layout:
         )
 
 
+@dataclass(frozen=True)
+class CudaMmaWarpTileLayout:
+    """One logical warp tile composed from m16n8k8 MMA instructions."""
+
+    m: int
+    n: int
+    k: int
+
+    instruction_layout = CudaMmaM16N8K8Layout()
+    threads_per_warp = instruction_layout.threads_per_warp
+    thread_shape = instruction_layout.thread_shape
+
+    def __post_init__(self) -> None:
+        instruction_m, instruction_n = self.instruction_layout.result_shape
+        instruction_k = self.instruction_layout.lhs_shape[1]
+
+        for name, value, multiple in (
+            ("M", self.m, instruction_m),
+            ("N", self.n, instruction_n),
+            ("K", self.k, instruction_k),
+        ):
+            if type(value) is not int or value <= 0 or value % multiple != 0:
+                raise ValueError(
+                    f"{name} dimension must be a positive multiple "
+                    f"of {multiple}, got {value}"
+                )
+
+    @property
+    def lhs_shape(self) -> tuple[int, int]:
+        return (self.m, self.k)
+
+    @property
+    def rhs_shape(self) -> tuple[int, int]:
+        return (self.k, self.n)
+
+    @property
+    def result_shape(self) -> tuple[int, int]:
+        return (self.m, self.n)
+
+    @property
+    def instruction_shape(self) -> tuple[int, int, int]:
+        instruction_m, instruction_n = self.instruction_layout.result_shape
+        instruction_k = self.instruction_layout.lhs_shape[1]
+        return (instruction_m, instruction_n, instruction_k)
+
+    @property
+    def m_tiles(self) -> int:
+        return self.m // self.instruction_shape[0]
+
+    @property
+    def n_tiles(self) -> int:
+        return self.n // self.instruction_shape[1]
+
+    @property
+    def k_tiles(self) -> int:
+        return self.k // self.instruction_shape[2]
+
+    @property
+    def instruction_count(self) -> int:
+        return self.m_tiles * self.n_tiles * self.k_tiles
+
+    @property
+    def accumulator_fragments_per_lane(self) -> int:
+        return self.m_tiles * self.n_tiles
+
+    @property
+    def accumulator_elements_per_lane(self) -> int:
+        elements_per_fragment = len(self.instruction_layout.accumulator_coordinates(0))
+        return self.accumulator_fragments_per_lane * elements_per_fragment
+
+    def instruction_coordinates(
+        self,
+    ) -> tuple[tuple[int, int, int], ...]:
+        return tuple(
+            (m_tile, n_tile, k_tile)
+            for m_tile in range(self.m_tiles)
+            for n_tile in range(self.n_tiles)
+            for k_tile in range(self.k_tiles)
+        )
+
+    @staticmethod
+    def _offset_fragment_coordinates(
+        coordinates: tuple[tuple[int, int], ...],
+        *,
+        row_offset: int,
+        column_offset: int,
+    ) -> tuple[tuple[int, int], ...]:
+        return tuple(
+            (row + row_offset, column + column_offset) for row, column in coordinates
+        )
+
+    @staticmethod
+    def _require_tile_index(
+        name: str,
+        index: int,
+        count: int,
+    ) -> None:
+        if type(index) is not int or not 0 <= index < count:
+            raise ValueError(
+                f"{name} tile index must be between 0 and {count - 1}, got {index}"
+            )
+
+    def lhs_fragment_coordinates(
+        self,
+        *,
+        lane: int,
+        m_tile: int,
+        k_tile: int,
+    ) -> tuple[tuple[int, int], ...]:
+        self._require_tile_index("M", m_tile, self.m_tiles)
+        self._require_tile_index("K", k_tile, self.k_tiles)
+
+        instruction_m, _, instruction_k = self.instruction_shape
+
+        return self._offset_fragment_coordinates(
+            self.instruction_layout.lhs_coordinates(lane),
+            row_offset=m_tile * instruction_m,
+            column_offset=k_tile * instruction_k,
+        )
+
+    def rhs_fragment_coordinates(
+        self,
+        *,
+        lane: int,
+        k_tile: int,
+        n_tile: int,
+    ) -> tuple[tuple[int, int], ...]:
+        self._require_tile_index("K", k_tile, self.k_tiles)
+        self._require_tile_index("N", n_tile, self.n_tiles)
+
+        _, instruction_n, instruction_k = self.instruction_shape
+
+        return self._offset_fragment_coordinates(
+            self.instruction_layout.rhs_coordinates(lane),
+            row_offset=k_tile * instruction_k,
+            column_offset=n_tile * instruction_n,
+        )
+
+    def accumulator_fragment_index(
+        self,
+        *,
+        m_tile: int,
+        n_tile: int,
+    ) -> int:
+        self._require_tile_index("M", m_tile, self.m_tiles)
+        self._require_tile_index("N", n_tile, self.n_tiles)
+
+        return m_tile * self.n_tiles + n_tile
+
+    def accumulator_fragment_coordinates(
+        self,
+        *,
+        lane: int,
+        m_tile: int,
+        n_tile: int,
+    ) -> tuple[tuple[int, int], ...]:
+        self.accumulator_fragment_index(
+            m_tile=m_tile,
+            n_tile=n_tile,
+        )
+        instruction_m, instruction_n, _ = self.instruction_shape
+
+        return self._offset_fragment_coordinates(
+            self.instruction_layout.accumulator_coordinates(lane),
+            row_offset=m_tile * instruction_m,
+            column_offset=n_tile * instruction_n,
+        )
+
+
+def cuda_mma_warp_tile_layout(
+    op: SSAItem,
+    *,
+    operand_types: frozenset[ScalarType] = frozenset((F16,)),
+) -> CudaMmaWarpTileLayout | None:
+    """Return the composable warp layout for a supported low-precision dot."""
+
+    from .ssa import SSAOp, SSAValue
+
+    if not isinstance(op, SSAOp) or op.opcode != "dot":
+        return None
+
+    if op.result is None or len(op.operands) != 2:
+        return None
+
+    lhs, rhs = op.operands
+
+    if not isinstance(lhs, SSAValue) or not isinstance(rhs, SSAValue):
+        return None
+
+    if (
+        not isinstance(lhs.ty, BlockType)
+        or not isinstance(rhs.ty, BlockType)
+        or not isinstance(op.result.ty, BlockType)
+    ):
+        return None
+
+    if lhs.ty.rank != 2 or rhs.ty.rank != 2 or op.result.ty.rank != 2:
+        return None
+
+    operand_ty = lhs.ty.element
+
+    if (
+        operand_ty not in operand_types
+        or rhs.ty.element != operand_ty
+        or op.result.ty.element != F32
+    ):
+        return None
+
+    lhs_m, lhs_k = lhs.ty.shape
+    rhs_k, rhs_n = rhs.ty.shape
+
+    if lhs_k != rhs_k:
+        return None
+
+    if op.result.ty.shape != (lhs_m, rhs_n):
+        return None
+
+    try:
+        return CudaMmaWarpTileLayout(
+            m=lhs_m,
+            n=rhs_n,
+            k=lhs_k,
+        )
+    except ValueError:
+        return None
+
+
+def cuda_mma_warp_tile_layouts(
+    ssa_ops: list[SSAItem],
+    *,
+    operand_types: frozenset[ScalarType] = frozenset((F16,)),
+) -> dict[int, CudaMmaWarpTileLayout]:
+    """Collect composable MMA layouts by SSA dot result ID."""
+
+    from .ssa import SSAForRange
+
+    layouts: dict[int, CudaMmaWarpTileLayout] = {}
+
+    for item in ssa_ops:
+        if isinstance(item, SSAForRange):
+            layouts.update(
+                cuda_mma_warp_tile_layouts(
+                    item.body,
+                    operand_types=operand_types,
+                )
+            )
+            continue
+
+        layout = cuda_mma_warp_tile_layout(
+            item,
+            operand_types=operand_types,
+        )
+
+        if layout is None:
+            continue
+
+        assert item.result is not None
+        layouts[item.result.id] = layout
+
+    return layouts
+
+
 def is_cuda_mma_m16n8k8_dot(
     op: SSAItem,
     *,
     operand_types: frozenset[ScalarType] = frozenset((F16,)),
 ) -> bool:
-    """Whether an SSA dot matches a supported m16n8k8 MMA contract."""
+    """Whether an SSA dot matches exactly one m16n8k8 instruction."""
 
-    from .ssa import SSAOp, SSAValue
-
-    if not isinstance(op, SSAOp) or op.opcode != "dot":
-        return False
-
-    if op.result is None or len(op.operands) != 2:
-        return False
-
-    lhs, rhs = op.operands
-    if not isinstance(lhs, SSAValue) or not isinstance(rhs, SSAValue):
-        return False
-
-    layout = CudaMmaM16N8K8Layout()
-
-    if not isinstance(lhs.ty, BlockType) or not isinstance(rhs.ty, BlockType):
-        return False
-
-    operand_ty = lhs.ty.element
-
-    return (
-        operand_ty in operand_types
-        and lhs.ty == BlockType(layout.lhs_shape, operand_ty)
-        and rhs.ty == BlockType(layout.rhs_shape, operand_ty)
-        and op.result.ty == BlockType(layout.result_shape, F32)
+    layout = cuda_mma_warp_tile_layout(
+        op,
+        operand_types=operand_types,
     )
+
+    return layout is not None and layout.instruction_count == 1
 
 
 def cuda_mma_m16n8k8_dot_result_ids(

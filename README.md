@@ -9,8 +9,9 @@
 `mytriton` is a small, executable compiler built to explore how a
 Triton-style Python kernel becomes GPU code. It parses kernel source, builds a
 symbolic IR, lowers it to verified typed SSA, and emits CUDA C++ with inline
-PTX. The current release includes shared-memory tiled matrix multiplication,
-FP16/BF16 inputs, FP32 accumulation, and real NVIDIA Tensor Core `mma.sync`.
+PTX. The current development version includes shared-memory tiled matrix
+multiplication, FP16/BF16 inputs, FP32 accumulation, and composable one-warp
+Tensor Core tiles built from NVIDIA `mma.sync` instructions.
 
 ```text
 Python kernel
@@ -52,6 +53,7 @@ full [changelog](CHANGELOG.md) and the accompanying
 | [`ver18`](https://github.com/pbelevich/mytriton/tree/ver18) | [Shared-memory layout optimization](https://pbelevich.github.io/2026/09/07/My_Triton_From_Scratch_Part_18_Shared_Memory_Optimization.html) |
 | [`ver19`](https://github.com/pbelevich/mytriton/tree/ver19) | [Mixed-precision types and casts](https://pbelevich.github.io/2026/09/12/My_Triton_From_Scratch_Part_19_Mixed_Precision_Types.html) |
 | [`ver20`](https://github.com/pbelevich/mytriton/tree/ver20) | [Tensor-core `mma.sync` lowering](https://pbelevich.github.io/2026/09/13/My_Triton_From_Scratch_Part_20_Tensor_Cores.html) |
+| [`ver21`](https://github.com/pbelevich/mytriton/tree/ver21) | [Composable warp MMA tiles](docs/implementation.md#composable-warp-mma-tiles) |
 
 ## Tensor-core matmul
 
@@ -109,7 +111,7 @@ def matmul_kernel(
 
 
 M, N, K = 128, 128, 128
-BM, BK, BN = 16, 8, 8
+BM, BK, BN = 32, 16, 16
 
 torch.manual_seed(0)
 a = torch.randn((M, K), device="cuda", dtype=torch.float16)
@@ -130,11 +132,11 @@ _, _, cuda_source = matmul_kernel[grid](
 )
 
 expected = a.float() @ b.float()
-torch.testing.assert_close(out, expected, rtol=2e-3, atol=2e-3)
+torch.testing.assert_close(out, expected, rtol=3e-3, atol=3e-3)
 ```
 
-For the canonical `16 x 8 x 8` dot, CUDA lowering fuses the loop-carried
-addition into the MMA accumulator and emits:
+A logical `32 x 16 x 16` dot is composed from eight physical `m16n8k8`
+instructions. Each instruction has the canonical form:
 
 ```cuda
 asm volatile(
@@ -149,10 +151,9 @@ asm volatile(
 ```
 
 FP16 MMA requires `sm_75+`; native BF16 MMA requires `sm_80+`. Unsupported
-types, shapes, and targets retain the CUDA-core fallback. The current
-tensor-core path prioritizes correctness and readable lowering; larger warp
-tiles, `ldmatrix`, `cp.async`, multistage pipelining, and autotuning are the
-next performance milestones.
+types, shapes, and targets retain the CUDA-core fallback. See the
+[implementation guide](docs/implementation.md#tensor-core-dot) for fragment
+layouts, composition, accumulation, and current performance limitations.
 
 ## Documentation
 
