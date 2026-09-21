@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from .trace import F16, F32, BlockType, ScalarType
+from .cuda_target import CudaTarget
+from .trace import BF16, F16, F32, BlockType, ScalarType
 
 if TYPE_CHECKING:
     from .ssa import SSAItem
@@ -14,6 +15,22 @@ def prod(shape: tuple[int, ...]) -> int:
     for dim in shape:
         result *= dim
     return result
+
+
+def cuda_mma_m16n8k8_operand_types(
+    target: CudaTarget,
+) -> frozenset[ScalarType]:
+    """Return low-precision operand types supported by the CUDA target."""
+
+    operand_types: set[ScalarType] = set()
+
+    if target.supports_f16_mma_m16n8k8:
+        operand_types.add(F16)
+
+    if target.supports_bf16_mma_m16n8k8:
+        operand_types.add(BF16)
+
+    return frozenset(operand_types)
 
 
 @dataclass(frozen=True)
@@ -257,6 +274,99 @@ class CudaMmaWarpTileLayout:
         )
 
 
+@dataclass(frozen=True)
+class CudaMmaCtaTileLayout:
+    """A CTA tile composed from a two-dimensional grid of warp MMA tiles."""
+
+    warp_tile: CudaMmaWarpTileLayout
+    warps_m: int
+    warps_n: int
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("warps_m", self.warps_m),
+            ("warps_n", self.warps_n),
+        ):
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{name} must be a positive integer, got {value}")
+
+        if self.threads_per_block > 1024:
+            raise ValueError(
+                "CTA MMA tile requires at most 1024 threads, "
+                f"got {self.threads_per_block}"
+            )
+
+    @property
+    def warp_shape(self) -> tuple[int, int]:
+        return (self.warps_m, self.warps_n)
+
+    @property
+    def warp_count(self) -> int:
+        return self.warps_m * self.warps_n
+
+    @property
+    def threads_per_block(self) -> int:
+        return self.warp_count * self.warp_tile.threads_per_warp
+
+    @property
+    def thread_shape(self) -> tuple[int, int]:
+        warp_threads_m, warp_threads_n = self.warp_tile.thread_shape
+        return (
+            self.warps_m * warp_threads_m,
+            self.warps_n * warp_threads_n,
+        )
+
+    @property
+    def lhs_shape(self) -> tuple[int, int]:
+        return (
+            self.warps_m * self.warp_tile.m,
+            self.warp_tile.k,
+        )
+
+    @property
+    def rhs_shape(self) -> tuple[int, int]:
+        return (
+            self.warp_tile.k,
+            self.warps_n * self.warp_tile.n,
+        )
+
+    @property
+    def result_shape(self) -> tuple[int, int]:
+        return (
+            self.warps_m * self.warp_tile.m,
+            self.warps_n * self.warp_tile.n,
+        )
+
+    def warp_coordinates(self, warp_id: int) -> tuple[int, int]:
+        if type(warp_id) is not int or not 0 <= warp_id < self.warp_count:
+            raise ValueError(
+                f"warp ID must be between 0 and {self.warp_count - 1}, got {warp_id}"
+            )
+
+        return divmod(warp_id, self.warps_n)
+
+    def warp_result_offset(self, warp_id: int) -> tuple[int, int]:
+        warp_m, warp_n = self.warp_coordinates(warp_id)
+        return (
+            warp_m * self.warp_tile.m,
+            warp_n * self.warp_tile.n,
+        )
+
+    def warp_lhs_offset(self, warp_id: int) -> tuple[int, int]:
+        warp_m, _ = self.warp_coordinates(warp_id)
+        return (
+            warp_m * self.warp_tile.m,
+            0,
+        )
+
+    def warp_rhs_offset(self, warp_id: int) -> tuple[int, int]:
+        _, warp_n = self.warp_coordinates(warp_id)
+        return (
+            0,
+            warp_n * self.warp_tile.n,
+        )
+
+
 def cuda_mma_warp_tile_layout(
     op: SSAItem,
     *,
@@ -313,6 +423,84 @@ def cuda_mma_warp_tile_layout(
         )
     except ValueError:
         return None
+
+
+CUDA_MMA_CTA_WARP_TILE_SHAPE = (32, 32)
+
+
+def cuda_mma_cta_tile_layout(
+    op: SSAItem,
+    *,
+    operand_types: frozenset[ScalarType] = frozenset((F16,)),
+) -> CudaMmaCtaTileLayout | None:
+    """Return a multi-warp CTA layout for a supported low-precision dot."""
+
+    full_tile = cuda_mma_warp_tile_layout(
+        op,
+        operand_types=operand_types,
+    )
+
+    if full_tile is None:
+        return None
+
+    warp_m, warp_n = CUDA_MMA_CTA_WARP_TILE_SHAPE
+
+    if full_tile.m % warp_m != 0 or full_tile.n % warp_n != 0:
+        return None
+
+    warps_m = full_tile.m // warp_m
+    warps_n = full_tile.n // warp_n
+
+    if warps_m * warps_n <= 1:
+        return None
+
+    try:
+        return CudaMmaCtaTileLayout(
+            warp_tile=CudaMmaWarpTileLayout(
+                m=warp_m,
+                n=warp_n,
+                k=full_tile.k,
+            ),
+            warps_m=warps_m,
+            warps_n=warps_n,
+        )
+    except ValueError:
+        return None
+
+
+def cuda_mma_cta_tile_layouts(
+    ssa_ops: list[SSAItem],
+    *,
+    operand_types: frozenset[ScalarType] = frozenset((F16,)),
+) -> dict[int, CudaMmaCtaTileLayout]:
+    """Collect multi-warp CTA layouts by SSA dot result ID."""
+
+    from .ssa import SSAForRange
+
+    layouts: dict[int, CudaMmaCtaTileLayout] = {}
+
+    for item in ssa_ops:
+        if isinstance(item, SSAForRange):
+            layouts.update(
+                cuda_mma_cta_tile_layouts(
+                    item.body,
+                    operand_types=operand_types,
+                )
+            )
+            continue
+
+        layout = cuda_mma_cta_tile_layout(
+            item,
+            operand_types=operand_types,
+        )
+
+        if layout is None:
+            continue
+
+        assert item.result is not None
+        layouts[item.result.id] = layout
+
+    return layouts
 
 
 def cuda_mma_warp_tile_layouts(
@@ -913,13 +1101,38 @@ def _infer_cuda_thread_shape(
     return output_tile_shape
 
 
-def cuda_kernel_layout(ssa_ops: list[SSAItem]) -> CudaKernelLayout:
+def cuda_kernel_layout(
+    ssa_ops: list[SSAItem],
+    *,
+    mma_operand_types: frozenset[ScalarType] = frozenset((F16,)),
+) -> CudaKernelLayout:
     output_tile_shape = _infer_cuda_kernel_tile_shape(ssa_ops)
-    thread_shape = _infer_cuda_thread_shape(
-        output_tile_shape,
-        reduction_block_shapes(ssa_ops),
-        dot_result_shapes(ssa_ops),
-    )
+
+    cta_thread_shapes = {
+        layout.thread_shape
+        for layout in cuda_mma_cta_tile_layouts(
+            ssa_ops,
+            operand_types=mma_operand_types,
+        ).values()
+        if layout.result_shape == output_tile_shape
+    }
+
+    if len(cta_thread_shapes) > 1:
+        rendered = ", ".join(str(shape) for shape in sorted(cta_thread_shapes))
+        raise ValueError(
+            f"CUDA lowering requires one multi-warp CTA thread shape, got: {rendered}"
+        )
+
+    thread_shape: tuple[int, ...]
+
+    if cta_thread_shapes:
+        thread_shape = next(iter(cta_thread_shapes))
+    else:
+        thread_shape = _infer_cuda_thread_shape(
+            output_tile_shape,
+            reduction_block_shapes(ssa_ops),
+            dot_result_shapes(ssa_ops),
+        )
 
     return CudaKernelLayout(
         output_tile_shape=output_tile_shape,
@@ -927,8 +1140,15 @@ def cuda_kernel_layout(ssa_ops: list[SSAItem]) -> CudaKernelLayout:
     )
 
 
-def cuda_threads_per_block(ssa_ops: list[SSAItem]) -> int:
-    layout = cuda_kernel_layout(ssa_ops)
+def cuda_threads_per_block(
+    ssa_ops: list[SSAItem],
+    *,
+    mma_operand_types: frozenset[ScalarType] = frozenset((F16,)),
+) -> int:
+    layout = cuda_kernel_layout(
+        ssa_ops,
+        mma_operand_types=mma_operand_types,
+    )
     threads = layout.threads_per_block
     if not 1 <= threads <= 1024:
         raise ValueError(

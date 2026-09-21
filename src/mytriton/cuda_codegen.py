@@ -4,10 +4,13 @@ from typing import ClassVar
 
 from .block_shapes import (
     CudaKernelLayout,
+    CudaMmaCtaTileLayout,
     CudaMmaM16N8K8Layout,
     CudaMmaWarpTileLayout,
     CudaRegisterTileLayout,
     cuda_kernel_layout,
+    cuda_mma_cta_tile_layouts,
+    cuda_mma_m16n8k8_operand_types,
     cuda_mma_warp_tile_layouts,
 )
 from .cuda_dot_staging import (
@@ -122,6 +125,25 @@ class CudaMmaAccumulatorRef:
 
     base: str
     layout: CudaMmaM16N8K8Layout | CudaMmaWarpTileLayout
+    cta_layout: CudaMmaCtaTileLayout | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            self.cta_layout is not None
+            and self.cta_layout.warp_tile != self.warp_tile_layout
+        ):
+            raise ValueError(
+                "CTA accumulator warp tile does not match "
+                f"its register layout: {self.cta_layout.warp_tile} "
+                f"and {self.warp_tile_layout}"
+            )
+
+    @property
+    def logical_shape(self) -> tuple[int, int]:
+        if self.cta_layout is not None:
+            return self.cta_layout.result_shape
+
+        return self.layout.result_shape
 
     @property
     def warp_tile_layout(self) -> CudaMmaWarpTileLayout:
@@ -207,6 +229,10 @@ class SSACUDACodegen:
             dot_plans={},
             staging_only_ids=frozenset(),
         )
+        self.mma_cta_dot_layouts: dict[
+            int,
+            CudaMmaCtaTileLayout,
+        ] = {}
         self.mma_dot_layouts: dict[
             int,
             CudaMmaWarpTileLayout,
@@ -463,6 +489,7 @@ class SSACUDACodegen:
         result_id: int,
         buffers: CudaDotSharedBuffers,
         layout: CudaMmaWarpTileLayout,
+        cta_layout: CudaMmaCtaTileLayout | None = None,
         stage: str | None = None,
     ) -> tuple[
         tuple[tuple[str, str], str],
@@ -470,19 +497,41 @@ class SSACUDACodegen:
     ]:
         """Load packed operands for every m16n8k8 instruction in a warp tile."""
 
-        if self.layout.threads_per_block != layout.threads_per_warp:
+        if cta_layout is None:
+            expected_threads = layout.threads_per_warp
+            expected_lhs_shape = layout.lhs_shape
+            expected_rhs_shape = layout.rhs_shape
+            lane = "threadIdx.x"
+            lhs_warp_row_offset: str | None = None
+            rhs_warp_column_offset: str | None = None
+        else:
+            if cta_layout.warp_tile != layout:
+                raise TypeError(
+                    "CTA MMA layout contains a different warp tile: "
+                    f"{cta_layout.warp_tile} and {layout}"
+                )
+
+            expected_threads = cta_layout.threads_per_block
+            expected_lhs_shape = cta_layout.lhs_shape
+            expected_rhs_shape = cta_layout.rhs_shape
+            lane = "mma_lane_id"
+            lhs_warp_row_offset = f"mma_warp_m * {layout.m}"
+            rhs_warp_column_offset = f"mma_warp_n * {layout.n}"
+
+        if self.layout.threads_per_block != expected_threads:
             raise TypeError(
-                "warp MMA tile requires exactly 32 CUDA threads, "
+                "warp MMA tile requires "
+                f"{expected_threads} CUDA threads, "
                 f"got {self.layout.threads_per_block}"
             )
 
         if (
-            buffers.lhs.logical_shape != layout.lhs_shape
-            or buffers.rhs.logical_shape != layout.rhs_shape
+            buffers.lhs.logical_shape != expected_lhs_shape
+            or buffers.rhs.logical_shape != expected_rhs_shape
         ):
             raise TypeError(
                 "warp MMA tile requires shared tiles "
-                f"{layout.lhs_shape} and {layout.rhs_shape}, got "
+                f"{expected_lhs_shape} and {expected_rhs_shape}, got "
                 f"{buffers.lhs.logical_shape} and "
                 f"{buffers.rhs.logical_shape}"
             )
@@ -507,8 +556,8 @@ class SSACUDACodegen:
 
         self.lines.extend(
             [
-                f"    int {group} = threadIdx.x >> 2;",
-                f"    int {thread} = threadIdx.x & 3;",
+                f"    int {group} = {lane} >> 2;",
+                f"    int {thread} = {lane} & 3;",
             ]
         )
 
@@ -539,6 +588,13 @@ class SSACUDACodegen:
             rhs_row_0 = add_offset(thread_pair, k_offset)
             rhs_row_1 = add_offset(thread_pair, k_offset + 1)
             rhs_column = add_offset(group, n_offset)
+
+            if lhs_warp_row_offset is not None:
+                lhs_row_0 = f"{lhs_warp_row_offset} + {lhs_row_0}"
+                lhs_row_1 = f"{lhs_warp_row_offset} + {lhs_row_1}"
+
+            if rhs_warp_column_offset is not None:
+                rhs_column = f"{rhs_warp_column_offset} + {rhs_column}"
 
             lhs_0_low = buffers.lhs.element(
                 lhs_row_0,
@@ -735,12 +791,22 @@ class SSACUDACodegen:
             ...,
         ],
         operand_ty: ScalarType,
+        cta_layout: CudaMmaCtaTileLayout | None = None,
         accumulator: CudaMmaAccumulatorRef | None = None,
     ) -> CudaMmaAccumulatorRef:
         """Compose one logical warp tile from m16n8k8 instructions."""
 
+        if cta_layout is not None and cta_layout.warp_tile != layout:
+            raise TypeError(
+                "CTA MMA layout contains a different warp tile: "
+                f"{cta_layout.warp_tile} and {layout}"
+            )
+
+        expected_result_shape = (
+            cta_layout.result_shape if cta_layout is not None else layout.result_shape
+        )
         expected_result_ty = BlockType(
-            layout.result_shape,
+            expected_result_shape,
             F32,
         )
         if result.ty != expected_result_ty:
@@ -756,7 +822,10 @@ class SSACUDACodegen:
                 f"got {len(instruction_operands)}"
             )
 
-        if accumulator is not None and accumulator.warp_tile_layout != layout:
+        if accumulator is not None and (
+            accumulator.warp_tile_layout != layout
+            or accumulator.cta_layout != cta_layout
+        ):
             raise TypeError(
                 "warp MMA tile requires a compatible accumulator layout, "
                 f"got {accumulator.layout}"
@@ -765,6 +834,7 @@ class SSACUDACodegen:
         result_ref = CudaMmaAccumulatorRef(
             base=f"v{result.id}",
             layout=layout,
+            cta_layout=cta_layout,
         )
 
         for index, element in enumerate(result_ref.elements()):
@@ -808,6 +878,7 @@ class SSACUDACodegen:
         buffers: CudaDotSharedBuffers,
         layout: CudaMmaWarpTileLayout,
         *,
+        cta_layout: CudaMmaCtaTileLayout | None = None,
         accumulator: CudaMmaAccumulatorRef | None = None,
         stage: str | None = None,
         emit_reuse_barrier: bool = True,
@@ -818,6 +889,7 @@ class SSACUDACodegen:
             result_id=result.id,
             buffers=buffers,
             layout=layout,
+            cta_layout=cta_layout,
             stage=stage,
         )
 
@@ -826,6 +898,7 @@ class SSACUDACodegen:
             layout=layout,
             instruction_operands=instruction_operands,
             operand_ty=buffers.lhs.element_ty,
+            cta_layout=cta_layout,
             accumulator=accumulator,
         )
 
@@ -875,7 +948,7 @@ class SSACUDACodegen:
 
         buffer = CudaSharedBuffer(
             name=f"mma_result_{value_id}",
-            logical_shape=layout.result_shape,
+            logical_shape=value.logical_shape,
             element_ty=F32,
         )
         self.reserve_shared_memory(buffer.nbytes)
@@ -884,10 +957,19 @@ class SSACUDACodegen:
         group = f"mma_store_group_{value_id}"
         thread = f"mma_store_thread_{value_id}"
 
+        if value.cta_layout is None:
+            lane = "threadIdx.x"
+            warp_row_offset: str | None = None
+            warp_column_offset: str | None = None
+        else:
+            lane = "mma_lane_id"
+            warp_row_offset = f"mma_warp_m * {layout.m}"
+            warp_column_offset = f"mma_warp_n * {layout.n}"
+
         self.lines.extend(
             [
-                f"    int {group} = threadIdx.x >> 2;",
-                f"    int {thread} = threadIdx.x & 3;",
+                f"    int {group} = {lane} >> 2;",
+                f"    int {thread} = {lane} & 3;",
             ]
         )
 
@@ -912,6 +994,14 @@ class SSACUDACodegen:
                 )
                 column_0 = add_offset(thread_pair, n_offset)
                 column_1 = add_offset(thread_pair, n_offset + 1)
+
+                if warp_row_offset is not None:
+                    row_0 = f"{warp_row_offset} + {row_0}"
+                    row_1 = f"{warp_row_offset} + {row_1}"
+
+                if warp_column_offset is not None:
+                    column_0 = f"{warp_column_offset} + {column_0}"
+                    column_1 = f"{warp_column_offset} + {column_1}"
 
                 coordinates = (
                     (row_0, column_0),
@@ -948,10 +1038,10 @@ class SSACUDACodegen:
 
         register_layout = self.layout.register_tile_layout()
 
-        if register_layout.logical_shape != value.layout.result_shape:
+        if register_layout.logical_shape != value.logical_shape:
             raise TypeError(
                 "MMA store output shape does not match the kernel layout, "
-                f"got {value.layout.result_shape} and "
+                f"got {value.logical_shape} and "
                 f"{register_layout.logical_shape}"
             )
 
@@ -1773,6 +1863,39 @@ class SSACUDACodegen:
         if not self.is_rank2_kernel():
             return
 
+        cta_layouts = {
+            layout
+            for layout in self.mma_cta_dot_layouts.values()
+            if layout.result_shape == self.layout.output_tile_shape
+        }
+
+        if len(cta_layouts) > 1:
+            raise ValueError("CUDA lowering requires one multi-warp CTA layout")
+
+        if cta_layouts:
+            cta_layout = next(iter(cta_layouts))
+            warp_threads_m, warp_threads_n = cta_layout.warp_tile.thread_shape
+
+            self.lines.extend(
+                [
+                    "    int mma_warp_id = threadIdx.x >> 5;",
+                    "    int mma_lane_id = threadIdx.x & 31;",
+                    (f"    int mma_warp_m = mma_warp_id / {cta_layout.warps_n};"),
+                    (f"    int mma_warp_n = mma_warp_id % {cta_layout.warps_n};"),
+                    (
+                        "    int tile_i = "
+                        f"mma_warp_m * {warp_threads_m} "
+                        f"+ mma_lane_id / {warp_threads_n};"
+                    ),
+                    (
+                        "    int tile_j = "
+                        f"mma_warp_n * {warp_threads_n} "
+                        f"+ mma_lane_id % {warp_threads_n};"
+                    ),
+                ]
+            )
+            return
+
         _, cols = self.layout.thread_shape
 
         self.lines.extend(
@@ -1871,10 +1994,19 @@ class SSACUDACodegen:
             self.staging_analysis,
         )
 
-        mma_loop_layout = (
-            self.mma_dot_layouts.get(double_buffering.dot_result_id)
+        mma_loop_cta_layout = (
+            self.mma_cta_dot_layouts.get(double_buffering.dot_result_id)
             if double_buffering is not None
             else None
+        )
+        mma_loop_layout = (
+            mma_loop_cta_layout.warp_tile
+            if mma_loop_cta_layout is not None
+            else (
+                self.mma_dot_layouts.get(double_buffering.dot_result_id)
+                if double_buffering is not None
+                else None
+            )
         )
         tensor_core_loop = mma_loop_layout is not None
 
@@ -1893,15 +2025,20 @@ class SSACUDACodegen:
             strict=True,
         ):
             if mma_loop_layout is not None:
+                expected_result_shape = (
+                    mma_loop_cta_layout.result_shape
+                    if mma_loop_cta_layout is not None
+                    else mma_loop_layout.result_shape
+                )
                 expected_ty = BlockType(
-                    mma_loop_layout.result_shape,
+                    expected_result_shape,
                     F32,
                 )
 
                 if result.ty != expected_ty:
                     raise TypeError(
                         "tensor-core loop requires an f32 "
-                        f"{mma_loop_layout.result_shape} accumulator, "
+                        f"{expected_result_shape} accumulator, "
                         f"got {result.ty}"
                     )
 
@@ -1909,6 +2046,7 @@ class SSACUDACodegen:
                 mma_result_ref = CudaMmaAccumulatorRef(
                     base=f"v{result.id}",
                     layout=mma_loop_layout,
+                    cta_layout=mma_loop_cta_layout,
                 )
 
                 for index, name in enumerate(mma_result_ref.elements()):
@@ -1918,7 +2056,10 @@ class SSACUDACodegen:
                         initial_value,
                         CudaMmaAccumulatorRef,
                     ):
-                        if initial_value.warp_tile_layout != mma_loop_layout:
+                        if (
+                            initial_value.warp_tile_layout != mma_loop_layout
+                            or initial_value.cta_layout != mma_loop_cta_layout
+                        ):
                             raise TypeError(
                                 "tensor-core loop received an incompatible "
                                 "accumulator layout: "
@@ -2071,7 +2212,10 @@ class SSACUDACodegen:
                         f"got {yielded_value}"
                     )
 
-                if yielded_value.warp_tile_layout != carried_value.warp_tile_layout:
+                if (
+                    yielded_value.warp_tile_layout != carried_value.warp_tile_layout
+                    or yielded_value.cta_layout != carried_value.cta_layout
+                ):
                     raise TypeError(
                         "tensor-core loop yielded an incompatible "
                         f"accumulator layout: {yielded_value.layout}"
@@ -2516,13 +2660,19 @@ class SSACUDACodegen:
             stage=stage,
         )
 
-        mma_layout = self.mma_dot_layouts.get(result.id)
+        cta_layout = self.mma_cta_dot_layouts.get(result.id)
+        mma_layout = (
+            cta_layout.warp_tile
+            if cta_layout is not None
+            else self.mma_dot_layouts.get(result.id)
+        )
 
         if mma_layout is not None:
             self.emit_mma_warp_tile_from_shared_memory(
                 result,
                 buffers,
                 mma_layout,
+                cta_layout=cta_layout,
                 accumulator=accumulator,
                 stage=stage,
                 emit_reuse_barrier=emit_reuse_barrier,
@@ -2616,18 +2766,20 @@ class SSACUDACodegen:
         self.values = {}
         self.definitions = SSADefinitions(ssa_ops)
         self.staging_analysis = CudaDotStagingAnalyzer(self.definitions).analyze()
-        mma_operand_types = set()
-        if self.target.supports_f16_mma_m16n8k8:
-            mma_operand_types.add(F16)
-        if self.target.supports_bf16_mma_m16n8k8:
-            mma_operand_types.add(BF16)
-        supported_mma_operand_types = frozenset(mma_operand_types)
+        supported_mma_operand_types = cuda_mma_m16n8k8_operand_types(self.target)
 
+        self.mma_cta_dot_layouts = cuda_mma_cta_tile_layouts(
+            ssa_ops,
+            operand_types=supported_mma_operand_types,
+        )
         self.mma_dot_layouts = cuda_mma_warp_tile_layouts(
             ssa_ops,
             operand_types=supported_mma_operand_types,
         )
-        self.layout = cuda_kernel_layout(ssa_ops)
+        self.layout = cuda_kernel_layout(
+            ssa_ops,
+            mma_operand_types=supported_mma_operand_types,
+        )
 
         self.emit_rank2_prologue()
 

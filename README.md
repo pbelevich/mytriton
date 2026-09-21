@@ -11,7 +11,8 @@ Triton-style Python kernel becomes GPU code. It parses kernel source, builds a
 symbolic IR, lowers it to verified typed SSA, and emits CUDA C++ with inline
 PTX. The current development version includes shared-memory tiled matrix
 multiplication, FP16/BF16 inputs, FP32 accumulation, and composable one-warp
-Tensor Core tiles built from NVIDIA `mma.sync` instructions.
+Tensor Core tiles combined into multi-warp CTA tiles built from NVIDIA
+`mma.sync` instructions.
 
 ```text
 Python kernel
@@ -54,6 +55,7 @@ full [changelog](CHANGELOG.md) and the accompanying
 | [`ver19`](https://github.com/pbelevich/mytriton/tree/ver19) | [Mixed-precision types and casts](https://pbelevich.github.io/2026/09/12/My_Triton_From_Scratch_Part_19_Mixed_Precision_Types.html) |
 | [`ver20`](https://github.com/pbelevich/mytriton/tree/ver20) | [Tensor-core `mma.sync` lowering](https://pbelevich.github.io/2026/09/13/My_Triton_From_Scratch_Part_20_Tensor_Cores.html) |
 | [`ver21`](https://github.com/pbelevich/mytriton/tree/ver21) | [Composable warp MMA tiles](docs/implementation.md#composable-warp-mma-tiles) |
+| [`ver22`](https://github.com/pbelevich/mytriton/tree/ver22) | [Multi-warp CTA tiles](docs/implementation.md#multi-warp-cta-tiles) |
 
 ## Tensor-core matmul
 
@@ -111,7 +113,7 @@ def matmul_kernel(
 
 
 M, N, K = 128, 128, 128
-BM, BK, BN = 32, 16, 16
+BM, BK, BN = 64, 16, 64
 
 torch.manual_seed(0)
 a = torch.randn((M, K), device="cuda", dtype=torch.float16)
@@ -135,8 +137,10 @@ expected = a.float() @ b.float()
 torch.testing.assert_close(out, expected, rtol=3e-3, atol=3e-3)
 ```
 
-A logical `32 x 16 x 16` dot is composed from eight physical `m16n8k8`
-instructions. Each instruction has the canonical form:
+A logical `64 x 16 x 64` dot is divided among four warps in a `2 x 2` grid.
+Each warp computes a `32 x 32` result tile with 16 physical `m16n8k8`
+instructions, while the CTA cooperatively stages and reuses the larger A and B
+tiles in shared memory. Every physical instruction has the canonical form:
 
 ```cuda
 asm volatile(
@@ -152,13 +156,17 @@ asm volatile(
 
 FP16 MMA requires `sm_75+`; native BF16 MMA requires `sm_80+`. Unsupported
 types, shapes, and targets retain the CUDA-core fallback. See the
-[implementation guide](docs/implementation.md#tensor-core-dot) for fragment
-layouts, composition, accumulation, and current performance limitations.
+[implementation guide](docs/implementation.md#multi-warp-cta-tiles) for warp
+mapping, fragment composition, accumulation, and current performance
+limitations. The accompanying
+[A100 benchmark and profile](benchmarks/matmul_multi_warp_a100_report.md)
+measures the four-warp kernel at approximately 24 TFLOP/s.
 
 ## Documentation
 
 - [Documentation index](docs/README.md)
 - [Compiler and backend implementation](docs/implementation.md)
+- [A100 multi-warp benchmark](benchmarks/matmul_multi_warp_a100_report.md)
 - [Version changelog](CHANGELOG.md)
 - [Colab test notebook](tests/mytriton_colab_tests.ipynb)
 - [My Triton From Scratch blog](https://pbelevich.github.io/)
