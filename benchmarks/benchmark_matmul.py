@@ -28,15 +28,12 @@ import torch
 
 import mytriton as triton
 import mytriton.language as tl
-from mytriton.block_shapes import cuda_threads_per_block
 from mytriton.cuda_utils import cuda_module
 
 Tile = tuple[int, int, int]
 
 DEFAULT_TILES: tuple[Tile, ...] = (
-    (16, 16, 16),
     (16, 16, 32),
-    (16, 32, 16),
     (16, 32, 32),
     (32, 16, 16),
     (32, 16, 32),
@@ -157,6 +154,13 @@ def find_raw_kernel(cuda_source: str) -> Any:
     raise RuntimeError("compiled CUDA kernel is missing from the launch cache")
 
 
+def find_threads_per_block(cuda_source: str) -> int:
+    for artifact in matmul_kernel.compilation_cache.values():
+        if artifact.src == cuda_source:
+            return artifact.threads_per_block
+    raise RuntimeError("compiled CUDA artifact is missing from the cache")
+
+
 def launch_raw_kernel(
     cp,
     raw_kernel,
@@ -262,6 +266,7 @@ def benchmark_size(
     seed: int,
     artifacts_dir: Path | None,
     dtype_name: str,
+    num_warps: int,
 ) -> dict[str, object]:
     m = n = k = size
     torch.manual_seed(seed + size)
@@ -310,12 +315,13 @@ def benchmark_size(
             BM=bm,
             BK=bk,
             BN=bn,
+            num_warps=num_warps,
         )
 
-        _ops, ssa_ops, cuda_source = run_wrapper()
+        _ops, _ssa_ops, cuda_source = run_wrapper()
         torch.cuda.synchronize()
 
-        threads_per_block = cuda_threads_per_block(ssa_ops)
+        threads_per_block = find_threads_per_block(cuda_source)
         raw_kernel = find_raw_kernel(cuda_source)
         cupy_a = cp.from_dlpack(a.detach())
         cupy_b = cp.from_dlpack(b.detach())
@@ -374,7 +380,9 @@ def benchmark_size(
         )
 
         if artifacts_dir is not None:
-            artifact_stem = f"matmul_{dtype_name}_m{m}_n{n}_k{k}_bm{bm}_bk{bk}_bn{bn}"
+            artifact_stem = (
+                f"matmul_{dtype_name}_m{m}_n{n}_k{k}_bm{bm}_bk{bk}_bn{bn}_nw{num_warps}"
+            )
             source_path = artifacts_dir / f"{artifact_stem}.cu"
             source_path.write_text(cuda_source)
             metadata_path = artifacts_dir / f"{artifact_stem}.json"
@@ -384,6 +392,7 @@ def benchmark_size(
                         "shape": [m, k, n],
                         "tile": {"BM": bm, "BK": bk, "BN": bn},
                         "grid": list(grid),
+                        "num_warps": num_warps,
                         "threads_per_block": threads_per_block,
                         "cuda_source_sha256": hashlib.sha256(
                             cuda_source.encode()
@@ -407,6 +416,7 @@ def benchmark_size(
             {
                 "tile": {"BM": bm, "BK": bk, "BN": bn},
                 "grid": list(grid),
+                "num_warps": num_warps,
                 "grid_blocks": math.prod(grid),
                 "threads_per_block": threads_per_block,
                 "arithmetic_intensity_flop_per_byte": bm * bn / (bm + bn),
@@ -428,6 +438,7 @@ def benchmark_size(
 
     return {
         "shape": [m, k, n],
+        "num_warps": num_warps,
         "torch": {
             "eager": native,
             "graph": native_graph,
@@ -439,6 +450,7 @@ def benchmark_size(
 
 def print_size_summary(result: dict[str, object]) -> None:
     m, k, n = result["shape"]
+    num_warps = result["num_warps"]
     native = result["torch"]
     native_ms = native["eager"]["median_ms"]
     native_tflops = native["eager_tflops"]
@@ -446,7 +458,7 @@ def print_size_summary(result: dict[str, object]) -> None:
     graph_suffix = "" if graph is None else f", graph {graph['median_ms']:.4f} ms"
 
     print()
-    print(f"{m}x{k} @ {k}x{n}")
+    print(f"{m}x{k} @ {k}x{n}, num_warps={num_warps}")
     print(f"torch.mm: {native_ms:.4f} ms, {native_tflops:.2f} TFLOP/s{graph_suffix}")
     print(
         " BM  BK  BN | wrapper ms | raw ms | graph ms | raw TF/s | "
@@ -499,6 +511,7 @@ def parse_args() -> argparse.Namespace:
         metavar="BMxBKxBN",
     )
     parser.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
+    parser.add_argument("--num-warps", type=int, default=4)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
@@ -511,6 +524,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--warmup must be non-negative and --repeats must be positive")
     if any(size <= 0 for size in args.sizes):
         parser.error("--sizes must contain positive integers")
+    if (
+        args.num_warps <= 0
+        or args.num_warps & (args.num_warps - 1)
+        or args.num_warps > 32
+    ):
+        parser.error("--num-warps must be a power of two between 1 and 32")
     return args
 
 
@@ -531,6 +550,7 @@ def main() -> None:
     metadata = {
         "device": device_summary(cp),
         "dtype": args.dtype,
+        "num_warps": args.num_warps,
         "warmup": args.warmup,
         "repeats": args.repeats,
         "cuda_graphs": not args.no_graphs,
@@ -550,6 +570,7 @@ def main() -> None:
             seed=args.seed,
             artifacts_dir=args.artifacts_dir,
             dtype_name=args.dtype,
+            num_warps=args.num_warps,
         )
         results.append(result)
         print_size_summary(result)

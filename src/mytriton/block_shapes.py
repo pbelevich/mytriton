@@ -257,6 +257,166 @@ class CudaMmaWarpTileLayout:
         )
 
 
+@dataclass(frozen=True)
+class CudaMatmulSchedule:
+    """CUDA matmul block and warp decomposition."""
+
+    block_m: int
+    block_k: int
+    block_n: int
+    warp_m: int
+    warp_n: int
+    warps_m: int
+    warps_n: int
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("block_m", self.block_m),
+            ("block_k", self.block_k),
+            ("block_n", self.block_n),
+            ("warp_m", self.warp_m),
+            ("warp_n", self.warp_n),
+            ("warps_m", self.warps_m),
+            ("warps_n", self.warps_n),
+        ):
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{name} must be a positive integer, got {value}")
+
+        expected_block_m = self.warp_m * self.warps_m
+        if self.block_m != expected_block_m:
+            raise ValueError(
+                "block_m must equal warp_m * warps_m, "
+                f"got {self.block_m} != {expected_block_m}"
+            )
+
+        expected_block_n = self.warp_n * self.warps_n
+        if self.block_n != expected_block_n:
+            raise ValueError(
+                "block_n must equal warp_n * warps_n, "
+                f"got {self.block_n} != {expected_block_n}"
+            )
+
+        if self.threads_per_block > 1024:
+            raise ValueError(
+                "CUDA matmul schedule requires at most 1024 threads, "
+                f"got {self.threads_per_block}"
+            )
+
+    @property
+    def block_shape(self) -> tuple[int, int, int]:
+        return (self.block_m, self.block_k, self.block_n)
+
+    @property
+    def warp_tile_shape(self) -> tuple[int, int]:
+        return (self.warp_m, self.warp_n)
+
+    @property
+    def warp_shape(self) -> tuple[int, int]:
+        return (self.warps_m, self.warps_n)
+
+    @property
+    def warp_count(self) -> int:
+        return self.warps_m * self.warps_n
+
+    @property
+    def threads_per_block(self) -> int:
+        return self.warp_count * 32
+
+
+@dataclass(frozen=True)
+class CudaMmaCtaTileLayout:
+    """Physical multi-warp MMA layout selected by a matmul schedule."""
+
+    schedule: CudaMatmulSchedule
+
+    def __post_init__(self) -> None:
+        # Constructing the warp layout validates that its M, N and K
+        # dimensions are compatible with the physical MMA instruction.
+        CudaMmaWarpTileLayout(
+            m=self.schedule.warp_m,
+            n=self.schedule.warp_n,
+            k=self.schedule.block_k,
+        )
+
+    @property
+    def warp_tile(self) -> CudaMmaWarpTileLayout:
+        return CudaMmaWarpTileLayout(
+            m=self.schedule.warp_m,
+            n=self.schedule.warp_n,
+            k=self.schedule.block_k,
+        )
+
+    @property
+    def warp_shape(self) -> tuple[int, int]:
+        return self.schedule.warp_shape
+
+    @property
+    def warp_count(self) -> int:
+        return self.schedule.warp_count
+
+    @property
+    def threads_per_block(self) -> int:
+        return self.schedule.threads_per_block
+
+    @property
+    def thread_shape(self) -> tuple[int, int]:
+        warp_threads_m, warp_threads_n = self.warp_tile.thread_shape
+        return (
+            self.schedule.warps_m * warp_threads_m,
+            self.schedule.warps_n * warp_threads_n,
+        )
+
+    @property
+    def lhs_shape(self) -> tuple[int, int]:
+        return (
+            self.schedule.block_m,
+            self.schedule.block_k,
+        )
+
+    @property
+    def rhs_shape(self) -> tuple[int, int]:
+        return (
+            self.schedule.block_k,
+            self.schedule.block_n,
+        )
+
+    @property
+    def result_shape(self) -> tuple[int, int]:
+        return (
+            self.schedule.block_m,
+            self.schedule.block_n,
+        )
+
+    def warp_coordinates(self, warp_id: int) -> tuple[int, int]:
+        if type(warp_id) is not int or not 0 <= warp_id < self.warp_count:
+            raise ValueError(
+                f"warp ID must be between 0 and {self.warp_count - 1}, got {warp_id}"
+            )
+
+        return divmod(warp_id, self.schedule.warps_n)
+
+    def warp_result_offset(self, warp_id: int) -> tuple[int, int]:
+        warp_m, warp_n = self.warp_coordinates(warp_id)
+        return (
+            warp_m * self.schedule.warp_m,
+            warp_n * self.schedule.warp_n,
+        )
+
+    def warp_lhs_offset(self, warp_id: int) -> tuple[int, int]:
+        warp_m, _ = self.warp_coordinates(warp_id)
+        return (
+            warp_m * self.schedule.warp_m,
+            0,
+        )
+
+    def warp_rhs_offset(self, warp_id: int) -> tuple[int, int]:
+        _, warp_n = self.warp_coordinates(warp_id)
+        return (
+            0,
+            warp_n * self.schedule.warp_n,
+        )
+
+
 def cuda_mma_warp_tile_layout(
     op: SSAItem,
     *,
@@ -315,6 +475,87 @@ def cuda_mma_warp_tile_layout(
         return None
 
 
+def cuda_mma_cta_tile_layout(
+    op: SSAItem,
+    *,
+    schedule: CudaMatmulSchedule,
+    operand_types: frozenset[ScalarType] = frozenset((F16,)),
+) -> CudaMmaCtaTileLayout | None:
+    """Match a low-precision dot against an explicit multi-warp schedule."""
+
+    full_tile = cuda_mma_warp_tile_layout(
+        op,
+        operand_types=operand_types,
+    )
+
+    if full_tile is None:
+        return None
+
+    if schedule.warp_count <= 1:
+        return None
+
+    if full_tile.lhs_shape != (
+        schedule.block_m,
+        schedule.block_k,
+    ):
+        return None
+
+    if full_tile.rhs_shape != (
+        schedule.block_k,
+        schedule.block_n,
+    ):
+        return None
+
+    if full_tile.result_shape != (
+        schedule.block_m,
+        schedule.block_n,
+    ):
+        return None
+
+    try:
+        return CudaMmaCtaTileLayout(schedule=schedule)
+    except ValueError:
+        return None
+
+
+def cuda_mma_cta_tile_layouts(
+    ssa_ops: list[SSAItem],
+    *,
+    schedule: CudaMatmulSchedule,
+    operand_types: frozenset[ScalarType] = frozenset((F16,)),
+) -> dict[int, CudaMmaCtaTileLayout]:
+    """Collect schedule-compatible CTA layouts by SSA dot result ID."""
+
+    from .ssa import SSAForRange
+
+    layouts: dict[int, CudaMmaCtaTileLayout] = {}
+
+    for item in ssa_ops:
+        if isinstance(item, SSAForRange):
+            layouts.update(
+                cuda_mma_cta_tile_layouts(
+                    item.body,
+                    schedule=schedule,
+                    operand_types=operand_types,
+                )
+            )
+            continue
+
+        layout = cuda_mma_cta_tile_layout(
+            item,
+            schedule=schedule,
+            operand_types=operand_types,
+        )
+
+        if layout is None:
+            continue
+
+        assert item.result is not None
+        layouts[item.result.id] = layout
+
+    return layouts
+
+
 def cuda_mma_warp_tile_layouts(
     ssa_ops: list[SSAItem],
     *,
@@ -348,6 +589,105 @@ def cuda_mma_warp_tile_layouts(
         layouts[item.result.id] = layout
 
     return layouts
+
+
+def infer_cuda_matmul_schedule(
+    ssa_ops: list[SSAItem],
+    *,
+    num_warps: int,
+    operand_types: frozenset[ScalarType] = frozenset((F16,)),
+) -> CudaMatmulSchedule | None:
+    """Infer a balanced multi-warp schedule for one logical dot shape."""
+
+    if type(num_warps) is not int or num_warps <= 0 or num_warps & (num_warps - 1):
+        raise ValueError(f"num_warps must be a positive power of two, got {num_warps}")
+
+    if num_warps > 32:
+        raise ValueError(
+            f"CUDA kernels support at most 32 warps per block, got {num_warps}"
+        )
+
+    full_layouts = set(
+        cuda_mma_warp_tile_layouts(
+            ssa_ops,
+            operand_types=operand_types,
+        ).values()
+    )
+
+    if not full_layouts:
+        return None
+
+    block_shapes = {(layout.m, layout.k, layout.n) for layout in full_layouts}
+
+    if len(block_shapes) != 1:
+        rendered = ", ".join(str(shape) for shape in sorted(block_shapes))
+        raise ValueError(
+            f"CUDA matmul scheduling requires one dot tile shape, got: {rendered}"
+        )
+
+    block_m, block_k, block_n = next(iter(block_shapes))
+
+    candidates: list[
+        tuple[
+            tuple[float, int],
+            CudaMatmulSchedule,
+        ]
+    ] = []
+
+    for warps_m in range(1, num_warps + 1):
+        if num_warps % warps_m != 0:
+            continue
+
+        warps_n = num_warps // warps_m
+
+        if block_m % warps_m != 0 or block_n % warps_n != 0:
+            continue
+
+        warp_m = block_m // warps_m
+        warp_n = block_n // warps_n
+
+        try:
+            CudaMmaWarpTileLayout(
+                m=warp_m,
+                n=warp_n,
+                k=block_k,
+            )
+        except ValueError:
+            continue
+
+        schedule = CudaMatmulSchedule(
+            block_m=block_m,
+            block_k=block_k,
+            block_n=block_n,
+            warp_m=warp_m,
+            warp_n=warp_n,
+            warps_m=warps_m,
+            warps_n=warps_n,
+        )
+
+        tile_aspect_ratio = max(warp_m, warp_n) / min(warp_m, warp_n)
+        warp_grid_imbalance = abs(warps_m - warps_n)
+
+        candidates.append(
+            (
+                (
+                    tile_aspect_ratio,
+                    warp_grid_imbalance,
+                ),
+                schedule,
+            )
+        )
+
+    if not candidates:
+        raise ValueError(
+            f"dot tile {(block_m, block_k, block_n)} "
+            f"cannot be partitioned across {num_warps} warps"
+        )
+
+    return min(
+        candidates,
+        key=lambda candidate: candidate[0],
+    )[1]
 
 
 def is_cuda_mma_m16n8k8_dot(
@@ -913,13 +1253,41 @@ def _infer_cuda_thread_shape(
     return output_tile_shape
 
 
-def cuda_kernel_layout(ssa_ops: list[SSAItem]) -> CudaKernelLayout:
+def cuda_kernel_layout(
+    ssa_ops: list[SSAItem],
+    *,
+    matmul_schedule: CudaMatmulSchedule | None = None,
+    mma_operand_types: frozenset[ScalarType] = frozenset((F16,)),
+) -> CudaKernelLayout:
     output_tile_shape = _infer_cuda_kernel_tile_shape(ssa_ops)
-    thread_shape = _infer_cuda_thread_shape(
-        output_tile_shape,
-        reduction_block_shapes(ssa_ops),
-        dot_result_shapes(ssa_ops),
-    )
+
+    cta_thread_shapes: set[tuple[int, ...]] = set()
+
+    if matmul_schedule is not None:
+        cta_thread_shapes = {
+            layout.thread_shape
+            for layout in cuda_mma_cta_tile_layouts(
+                ssa_ops,
+                schedule=matmul_schedule,
+                operand_types=mma_operand_types,
+            ).values()
+            if layout.result_shape == output_tile_shape
+        }
+
+    if len(cta_thread_shapes) > 1:
+        rendered = ", ".join(str(shape) for shape in sorted(cta_thread_shapes))
+        raise ValueError(
+            f"CUDA lowering requires one multi-warp CTA thread shape, got: {rendered}"
+        )
+
+    if cta_thread_shapes:
+        thread_shape = next(iter(cta_thread_shapes))
+    else:
+        thread_shape = _infer_cuda_thread_shape(
+            output_tile_shape,
+            reduction_block_shapes(ssa_ops),
+            dot_result_shapes(ssa_ops),
+        )
 
     return CudaKernelLayout(
         output_tile_shape=output_tile_shape,
@@ -927,11 +1295,22 @@ def cuda_kernel_layout(ssa_ops: list[SSAItem]) -> CudaKernelLayout:
     )
 
 
-def cuda_threads_per_block(ssa_ops: list[SSAItem]) -> int:
-    layout = cuda_kernel_layout(ssa_ops)
+def cuda_threads_per_block(
+    ssa_ops: list[SSAItem],
+    *,
+    matmul_schedule: CudaMatmulSchedule | None = None,
+    mma_operand_types: frozenset[ScalarType] = frozenset((F16,)),
+) -> int:
+    layout = cuda_kernel_layout(
+        ssa_ops,
+        matmul_schedule=matmul_schedule,
+        mma_operand_types=mma_operand_types,
+    )
     threads = layout.threads_per_block
+
     if not 1 <= threads <= 1024:
         raise ValueError(
             f"CUDA threads per block must be between 1 and 1024, got {threads}"
         )
+
     return threads

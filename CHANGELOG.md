@@ -6,6 +6,16 @@ were built.
 
 ## Unreleased
 
+- Added Triton-style `num_warps` launch configuration for CUDA tensor-core
+  matrix multiplication.
+- Added inferred block-to-warp decomposition, multi-warp CTA layouts,
+  cooperative 128-thread operand staging, warp-local MMA accumulation, and
+  shared-memory result redistribution.
+- Added compilation-cache separation by launch configuration and CUDA
+  execution coverage for masked FP16/BF16 multi-warp matrix multiplication.
+
+## [ver21](https://github.com/pbelevich/mytriton/tree/ver21) — 2026-09-20
+
 - Added composable one-warp Tensor Core tiles that lower larger FP16/BF16
   `tl.dot` operations into grids of `mma.sync.m16n8k8` instructions, carry
   multiple accumulator fragments across runtime K-loops, and redistribute the

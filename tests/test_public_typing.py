@@ -17,7 +17,8 @@ def _mypy_contract() -> None:
     def typed_kernel(value: int) -> None:
         del value
 
-    typed_kernel[(1,)]("not an int")  # type: ignore[arg-type]
+    typed_kernel[(1,)](1, num_warps=4)
+    typed_kernel[(1,)]("not an int")  # type: ignore[call-overload]
 
 
 def test_public_dsl_functions_have_annotations():

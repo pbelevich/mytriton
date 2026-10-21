@@ -1,4 +1,5 @@
 import itertools
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -7,12 +8,18 @@ import mytriton as triton
 import mytriton.language as tl
 from mytriton.block_shapes import (
     CudaKernelLayout,
+    CudaMatmulSchedule,
+    CudaMmaCtaTileLayout,
     CudaMmaM16N8K8Layout,
     CudaMmaWarpTileLayout,
+    cuda_kernel_layout,
+    cuda_mma_cta_tile_layout,
+    cuda_mma_cta_tile_layouts,
     cuda_mma_m16n8k8_dot_result_ids,
     cuda_mma_warp_tile_layout,
     cuda_mma_warp_tile_layouts,
     cuda_threads_per_block,
+    infer_cuda_matmul_schedule,
     is_cuda_mma_m16n8k8_dot,
 )
 from mytriton.cuda_codegen import (
@@ -25,7 +32,7 @@ from mytriton.cuda_dot_staging import (
     CudaSharedBuffer,
 )
 from mytriton.cuda_target import CudaTarget
-from mytriton.ssa import SSAForRange, SSAOp, SSAValue
+from mytriton.ssa import SSAForRange, SSAItem, SSAOp, SSAValue
 from mytriton.trace import (
     BF16,
     BOOL,
@@ -117,6 +124,298 @@ def test_composable_mma_warp_tile_layout() -> None:
         (1, 0, 1),
         (1, 1, 0),
         (1, 1, 1),
+    )
+
+
+def test_cuda_matmul_schedule_describes_cta_and_warp_tiles() -> None:
+    schedule = CudaMatmulSchedule(
+        block_m=128,
+        block_k=32,
+        block_n=128,
+        warp_m=64,
+        warp_n=64,
+        warps_m=2,
+        warps_n=2,
+    )
+
+    assert schedule.block_shape == (128, 32, 128)
+    assert schedule.warp_tile_shape == (64, 64)
+    assert schedule.warp_shape == (2, 2)
+    assert schedule.warp_count == 4
+    assert schedule.threads_per_block == 128
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "block_m",
+        "block_k",
+        "block_n",
+        "warp_m",
+        "warp_n",
+        "warps_m",
+        "warps_n",
+    ],
+)
+def test_cuda_matmul_schedule_rejects_non_positive_values(
+    field: str,
+) -> None:
+    schedule = CudaMatmulSchedule(
+        block_m=128,
+        block_k=32,
+        block_n=128,
+        warp_m=64,
+        warp_n=64,
+        warps_m=2,
+        warps_n=2,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=rf"{field} must be a positive integer",
+    ):
+        replace(schedule, **{field: 0})
+
+
+def test_cuda_matmul_schedule_rejects_inconsistent_decomposition() -> None:
+    schedule = CudaMatmulSchedule(
+        block_m=128,
+        block_k=32,
+        block_n=128,
+        warp_m=64,
+        warp_n=64,
+        warps_m=2,
+        warps_n=2,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"block_m must equal warp_m \* warps_m, got 64 != 128",
+    ):
+        replace(schedule, block_m=64)
+
+    with pytest.raises(
+        ValueError,
+        match=r"block_n must equal warp_n \* warps_n, got 64 != 128",
+    ):
+        replace(schedule, block_n=64)
+
+    with pytest.raises(
+        ValueError,
+        match="CUDA matmul schedule requires at most 1024 threads, got 2048",
+    ):
+        CudaMatmulSchedule(
+            block_m=2048,
+            block_k=32,
+            block_n=128,
+            warp_m=64,
+            warp_n=64,
+            warps_m=32,
+            warps_n=2,
+        )
+
+
+def test_cuda_matmul_schedule_rejects_boolean_values() -> None:
+    with pytest.raises(
+        ValueError,
+        match="block_m must be a positive integer",
+    ):
+        CudaMatmulSchedule(
+            block_m=True,
+            block_k=32,
+            block_n=128,
+            warp_m=64,
+            warp_n=64,
+            warps_m=2,
+            warps_n=2,
+        )
+
+
+def test_infers_balanced_cuda_matmul_schedule_from_num_warps() -> None:
+    dot = make_dot_op(
+        BlockType((32, 16), F16),
+        BlockType((16, 32), F16),
+        BlockType((32, 32), F32),
+    )
+
+    schedule = infer_cuda_matmul_schedule(
+        [dot],
+        num_warps=4,
+    )
+
+    assert schedule == CudaMatmulSchedule(
+        block_m=32,
+        block_k=16,
+        block_n=32,
+        warp_m=16,
+        warp_n=16,
+        warps_m=2,
+        warps_n=2,
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "lhs_shape",
+        "rhs_shape",
+        "expected_warp_shape",
+        "expected_warp_tile_shape",
+    ),
+    [
+        (
+            (128, 16),
+            (16, 32),
+            (4, 1),
+            (32, 32),
+        ),
+        (
+            (32, 16),
+            (16, 128),
+            (1, 4),
+            (32, 32),
+        ),
+    ],
+)
+def test_matmul_schedule_splits_the_long_output_dimension(
+    lhs_shape: tuple[int, int],
+    rhs_shape: tuple[int, int],
+    expected_warp_shape: tuple[int, int],
+    expected_warp_tile_shape: tuple[int, int],
+) -> None:
+    dot = make_dot_op(
+        BlockType(lhs_shape, F16),
+        BlockType(rhs_shape, F16),
+        BlockType(
+            (lhs_shape[0], rhs_shape[1]),
+            F32,
+        ),
+    )
+
+    schedule = infer_cuda_matmul_schedule(
+        [dot],
+        num_warps=4,
+    )
+
+    assert schedule is not None
+    assert schedule.warp_shape == expected_warp_shape
+    assert schedule.warp_tile_shape == expected_warp_tile_shape
+
+
+@pytest.mark.parametrize("num_warps", [0, 3, True])
+def test_matmul_schedule_rejects_invalid_num_warps(
+    num_warps: int,
+) -> None:
+    dot = make_dot_op(
+        BlockType((32, 16), F16),
+        BlockType((16, 32), F16),
+        BlockType((32, 32), F32),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="num_warps must be a positive power of two",
+    ):
+        infer_cuda_matmul_schedule(
+            [dot],
+            num_warps=num_warps,
+        )
+
+
+def test_matmul_schedule_rejects_more_than_32_warps() -> None:
+    dot = make_dot_op(
+        BlockType((128, 16), F16),
+        BlockType((16, 128), F16),
+        BlockType((128, 128), F32),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="CUDA kernels support at most 32 warps per block",
+    ):
+        infer_cuda_matmul_schedule(
+            [dot],
+            num_warps=64,
+        )
+
+
+def test_matmul_schedule_ignores_non_tensor_core_dot() -> None:
+    dot = make_dot_op(
+        BlockType((32, 16), F32),
+        BlockType((16, 32), F32),
+        BlockType((32, 32), F32),
+    )
+
+    assert (
+        infer_cuda_matmul_schedule(
+            [dot],
+            num_warps=4,
+        )
+        is None
+    )
+
+
+def test_cuda_mma_cta_tile_layout_uses_matmul_schedule() -> None:
+    schedule = CudaMatmulSchedule(
+        block_m=128,
+        block_k=32,
+        block_n=128,
+        warp_m=64,
+        warp_n=64,
+        warps_m=2,
+        warps_n=2,
+    )
+    layout = CudaMmaCtaTileLayout(schedule=schedule)
+
+    assert layout.schedule is schedule
+    assert layout.warp_tile == CudaMmaWarpTileLayout(
+        m=64,
+        n=64,
+        k=32,
+    )
+
+    assert layout.lhs_shape == (128, 32)
+    assert layout.rhs_shape == (32, 128)
+    assert layout.result_shape == (128, 128)
+
+    assert layout.warp_shape == (2, 2)
+    assert layout.warp_count == 4
+    assert layout.threads_per_block == 128
+    assert layout.thread_shape == (8, 16)
+
+    assert tuple(
+        layout.warp_coordinates(warp_id) for warp_id in range(layout.warp_count)
+    ) == (
+        (0, 0),
+        (0, 1),
+        (1, 0),
+        (1, 1),
+    )
+
+    assert tuple(
+        layout.warp_result_offset(warp_id) for warp_id in range(layout.warp_count)
+    ) == (
+        (0, 0),
+        (0, 64),
+        (64, 0),
+        (64, 64),
+    )
+
+    assert tuple(
+        layout.warp_lhs_offset(warp_id) for warp_id in range(layout.warp_count)
+    ) == (
+        (0, 0),
+        (0, 0),
+        (64, 0),
+        (64, 0),
+    )
+
+    assert tuple(
+        layout.warp_rhs_offset(warp_id) for warp_id in range(layout.warp_count)
+    ) == (
+        (0, 0),
+        (0, 64),
+        (0, 0),
+        (0, 64),
     )
 
 
@@ -315,6 +614,146 @@ def make_dot_op(
     )
 
 
+def test_recognizes_mma_cta_tile_for_matching_schedule() -> None:
+    schedule = CudaMatmulSchedule(
+        block_m=128,
+        block_k=32,
+        block_n=128,
+        warp_m=64,
+        warp_n=64,
+        warps_m=2,
+        warps_n=2,
+    )
+    op = make_dot_op(
+        BlockType((128, 32), F16),
+        BlockType((32, 128), F16),
+        BlockType((128, 128), F32),
+    )
+
+    assert cuda_mma_cta_tile_layout(
+        op,
+        schedule=schedule,
+    ) == CudaMmaCtaTileLayout(schedule=schedule)
+
+
+@pytest.mark.parametrize(
+    ("lhs_shape", "rhs_shape", "result_shape"),
+    [
+        ((64, 32), (32, 128), (64, 128)),
+        ((128, 16), (16, 128), (128, 128)),
+        ((128, 32), (32, 64), (128, 64)),
+    ],
+)
+def test_mma_cta_tile_rejects_dot_that_does_not_match_schedule(
+    lhs_shape: tuple[int, int],
+    rhs_shape: tuple[int, int],
+    result_shape: tuple[int, int],
+) -> None:
+    schedule = CudaMatmulSchedule(
+        block_m=128,
+        block_k=32,
+        block_n=128,
+        warp_m=64,
+        warp_n=64,
+        warps_m=2,
+        warps_n=2,
+    )
+    op = make_dot_op(
+        BlockType(lhs_shape, F16),
+        BlockType(rhs_shape, F16),
+        BlockType(result_shape, F32),
+    )
+
+    assert (
+        cuda_mma_cta_tile_layout(
+            op,
+            schedule=schedule,
+        )
+        is None
+    )
+
+
+def test_mma_cta_tile_rejects_single_warp_schedule() -> None:
+    schedule = CudaMatmulSchedule(
+        block_m=64,
+        block_k=32,
+        block_n=64,
+        warp_m=64,
+        warp_n=64,
+        warps_m=1,
+        warps_n=1,
+    )
+    op = make_dot_op(
+        BlockType((64, 32), F16),
+        BlockType((32, 64), F16),
+        BlockType((64, 64), F32),
+    )
+
+    assert (
+        cuda_mma_cta_tile_layout(
+            op,
+            schedule=schedule,
+        )
+        is None
+    )
+
+
+def test_mma_cta_tile_rejects_incompatible_physical_warp_tile() -> None:
+    schedule = CudaMatmulSchedule(
+        block_m=80,
+        block_k=32,
+        block_n=128,
+        warp_m=40,
+        warp_n=64,
+        warps_m=2,
+        warps_n=2,
+    )
+    op = make_dot_op(
+        BlockType((80, 32), F16),
+        BlockType((32, 128), F16),
+        BlockType((80, 128), F32),
+    )
+
+    assert (
+        cuda_mma_cta_tile_layout(
+            op,
+            schedule=schedule,
+        )
+        is None
+    )
+
+
+def test_mma_cta_tile_uses_target_operand_type_policy() -> None:
+    schedule = CudaMatmulSchedule(
+        block_m=128,
+        block_k=32,
+        block_n=128,
+        warp_m=64,
+        warp_n=64,
+        warps_m=2,
+        warps_n=2,
+    )
+    op = make_dot_op(
+        BlockType((128, 32), BF16),
+        BlockType((32, 128), BF16),
+        BlockType((128, 128), F32),
+    )
+
+    assert (
+        cuda_mma_cta_tile_layout(
+            op,
+            schedule=schedule,
+        )
+        is None
+    )
+
+    assert cuda_mma_cta_tile_layout(
+        op,
+        schedule=schedule,
+        operand_types=frozenset((F16, BF16)),
+    ) == CudaMmaCtaTileLayout(schedule=schedule)
+
+
 def test_recognizes_f16_m16n8k8_dot() -> None:
     op = make_dot_op(
         BlockType((16, 8), F16),
@@ -474,6 +913,115 @@ def test_collects_composable_mma_warp_tile_layouts_recursively() -> None:
     }
 
 
+def test_collects_matching_mma_cta_tile_layouts_recursively() -> None:
+    schedule = CudaMatmulSchedule(
+        block_m=128,
+        block_k=32,
+        block_n=128,
+        warp_m=64,
+        warp_n=64,
+        warps_m=2,
+        warps_n=2,
+    )
+    top_level_dot = make_dot_op(
+        BlockType((128, 32), F16),
+        BlockType((32, 128), F16),
+        BlockType((128, 128), F32),
+        result_id=2,
+    )
+    unmatched_dot = make_dot_op(
+        BlockType((64, 32), F16),
+        BlockType((32, 128), F16),
+        BlockType((64, 128), F32),
+        result_id=5,
+    )
+    nested_dot = make_dot_op(
+        BlockType((128, 32), F16),
+        BlockType((32, 128), F16),
+        BlockType((128, 128), F32),
+        result_id=9,
+    )
+
+    loop = SSAForRange(
+        index=SSAValue(id=6, ty=I32),
+        start=Const(0),
+        stop=Const(32),
+        step=Const(32),
+        carried_inputs=(),
+        carried_args=(),
+        body=[nested_dot],
+        yields=(),
+        results=(),
+    )
+
+    layouts = cuda_mma_cta_tile_layouts(
+        [
+            top_level_dot,
+            unmatched_dot,
+            loop,
+        ],
+        schedule=schedule,
+    )
+
+    assert layouts == {
+        2: CudaMmaCtaTileLayout(schedule=schedule),
+        9: CudaMmaCtaTileLayout(schedule=schedule),
+    }
+
+
+def test_mma_cta_schedule_determines_cuda_kernel_layout() -> None:
+    schedule = CudaMatmulSchedule(
+        block_m=128,
+        block_k=32,
+        block_n=128,
+        warp_m=64,
+        warp_n=64,
+        warps_m=2,
+        warps_n=2,
+    )
+    dot = make_dot_op(
+        BlockType((128, 32), F16),
+        BlockType((32, 128), F16),
+        BlockType((128, 128), F32),
+    )
+    output_pointer = SSAValue(
+        id=3,
+        ty=BlockType((128, 128), PTR_F32),
+    )
+    output_mask = SSAValue(
+        id=4,
+        ty=BlockType((128, 128), BOOL),
+    )
+    store = SSAOp(
+        opcode="store",
+        operands=(output_pointer, dot.result, output_mask),
+    )
+    ssa_ops: list[SSAItem] = [dot, store]
+
+    one_warp_layout = cuda_kernel_layout(ssa_ops)
+
+    assert one_warp_layout.output_tile_shape == (128, 128)
+    assert one_warp_layout.thread_shape == (4, 8)
+    assert one_warp_layout.threads_per_block == 32
+
+    scheduled_layout = cuda_kernel_layout(
+        ssa_ops,
+        matmul_schedule=schedule,
+    )
+
+    assert scheduled_layout.output_tile_shape == (128, 128)
+    assert scheduled_layout.thread_shape == (8, 16)
+    assert scheduled_layout.threads_per_block == 128
+
+    assert (
+        cuda_threads_per_block(
+            ssa_ops,
+            matmul_schedule=schedule,
+        )
+        == 128
+    )
+
+
 def test_collects_no_results_without_compatible_dot() -> None:
     cuda_core_dot = make_dot_op(
         BlockType((16, 8), F32),
@@ -566,6 +1114,94 @@ def test_mma_accumulator_ref_names_composable_lane_registers() -> None:
     )
 
     assert ref.elements() == tuple(f"v7_{index}" for index in range(16))
+
+
+def test_mma_accumulator_ref_tracks_cta_layout() -> None:
+    schedule = CudaMatmulSchedule(
+        block_m=128,
+        block_k=32,
+        block_n=128,
+        warp_m=64,
+        warp_n=64,
+        warps_m=2,
+        warps_n=2,
+    )
+    cta_layout = CudaMmaCtaTileLayout(schedule=schedule)
+    accumulator = CudaMmaAccumulatorRef(
+        base="v7",
+        layout=cta_layout.warp_tile,
+        cta_layout=cta_layout,
+    )
+
+    assert accumulator.layout == CudaMmaWarpTileLayout(
+        m=64,
+        n=64,
+        k=32,
+    )
+    assert accumulator.warp_tile_layout == cta_layout.warp_tile
+    assert accumulator.cta_layout == cta_layout
+    assert accumulator.logical_shape == (128, 128)
+    assert accumulator.elements_per_lane == 128
+
+
+def test_mma_accumulator_ref_rejects_mismatched_cta_warp_tile() -> None:
+    schedule = CudaMatmulSchedule(
+        block_m=128,
+        block_k=32,
+        block_n=128,
+        warp_m=64,
+        warp_n=64,
+        warps_m=2,
+        warps_n=2,
+    )
+    cta_layout = CudaMmaCtaTileLayout(schedule=schedule)
+
+    with pytest.raises(
+        ValueError,
+        match="CTA accumulator warp tile does not match its register layout",
+    ):
+        CudaMmaAccumulatorRef(
+            base="v7",
+            layout=CudaMmaWarpTileLayout(
+                m=32,
+                n=64,
+                k=32,
+            ),
+            cta_layout=cta_layout,
+        )
+
+
+def test_cuda_codegen_emits_multi_warp_cta_prologue() -> None:
+    schedule = CudaMatmulSchedule(
+        block_m=128,
+        block_k=32,
+        block_n=128,
+        warp_m=64,
+        warp_n=64,
+        warps_m=2,
+        warps_n=2,
+    )
+    cta_layout = CudaMmaCtaTileLayout(schedule=schedule)
+
+    codegen = SSACUDACodegen()
+    codegen.layout = CudaKernelLayout(
+        output_tile_shape=cta_layout.result_shape,
+        thread_shape=cta_layout.thread_shape,
+    )
+    codegen.mma_cta_dot_layouts = {
+        7: cta_layout,
+    }
+
+    codegen.emit_rank2_prologue()
+
+    assert codegen.lines == [
+        "    int mma_warp_id = threadIdx.x >> 5;",
+        "    int mma_lane_id = threadIdx.x & 31;",
+        "    int mma_warp_m = mma_warp_id / 2;",
+        "    int mma_warp_n = mma_warp_id % 2;",
+        "    int tile_i = mma_warp_m * 4 + mma_lane_id / 8;",
+        "    int tile_j = mma_warp_n * 8 + mma_lane_id % 8;",
+    ]
 
 
 @pytest.mark.parametrize("index", [-1, 4])
@@ -729,6 +1365,72 @@ def test_cuda_codegen_loads_composable_mma_operands_from_shared_memory() -> None
     assert ("dot_rhs_7[(mma_thread_7 * 2 + 9) * 16 + (mma_group_7 + 8)]") in cuda
 
     assert cuda.count("__half_as_ushort") == 48
+
+
+def test_cuda_codegen_loads_multi_warp_cta_operands() -> None:
+    schedule = CudaMatmulSchedule(
+        block_m=128,
+        block_k=32,
+        block_n=128,
+        warp_m=64,
+        warp_n=64,
+        warps_m=2,
+        warps_n=2,
+    )
+    cta_layout = CudaMmaCtaTileLayout(schedule=schedule)
+
+    codegen = SSACUDACodegen()
+    codegen.layout = CudaKernelLayout(
+        output_tile_shape=cta_layout.result_shape,
+        thread_shape=cta_layout.thread_shape,
+    )
+
+    buffers = CudaDotSharedBuffers(
+        lhs=CudaSharedBuffer(
+            name="dot_lhs_7",
+            logical_shape=cta_layout.lhs_shape,
+            element_ty=F16,
+        ),
+        rhs=CudaSharedBuffer(
+            name="dot_rhs_7",
+            logical_shape=cta_layout.rhs_shape,
+            element_ty=F16,
+        ),
+    )
+
+    instruction_operands = codegen.emit_mma_warp_tile_operand_registers(
+        result_id=7,
+        buffers=buffers,
+        layout=cta_layout.warp_tile,
+        cta_layout=cta_layout,
+    )
+
+    assert len(instruction_operands) == cta_layout.warp_tile.instruction_count == 128
+
+    assert codegen.lines[:2] == [
+        "    int mma_group_7 = mma_lane_id >> 2;",
+        "    int mma_thread_7 = mma_lane_id & 3;",
+    ]
+
+    cuda = "\n".join(codegen.lines)
+
+    assert (
+        "dot_lhs_7[(mma_warp_m * 64 + mma_group_7) * 32 + (mma_thread_7 * 2)]"
+    ) in cuda
+    assert (
+        "dot_lhs_7[(mma_warp_m * 64 + mma_group_7 + 56) * 32 + (mma_thread_7 * 2 + 25)]"
+    ) in cuda
+
+    assert (
+        "dot_rhs_7[(mma_thread_7 * 2) * 128 + (mma_warp_n * 64 + mma_group_7)]"
+    ) in cuda
+    assert (
+        "dot_rhs_7["
+        "(mma_thread_7 * 2 + 25) * 128 "
+        "+ (mma_warp_n * 64 + mma_group_7 + 56)]"
+    ) in cuda
+
+    assert cuda.count("__half_as_ushort") == 768
 
 
 def test_cuda_codegen_loads_bf16_mma_operand_registers() -> None:
@@ -1045,6 +1747,75 @@ def test_cuda_codegen_computes_composable_mma_warp_tile_from_shared_memory() -> 
     assert codegen.lines[-1] == "    __syncthreads();"
 
 
+def test_cuda_codegen_computes_multi_warp_cta_from_shared_memory() -> None:
+    schedule = CudaMatmulSchedule(
+        block_m=128,
+        block_k=32,
+        block_n=128,
+        warp_m=64,
+        warp_n=64,
+        warps_m=2,
+        warps_n=2,
+    )
+    cta_layout = CudaMmaCtaTileLayout(schedule=schedule)
+
+    codegen = SSACUDACodegen()
+    codegen.layout = CudaKernelLayout(
+        output_tile_shape=cta_layout.result_shape,
+        thread_shape=cta_layout.thread_shape,
+    )
+
+    buffers = CudaDotSharedBuffers(
+        lhs=CudaSharedBuffer(
+            name="dot_lhs_7",
+            logical_shape=cta_layout.lhs_shape,
+            element_ty=F16,
+        ),
+        rhs=CudaSharedBuffer(
+            name="dot_rhs_7",
+            logical_shape=cta_layout.rhs_shape,
+            element_ty=F16,
+        ),
+    )
+    result = SSAValue(
+        id=7,
+        ty=BlockType(cta_layout.result_shape, F32),
+    )
+    accumulator = CudaMmaAccumulatorRef(
+        base="v3",
+        layout=cta_layout.warp_tile,
+        cta_layout=cta_layout,
+    )
+
+    result_ref = codegen.emit_mma_warp_tile_from_shared_memory(
+        result=result,
+        buffers=buffers,
+        layout=cta_layout.warp_tile,
+        cta_layout=cta_layout,
+        accumulator=accumulator,
+    )
+
+    assert result_ref == CudaMmaAccumulatorRef(
+        base="v7",
+        layout=cta_layout.warp_tile,
+        cta_layout=cta_layout,
+    )
+    assert codegen.values[result.id] == result_ref
+
+    assert "    float v7_0 = v3_0;" in codegen.lines
+    assert "    float v7_127 = v3_127;" in codegen.lines
+
+    cuda = "\n".join(codegen.lines)
+
+    operand_position = cuda.index("unsigned mma_a_7_0_0_0_0")
+    instruction_position = cuda.index("mma.sync.aligned.m16n8k8")
+    barrier_position = cuda.rindex("__syncthreads();")
+
+    assert operand_position < instruction_position < barrier_position
+    assert cuda.count("mma.sync.aligned.m16n8k8") == 128
+    assert codegen.lines[-1] == "    __syncthreads();"
+
+
 def test_cuda_codegen_spills_mma_accumulator_to_shared_memory() -> None:
     codegen = SSACUDACodegen()
     value = CudaMmaAccumulatorRef(
@@ -1138,6 +1909,133 @@ def test_cuda_codegen_spills_composable_mma_accumulator_to_shared_memory() -> No
 
     assert len(codegen.lines) == 19
     assert codegen.lines[-1] == "    __syncthreads();"
+
+
+def test_cuda_codegen_spills_multi_warp_cta_accumulator() -> None:
+    schedule = CudaMatmulSchedule(
+        block_m=64,
+        block_k=16,
+        block_n=64,
+        warp_m=32,
+        warp_n=32,
+        warps_m=2,
+        warps_n=2,
+    )
+    cta_layout = CudaMmaCtaTileLayout(schedule=schedule)
+    value = CudaMmaAccumulatorRef(
+        base="v7",
+        layout=cta_layout.warp_tile,
+        cta_layout=cta_layout,
+    )
+    codegen = SSACUDACodegen()
+
+    buffer = codegen.emit_mma_accumulator_spill(
+        value_id=7,
+        value=value,
+    )
+
+    assert buffer == CudaSharedBuffer(
+        name="mma_result_7",
+        logical_shape=(64, 64),
+        element_ty=F32,
+    )
+    assert buffer.nbytes == 64 * 64 * 4
+    assert codegen.shared_memory_bytes == 64 * 64 * 4
+    assert codegen.shared_lines == ["    __shared__ float mma_result_7[4096];"]
+
+    assert codegen.lines[:2] == [
+        "    int mma_store_group_7 = mma_lane_id >> 2;",
+        "    int mma_store_thread_7 = mma_lane_id & 3;",
+    ]
+
+    assert (
+        "    mma_result_7["
+        "(mma_warp_m * 32 + mma_store_group_7) * 64 "
+        "+ (mma_warp_n * 32 + mma_store_thread_7 * 2)"
+        "] = v7_0;"
+    ) in codegen.lines
+    assert (
+        "    mma_result_7["
+        "(mma_warp_m * 32 + mma_store_group_7 + 24) * 64 "
+        "+ (mma_warp_n * 32 + mma_store_thread_7 * 2 + 25)"
+        "] = v7_31;"
+    ) in codegen.lines
+
+    assert len(codegen.lines) == 35
+    assert codegen.lines[-1] == "    __syncthreads();"
+
+
+def test_cuda_store_redistributes_multi_warp_cta_accumulator() -> None:
+    schedule = CudaMatmulSchedule(
+        block_m=64,
+        block_k=16,
+        block_n=64,
+        warp_m=32,
+        warp_n=32,
+        warps_m=2,
+        warps_n=2,
+    )
+    cta_layout = CudaMmaCtaTileLayout(schedule=schedule)
+
+    codegen = SSACUDACodegen()
+    codegen.layout = CudaKernelLayout(
+        output_tile_shape=cta_layout.result_shape,
+        thread_shape=cta_layout.thread_shape,
+    )
+    register_layout = codegen.layout.register_tile_layout()
+
+    pointers = SSAValue(
+        id=0,
+        ty=BlockType(cta_layout.result_shape, PTR_F32),
+    )
+    value = SSAValue(
+        id=1,
+        ty=BlockType(cta_layout.result_shape, F32),
+    )
+    mask = SSAValue(
+        id=2,
+        ty=BlockType(cta_layout.result_shape, BOOL),
+    )
+
+    codegen.values[pointers.id] = CudaRegisterTileRef(
+        base="ptr",
+        layout=register_layout,
+    )
+    codegen.values[value.id] = CudaMmaAccumulatorRef(
+        base="v1",
+        layout=cta_layout.warp_tile,
+        cta_layout=cta_layout,
+    )
+    codegen.values[mask.id] = CudaRegisterTileRef(
+        base="mask",
+        layout=register_layout,
+    )
+
+    codegen.emit_store(
+        SSAOp(
+            opcode="store",
+            operands=(pointers, value, mask),
+        )
+    )
+
+    assert codegen.shared_lines == ["    __shared__ float mma_result_1[4096];"]
+
+    cuda = "\n".join(codegen.lines)
+
+    assert (
+        "    if (mask_0_0) {\n"
+        "        ptr_0_0[0] = "
+        "mma_result_1[(tile_i) * 64 + (tile_j)];\n"
+        "    }"
+    ) in cuda
+    assert (
+        "    if (mask_7_3) {\n"
+        "        ptr_7_3[0] = "
+        "mma_result_1[(tile_i + 56) * 64 + (tile_j + 48)];\n"
+        "    }"
+    ) in cuda
+
+    assert cuda.count("if (mask_") == 32
 
 
 def test_cuda_store_redistributes_mma_fragment_through_shared_memory() -> None:
@@ -1745,6 +2643,325 @@ def test_f16_composable_mma_lowers_k_loop_to_tensor_core(
     assert f"v{accumulation.result.id}_" not in cuda_src
 
 
+@pytest.mark.codegen
+def test_f16_multi_warp_cta_schedule_lowers_matmul_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MYTRITON_BACKEND", "cuda")
+
+    M, N, K = 32, 32, 32
+    BM, BK, BN = 32, 16, 32
+
+    a = np.zeros((M, K), dtype=np.float16)
+    b = np.zeros((K, N), dtype=np.float16)
+    out = np.zeros((M, N), dtype=np.float32)
+
+    tensor_core_matmul_kernel.clear_cache()
+    _, ssa_ops, _ = tensor_core_matmul_kernel[(1, 1)](
+        a,
+        b,
+        out,
+        M,
+        N,
+        K,
+        BM=BM,
+        BK=BK,
+        BN=BN,
+    )
+
+    schedule = CudaMatmulSchedule(
+        block_m=BM,
+        block_k=BK,
+        block_n=BN,
+        warp_m=16,
+        warp_n=16,
+        warps_m=2,
+        warps_n=2,
+    )
+    codegen = SSACUDACodegen()
+
+    cuda_src = codegen.generate(
+        "scheduled_multi_warp_matmul",
+        ssa_ops,
+        [],
+        matmul_schedule=schedule,
+    )
+
+    loop = next(item for item in ssa_ops if isinstance(item, SSAForRange))
+    dot = next(
+        item for item in loop.body if isinstance(item, SSAOp) and item.opcode == "dot"
+    )
+    assert dot.result is not None
+
+    assert codegen.layout.output_tile_shape == (32, 32)
+    assert codegen.layout.thread_shape == (8, 16)
+    assert codegen.layout.threads_per_block == 128
+
+    assert codegen.mma_cta_dot_layouts == {
+        dot.result.id: CudaMmaCtaTileLayout(
+            schedule=schedule,
+        )
+    }
+
+    assert "int mma_warp_id = threadIdx.x >> 5;" in cuda_src
+    assert "int mma_lane_id = threadIdx.x & 31;" in cuda_src
+    assert "int mma_warp_m = mma_warp_id / 2;" in cuda_src
+    assert "int mma_warp_n = mma_warp_id % 2;" in cuda_src
+
+    assert "mma_warp_m * 16" in cuda_src
+    assert "mma_warp_n * 16" in cuda_src
+    assert "index += 128" in cuda_src
+
+    assert cuda_src.count("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32") == 4
+    assert "for (int dot_k_" not in cuda_src
+
+
+@pytest.mark.codegen
+def test_compiler_accepts_triton_style_num_warps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MYTRITON_BACKEND", "cuda")
+
+    M, N, K = 32, 32, 32
+    BM, BK, BN = 32, 16, 32
+
+    a = np.zeros((M, K), dtype=np.float16)
+    b = np.zeros((K, N), dtype=np.float16)
+    out = np.zeros((M, N), dtype=np.float32)
+
+    tensor_core_matmul_kernel.clear_cache()
+    _, ssa_ops, cuda_src = tensor_core_matmul_kernel[(1, 1)](
+        a,
+        b,
+        out,
+        M,
+        N,
+        K,
+        BM=BM,
+        BK=BK,
+        BN=BN,
+        num_warps=4,
+    )
+
+    schedule = infer_cuda_matmul_schedule(
+        ssa_ops,
+        num_warps=4,
+    )
+    assert schedule == CudaMatmulSchedule(
+        block_m=BM,
+        block_k=BK,
+        block_n=BN,
+        warp_m=16,
+        warp_n=16,
+        warps_m=2,
+        warps_n=2,
+    )
+
+    assert (
+        cuda_threads_per_block(
+            ssa_ops,
+            matmul_schedule=schedule,
+        )
+        == 128
+    )
+
+    assert len(tensor_core_matmul_kernel.compilation_cache) == 1
+    artifact = next(iter(tensor_core_matmul_kernel.compilation_cache.values()))
+    assert artifact.threads_per_block == 128
+
+    assert "int mma_warp_id = threadIdx.x >> 5;" in cuda_src
+    assert "int mma_lane_id = threadIdx.x & 31;" in cuda_src
+    assert "index += 128" in cuda_src
+    assert cuda_src.count("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32") == 4
+
+
+@pytest.mark.codegen
+def test_compiler_cache_separates_num_warps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MYTRITON_BACKEND", "cuda")
+
+    M, N, K = 32, 32, 32
+    BM, BK, BN = 32, 16, 32
+
+    a = np.zeros((M, K), dtype=np.float16)
+    b = np.zeros((K, N), dtype=np.float16)
+    out = np.zeros((M, N), dtype=np.float32)
+
+    tensor_core_matmul_kernel.clear_cache()
+
+    _, _, one_warp_src = tensor_core_matmul_kernel[(1, 1)](
+        a,
+        b,
+        out,
+        M,
+        N,
+        K,
+        BM=BM,
+        BK=BK,
+        BN=BN,
+        num_warps=1,
+    )
+
+    _, _, four_warp_src = tensor_core_matmul_kernel[(1, 1)](
+        a,
+        b,
+        out,
+        M,
+        N,
+        K,
+        BM=BM,
+        BK=BK,
+        BN=BN,
+        num_warps=4,
+    )
+
+    _, _, cached_four_warp_src = tensor_core_matmul_kernel[(1, 1)](
+        a,
+        b,
+        out,
+        M,
+        N,
+        K,
+        BM=BM,
+        BK=BK,
+        BN=BN,
+        num_warps=4,
+    )
+
+    assert len(tensor_core_matmul_kernel.compilation_cache) == 2
+    assert {
+        artifact.threads_per_block
+        for artifact in tensor_core_matmul_kernel.compilation_cache.values()
+    } == {32, 128}
+
+    assert one_warp_src != four_warp_src
+    assert "int mma_warp_id = threadIdx.x >> 5;" not in one_warp_src
+    assert "int mma_warp_id = threadIdx.x >> 5;" in four_warp_src
+    assert cached_four_warp_src == four_warp_src
+    assert len(tensor_core_matmul_kernel.compilation_cache) == 2
+
+
+@pytest.mark.codegen
+@pytest.mark.parametrize(
+    ("num_warps", "expected_error"),
+    [
+        (0, "num_warps must be a positive power of two"),
+        (3, "num_warps must be a positive power of two"),
+        (True, "num_warps must be a positive power of two"),
+        (64, "CUDA kernels support at most 32 warps per block"),
+    ],
+)
+def test_compiler_rejects_invalid_num_warps(
+    monkeypatch: pytest.MonkeyPatch,
+    num_warps: int,
+    expected_error: str,
+) -> None:
+    monkeypatch.setenv("MYTRITON_BACKEND", "cuda")
+
+    M, N, K = 32, 32, 32
+    BM, BK, BN = 32, 16, 32
+
+    a = np.zeros((M, K), dtype=np.float16)
+    b = np.zeros((K, N), dtype=np.float16)
+    out = np.zeros((M, N), dtype=np.float32)
+
+    tensor_core_matmul_kernel.clear_cache()
+
+    with pytest.raises(ValueError, match=expected_error):
+        tensor_core_matmul_kernel[(1, 1)](
+            a,
+            b,
+            out,
+            M,
+            N,
+            K,
+            BM=BM,
+            BK=BK,
+            BN=BN,
+            num_warps=num_warps,
+        )
+
+    assert not tensor_core_matmul_kernel.compilation_cache
+
+
+@pytest.mark.codegen
+def test_compiler_rejects_num_warps_for_non_mma_dot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MYTRITON_BACKEND", "cuda")
+
+    M, N, K = 32, 32, 32
+    BM, BK, BN = 32, 16, 32
+
+    # An f32 dot runs on CUDA cores, while the current multi-warp schedule
+    # supports only tensor-core f16/bf16 dots.
+    a = np.zeros((M, K), dtype=np.float32)
+    b = np.zeros((K, N), dtype=np.float32)
+    out = np.zeros((M, N), dtype=np.float32)
+
+    tensor_core_matmul_kernel.clear_cache()
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"num_warps currently requires a "
+            r"tensor-core-compatible tl\.dot"
+        ),
+    ):
+        tensor_core_matmul_kernel[(1, 1)](
+            a,
+            b,
+            out,
+            M,
+            N,
+            K,
+            BM=BM,
+            BK=BK,
+            BN=BN,
+            num_warps=4,
+        )
+
+    assert not tensor_core_matmul_kernel.compilation_cache
+
+
+@pytest.mark.codegen
+def test_compiler_rejects_num_warps_for_mlir_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MYTRITON_BACKEND", "mlir")
+
+    M, N, K = 32, 32, 32
+    BM, BK, BN = 32, 16, 32
+
+    a = np.zeros((M, K), dtype=np.float16)
+    b = np.zeros((K, N), dtype=np.float16)
+    out = np.zeros((M, N), dtype=np.float32)
+
+    tensor_core_matmul_kernel.clear_cache()
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "num_warps launch option is currently supported only by the CUDA backend"
+        ),
+    ):
+        tensor_core_matmul_kernel[(1, 1)](
+            a,
+            b,
+            out,
+            M,
+            N,
+            K,
+            BM=BM,
+            BK=BK,
+            BN=BN,
+            num_warps=4,
+        )
+
+    assert not tensor_core_matmul_kernel.compilation_cache
+
+
 def test_cuda_codegen_emits_mma_with_existing_accumulator() -> None:
     codegen = SSACUDACodegen()
     result = SSAValue(
@@ -1908,6 +3125,90 @@ def test_f16_composable_tensor_core_matmul_executes_on_cuda(
 
 
 @pytest.mark.execution
+def test_f16_multi_warp_tensor_core_matmul_executes_on_cuda(
+    cp,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capability = int(cp.cuda.Device().compute_capability)
+    if capability < 75:
+        pytest.skip("m16n8k8 f16 MMA requires compute capability 7.5+")
+
+    monkeypatch.setenv("MYTRITON_BACKEND", "cuda")
+
+    # The dimensions intentionally are not multiples of the block tile,
+    # so the final CTA must handle masked edges correctly.
+    M, N, K = 45, 53, 37
+    BM, BK, BN = 32, 16, 32
+
+    rng = np.random.default_rng(22)
+    a_host = rng.normal(
+        0.0,
+        0.25,
+        size=(M, K),
+    ).astype(np.float16)
+    b_host = rng.normal(
+        0.0,
+        0.25,
+        size=(K, N),
+    ).astype(np.float16)
+
+    a = cp.asarray(a_host)
+    b = cp.asarray(b_host)
+    out = cp.full(
+        (M, N),
+        cp.nan,
+        dtype=cp.float32,
+    )
+
+    grid = (
+        (M + BM - 1) // BM,
+        (N + BN - 1) // BN,
+    )
+
+    tensor_core_matmul_kernel.clear_cache()
+    _, _, cuda_src = tensor_core_matmul_kernel[grid](
+        a,
+        b,
+        out,
+        M,
+        N,
+        K,
+        BM=BM,
+        BK=BK,
+        BN=BN,
+        num_warps=4,
+    )
+    cp.cuda.Stream.null.synchronize()
+
+    expected = a_host.astype(np.float32) @ b_host.astype(np.float32)
+
+    artifact = next(iter(tensor_core_matmul_kernel.compilation_cache.values()))
+    assert artifact.threads_per_block == 128
+
+    assert "int mma_warp_id = threadIdx.x >> 5;" in cuda_src
+    assert "int mma_warp_m = mma_warp_id / 2;" in cuda_src
+    assert "int mma_warp_n = mma_warp_id % 2;" in cuda_src
+    assert "index += 128" in cuda_src
+
+    # One warp owns a 16x16 output tile:
+    #
+    #   M: 16 / 16 = 1 MMA tile
+    #   N: 16 / 8  = 2 MMA tiles
+    #   K: 16 / 8  = 2 MMA steps
+    #
+    # Therefore, the static CUDA source contains four mma.sync instructions.
+    # Each of the four warps executes them for its part of the 32x32 CTA tile.
+    assert cuda_src.count("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32") == 4
+
+    cp.testing.assert_allclose(
+        out,
+        cp.asarray(expected),
+        rtol=3e-3,
+        atol=3e-3,
+    )
+
+
+@pytest.mark.execution
 def test_bf16_tiled_tensor_core_matmul_executes_on_sm80(
     cp,
     monkeypatch: pytest.MonkeyPatch,
@@ -2036,6 +3337,85 @@ def test_bf16_composable_tensor_core_matmul_executes_on_sm80(
     expected = a.float() @ b.float()
 
     assert cuda_src.count("mma.sync.aligned.m16n8k8.row.col.f32.bf16.bf16.f32") == 8
+    torch.testing.assert_close(
+        out,
+        expected,
+        rtol=3e-3,
+        atol=3e-3,
+    )
+
+
+@pytest.mark.execution
+def test_bf16_multi_warp_tensor_core_matmul_executes_on_sm80(
+    cp,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del cp
+
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("PyTorch CUDA is not available")
+    if torch.cuda.get_device_capability() < (8, 0):
+        pytest.skip("m16n8k8 bf16 MMA requires compute capability 8.0+")
+
+    monkeypatch.setenv("MYTRITON_BACKEND", "cuda")
+
+    M, N, K = 45, 53, 37
+    BM, BK, BN = 32, 16, 32
+
+    generator = torch.Generator().manual_seed(22)
+    a = (
+        torch.randn(
+            (M, K),
+            generator=generator,
+            dtype=torch.float32,
+        )
+        .mul_(0.25)
+        .to(device="cuda", dtype=torch.bfloat16)
+    )
+    b = (
+        torch.randn(
+            (K, N),
+            generator=generator,
+            dtype=torch.float32,
+        )
+        .mul_(0.25)
+        .to(device="cuda", dtype=torch.bfloat16)
+    )
+    out = torch.full(
+        (M, N),
+        torch.nan,
+        device="cuda",
+        dtype=torch.float32,
+    )
+
+    grid = (
+        (M + BM - 1) // BM,
+        (N + BN - 1) // BN,
+    )
+
+    tensor_core_matmul_kernel.clear_cache()
+    _, _, cuda_src = tensor_core_matmul_kernel[grid](
+        a,
+        b,
+        out,
+        M,
+        N,
+        K,
+        BM=BM,
+        BK=BK,
+        BN=BN,
+        num_warps=4,
+    )
+    torch.cuda.synchronize()
+
+    expected = a.float() @ b.float()
+
+    artifact = next(iter(tensor_core_matmul_kernel.compilation_cache.values()))
+    assert artifact.threads_per_block == 128
+    assert "int mma_warp_id = threadIdx.x >> 5;" in cuda_src
+    assert cuda_src.count("mma.sync.aligned.m16n8k8.row.col.f32.bf16.bf16.f32") == 4
+
     torch.testing.assert_close(
         out,
         expected,
