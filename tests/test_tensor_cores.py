@@ -2152,8 +2152,9 @@ def test_f16_m16n8k8_dot_lowers_to_tensor_core(
         "int M, int N, int K, int k_base)"
     ) in cuda_src
 
-    assert "__shared__ __half dot_lhs_" in cuda_src
-    assert "__shared__ __half dot_rhs_" in cuda_src
+    assert "__shared__ __align__(16) __half dot_lhs_" in cuda_src
+    assert "__shared__ __align__(16) __half dot_rhs_" in cuda_src
+    assert cuda_src.count("*reinterpret_cast<uint4 *>") == 2
     assert "__shared__ float mma_result_" in cuda_src
 
     assert cuda_src.count("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32") == 1
@@ -2257,8 +2258,9 @@ def test_bf16_m16n8k8_dot_lowers_to_tensor_core_for_sm80(
     assert cuda_threads_per_block(ssa_ops) == 32
     assert cuda_src.startswith("#include <cuda_bf16.h>\n\n")
     assert "#include <cuda_fp16.h>" not in cuda_src
-    assert "__shared__ __nv_bfloat16 dot_lhs_" in cuda_src
-    assert "__shared__ __nv_bfloat16 dot_rhs_" in cuda_src
+    assert "__shared__ __align__(16) __nv_bfloat16 dot_lhs_" in cuda_src
+    assert "__shared__ __align__(16) __nv_bfloat16 dot_rhs_" in cuda_src
+    assert cuda_src.count("*reinterpret_cast<uint4 *>") == 2
     assert cuda_src.count("mma.sync.aligned.m16n8k8.row.col.f32.bf16.bf16.f32") == 1
     assert cuda_src.count("static_cast<__nv_bfloat16_raw>") == 6
     assert "for (int dot_k_" not in cuda_src
@@ -2710,7 +2712,8 @@ def test_f16_multi_warp_cta_schedule_lowers_matmul_loop(
 
     assert "mma_warp_m * 16" in cuda_src
     assert "mma_warp_n * 16" in cuda_src
-    assert "index += 128" in cuda_src
+    assert cuda_src.count("vector += 128") == 2
+    assert cuda_src.count("*reinterpret_cast<uint4 *>") == 2
 
     assert cuda_src.count("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32") == 4
     assert "for (int dot_k_" not in cuda_src
@@ -2771,7 +2774,8 @@ def test_compiler_accepts_triton_style_num_warps(
 
     assert "int mma_warp_id = threadIdx.x >> 5;" in cuda_src
     assert "int mma_lane_id = threadIdx.x & 31;" in cuda_src
-    assert "index += 128" in cuda_src
+    assert cuda_src.count("vector += 128") == 2
+    assert cuda_src.count("*reinterpret_cast<uint4 *>") == 2
     assert cuda_src.count("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32") == 4
 
 
@@ -3188,7 +3192,8 @@ def test_f16_multi_warp_tensor_core_matmul_executes_on_cuda(
     assert "int mma_warp_id = threadIdx.x >> 5;" in cuda_src
     assert "int mma_warp_m = mma_warp_id / 2;" in cuda_src
     assert "int mma_warp_n = mma_warp_id % 2;" in cuda_src
-    assert "index += 128" in cuda_src
+    assert cuda_src.count("vector += 128") == 2
+    assert cuda_src.count("*reinterpret_cast<uint4 *>") == 2
 
     # One warp owns a 16x16 output tile:
     #

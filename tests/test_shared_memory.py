@@ -26,6 +26,7 @@ from mytriton.cuda_dot_staging import (
     CudaGlobalTilePlan,
     CudaSharedBuffer,
     SSADefinitions,
+    cuda_cooperative_copy_width,
     cuda_f32_shared_row_padding,
     match_cuda_dot_double_buffering,
 )
@@ -38,7 +39,9 @@ from mytriton.ssa import (
     SSAValue,
 )
 from mytriton.trace import (
+    BF16,
     BOOL,
+    F16,
     F32,
     I32,
     PTR_F32,
@@ -46,6 +49,7 @@ from mytriton.trace import (
     Const,
     Param,
     Ptr,
+    ScalarType,
     Value,
     make_runtime_params,
 )
@@ -147,6 +151,42 @@ def test_cuda_shared_buffer_represents_flat_rank2_tile() -> None:
 
 
 @pytest.mark.parametrize(
+    (
+        "logical_shape",
+        "element_ty",
+        "row_padding",
+        "alignment",
+        "expected_width",
+    ),
+    [
+        ((64, 16), BF16, 0, 16, 8),
+        ((16, 64), BF16, 0, 16, 8),
+        ((64, 16), F16, 0, 16, 8),
+        ((64, 16), F32, 0, 16, 4),
+        ((64, 16), F32, 1, 16, 1),
+        ((64, 12), BF16, 0, 16, 1),
+        ((64, 16), BF16, 0, 2, 1),
+    ],
+)
+def test_cuda_cooperative_copy_width(
+    logical_shape: tuple[int, ...],
+    element_ty: ScalarType,
+    row_padding: int,
+    alignment: int,
+    expected_width: int,
+) -> None:
+    buffer = CudaSharedBuffer(
+        name="tile",
+        logical_shape=logical_shape,
+        element_ty=element_ty,
+        row_padding=row_padding,
+        alignment=alignment,
+    )
+
+    assert cuda_cooperative_copy_width(buffer) == expected_width
+
+
+@pytest.mark.parametrize(
     "shape",
     [
         (),
@@ -186,6 +226,22 @@ def test_cuda_codegen_declares_shared_buffer() -> None:
     )
     assert codegen.shared_lines == [
         "    __shared__ float dot_lhs_7[64];",
+    ]
+
+
+def test_cuda_codegen_declares_aligned_shared_buffer() -> None:
+    codegen = SSACUDACodegen()
+    buffer = CudaSharedBuffer(
+        name="dot_lhs_7",
+        logical_shape=(64, 16),
+        element_ty=BF16,
+        alignment=16,
+    )
+
+    codegen.append_shared_buffer_declaration(buffer)
+
+    assert codegen.shared_lines == [
+        "    __shared__ __align__(16) __nv_bfloat16 dot_lhs_7[1024];",
     ]
 
 
@@ -237,6 +293,123 @@ def test_cuda_codegen_emits_cooperative_masked_load() -> None:
         ),
         "    }",
     ]
+
+
+def test_cuda_codegen_emits_vectorized_cooperative_bf16_load() -> None:
+    codegen = SSACUDACodegen()
+    codegen.layout = CudaKernelLayout(
+        output_tile_shape=(64, 64),
+        thread_shape=(8, 16),
+    )
+
+    target = CudaSharedBuffer(
+        name="dot_lhs_7",
+        logical_shape=(64, 16),
+        element_ty=BF16,
+        alignment=16,
+    )
+    source = CudaGlobalTile(
+        base="a",
+        row_offset="blockIdx.x * 64",
+        column_offset="k_base",
+        row_stride="K",
+        row_bound="M",
+        column_bound="K",
+    )
+
+    codegen.emit_vectorized_cooperative_load(target, source)
+
+    assert codegen.lines == [
+        (
+            "    for (int dot_lhs_7_vector = threadIdx.x; "
+            "dot_lhs_7_vector < 128; dot_lhs_7_vector += 128) {"
+        ),
+        "        int dot_lhs_7_index = dot_lhs_7_vector * 8;",
+        "        int dot_lhs_7_row = dot_lhs_7_index / 16;",
+        "        int dot_lhs_7_column = dot_lhs_7_index % 16;",
+        ("        int dot_lhs_7_global_row = (blockIdx.x * 64) + dot_lhs_7_row;"),
+        ("        int dot_lhs_7_global_column = (k_base) + dot_lhs_7_column;"),
+        (
+            "        int dot_lhs_7_source_index = "
+            "dot_lhs_7_global_row * (K) + dot_lhs_7_global_column;"
+        ),
+        (
+            "        bool dot_lhs_7_vector_in_bounds = "
+            "dot_lhs_7_global_row < (M) && "
+            "dot_lhs_7_global_column + 7 < (K);"
+        ),
+        (
+            "        if (dot_lhs_7_vector_in_bounds && "
+            "(reinterpret_cast<unsigned long long>("
+            "&a[dot_lhs_7_source_index]) & 15ULL) == 0ULL) {"
+        ),
+        (
+            "            *reinterpret_cast<uint4 *>("
+            "&dot_lhs_7[(dot_lhs_7_row) * 16 + "
+            "(dot_lhs_7_column)]) = "
+            "*reinterpret_cast<const uint4 *>("
+            "&a[dot_lhs_7_source_index]);"
+        ),
+        "        } else {",
+        "            #pragma unroll",
+        (
+            "            for (int dot_lhs_7_lane = 0; "
+            "dot_lhs_7_lane < 8; ++dot_lhs_7_lane) {"
+        ),
+        (
+            "                int dot_lhs_7_lane_global_column = "
+            "dot_lhs_7_global_column + dot_lhs_7_lane;"
+        ),
+        (
+            "                bool dot_lhs_7_lane_in_bounds = "
+            "dot_lhs_7_global_row < (M) && "
+            "dot_lhs_7_lane_global_column < (K);"
+        ),
+        (
+            "                dot_lhs_7[(dot_lhs_7_row) * 16 + "
+            "(dot_lhs_7_column + dot_lhs_7_lane)] = "
+            "dot_lhs_7_lane_in_bounds ? "
+            "a[dot_lhs_7_source_index + dot_lhs_7_lane] : "
+            "__float2bfloat16_rn(0.0f);"
+        ),
+        "            }",
+        "        }",
+        "    }",
+    ]
+
+
+def test_cuda_codegen_vectorized_load_falls_back_without_alignment() -> None:
+    scalar_codegen = SSACUDACodegen()
+    vectorized_codegen = SSACUDACodegen()
+
+    for codegen in (scalar_codegen, vectorized_codegen):
+        codegen.layout = CudaKernelLayout(
+            output_tile_shape=(64, 64),
+            thread_shape=(8, 16),
+        )
+
+    target = CudaSharedBuffer(
+        name="dot_lhs_7",
+        logical_shape=(64, 16),
+        element_ty=BF16,
+        alignment=2,
+    )
+    source = CudaGlobalTile(
+        base="a",
+        row_offset="blockIdx.x * 64",
+        column_offset="k_base",
+        row_stride="K",
+        row_bound="M",
+        column_bound="K",
+    )
+
+    scalar_codegen.emit_cooperative_load(target, source)
+    vectorized_codegen.emit_vectorized_cooperative_load(target, source)
+
+    assert vectorized_codegen.lines == scalar_codegen.lines
+    assert all(
+        "reinterpret_cast<uint4" not in line for line in vectorized_codegen.lines
+    )
 
 
 def test_cuda_codegen_rejects_non_row_major_cooperative_load() -> None:
@@ -365,6 +538,71 @@ def test_cuda_codegen_stages_both_dot_operands() -> None:
         "b[dot_rhs_7_source_index] : 0.0f;"
     )
 
+    assert codegen.lines[-1] == "    __syncthreads();"
+
+
+def test_cuda_codegen_vectorizes_low_precision_dot_staging() -> None:
+    codegen = SSACUDACodegen()
+    codegen.layout = CudaKernelLayout(
+        output_tile_shape=(64, 64),
+        thread_shape=(8, 16),
+    )
+
+    buffers = codegen.emit_dot_operand_staging(
+        dot_result_id=7,
+        lhs_shape=(64, 16),
+        rhs_shape=(16, 64),
+        element_ty=BF16,
+        lhs_source=CudaGlobalTile(
+            base="a",
+            row_offset="blockIdx.x * 64",
+            column_offset="k_base",
+            row_stride="K",
+            row_bound="M",
+            column_bound="K",
+        ),
+        rhs_source=CudaGlobalTile(
+            base="b",
+            row_offset="k_base",
+            column_offset="blockIdx.y * 64",
+            row_stride="N",
+            row_bound="K",
+            column_bound="N",
+        ),
+    )
+
+    assert buffers == CudaDotSharedBuffers(
+        lhs=CudaSharedBuffer(
+            name="dot_lhs_7",
+            logical_shape=(64, 16),
+            element_ty=BF16,
+            alignment=16,
+        ),
+        rhs=CudaSharedBuffer(
+            name="dot_rhs_7",
+            logical_shape=(16, 64),
+            element_ty=BF16,
+            alignment=16,
+        ),
+    )
+    assert codegen.shared_memory_bytes == 4096
+    assert codegen.shared_lines == [
+        ("    __shared__ __align__(16) __nv_bfloat16 dot_lhs_7[1024];"),
+        ("    __shared__ __align__(16) __nv_bfloat16 dot_rhs_7[1024];"),
+    ]
+
+    cuda_fragment = "\n".join(codegen.lines)
+
+    assert (
+        "for (int dot_lhs_7_vector = threadIdx.x; "
+        "dot_lhs_7_vector < 128; dot_lhs_7_vector += 128)"
+    ) in cuda_fragment
+    assert (
+        "for (int dot_rhs_7_vector = threadIdx.x; "
+        "dot_rhs_7_vector < 128; dot_rhs_7_vector += 128)"
+    ) in cuda_fragment
+    assert cuda_fragment.count("*reinterpret_cast<uint4 *>") == 2
+    assert cuda_fragment.count("*reinterpret_cast<const uint4 *>") == 2
     assert codegen.lines[-1] == "    __syncthreads();"
 
 
@@ -2428,6 +2666,22 @@ def test_cuda_shared_buffer_rejects_invalid_stage_count(
             logical_shape=(4, 16),
             element_ty=F32,
             stage_count=stage_count,
+        )
+
+
+@pytest.mark.parametrize("alignment", [0, -1, 3, 12, True])
+def test_cuda_shared_buffer_rejects_invalid_alignment(
+    alignment: int,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="alignment must be a positive power of two",
+    ):
+        CudaSharedBuffer(
+            name="tile",
+            logical_shape=(4, 16),
+            element_ty=F32,
+            alignment=alignment,
         )
 
 

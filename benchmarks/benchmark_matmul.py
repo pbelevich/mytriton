@@ -32,14 +32,7 @@ from mytriton.cuda_utils import cuda_module
 
 Tile = tuple[int, int, int]
 
-DEFAULT_TILES: tuple[Tile, ...] = (
-    (16, 16, 32),
-    (16, 32, 32),
-    (32, 16, 16),
-    (32, 16, 32),
-    (32, 32, 16),
-    (32, 32, 32),
-)
+DEFAULT_TILES: tuple[Tile, ...] = ((64, 16, 64),)
 
 
 @triton.jit
@@ -403,6 +396,9 @@ def benchmark_size(
                         ),
                         "barriers_in_source": cuda_source.count("__syncthreads()"),
                         "uses_ldmatrix": "ldmatrix" in cuda_source,
+                        "uses_vectorized_staging": (
+                            "reinterpret_cast<uint4" in cuda_source
+                        ),
                         "uses_cp_async": "cp.async" in cuda_source,
                     },
                     indent=2,
@@ -422,6 +418,7 @@ def benchmark_size(
                 "arithmetic_intensity_flop_per_byte": bm * bn / (bm + bn),
                 "mma_instructions_in_source": cuda_source.count("mma.sync.aligned"),
                 "barriers_in_source": cuda_source.count("__syncthreads()"),
+                "uses_vectorized_staging": ("reinterpret_cast<uint4" in cuda_source),
                 "uses_cp_async": "cp.async" in cuda_source,
                 "wrapper": wrapper,
                 "raw": raw,

@@ -6,6 +6,20 @@ were built.
 
 ## Unreleased
 
+### Version 23: Vectorized global-to-shared staging
+
+- Added 16-byte-aligned low-precision shared buffers and cooperative 128-bit
+  FP16/BF16 operand copies with masked scalar fallback for boundary and
+  misaligned vectors.
+- Added generated-CUDA, F16/BF16 execution, alignment, and fallback coverage
+  for vectorized CUDA-core and Tensor Core dot staging.
+- Improved the best `64x16x64`, four-warp A100 matmul from approximately
+  22.9-24.2 TFLOP/s to 38.5-40.8 TFLOP/s, with matching FP16/BF16 results.
+- Added reproducible Colab upload, benchmark, and Nsight Compute wrappers;
+  Colab CUDA extras are inferred from the remote PyTorch CUDA version.
+
+### Version 22: Multi-warp Tensor Core CTAs
+
 - Added Triton-style `num_warps` launch configuration for CUDA tensor-core
   matrix multiplication.
 - Added inferred block-to-warp decomposition, multi-warp CTA layouts,

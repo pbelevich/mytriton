@@ -12,6 +12,8 @@ symbolic IR, lowers it to verified typed SSA, and emits CUDA C++ with inline
 PTX. The current development version includes shared-memory tiled matrix
 multiplication, FP16/BF16 inputs, FP32 accumulation, and multi-warp Tensor Core
 CTA tiles built from NVIDIA `mma.sync` instructions.
+Low-precision operands are cooperatively staged with aligned 128-bit
+global-to-shared copies and a safe masked scalar fallback.
 
 ```text
 Python kernel
@@ -55,6 +57,7 @@ full [changelog](CHANGELOG.md) and the accompanying
 | [`ver20`](https://github.com/pbelevich/mytriton/tree/ver20) | [Tensor-core `mma.sync` lowering](https://pbelevich.github.io/2026/09/13/My_Triton_From_Scratch_Part_20_Tensor_Cores.html) |
 | [`ver21`](https://github.com/pbelevich/mytriton/tree/ver21) | [Composable warp MMA tiles](docs/implementation.md#composable-warp-mma-tiles) |
 | [`ver22`](https://github.com/pbelevich/mytriton/tree/ver22) | [Multi-warp Tensor Core CTAs](docs/implementation.md#multi-warp-cta-tiles) |
+| [`ver23`](https://github.com/pbelevich/mytriton/tree/ver23) | [Vectorized operand staging](docs/implementation.md#vectorized-global-to-shared-staging) |
 
 ## Tensor-core matmul
 
@@ -112,7 +115,7 @@ def matmul_kernel(
 
 
 M, N, K = 128, 128, 128
-BM, BK, BN = 32, 16, 32
+BM, BK, BN = 64, 16, 64
 
 torch.manual_seed(0)
 a = torch.randn((M, K), device="cuda", dtype=torch.float16)
@@ -137,9 +140,9 @@ expected = a.float() @ b.float()
 torch.testing.assert_close(out, expected, rtol=3e-3, atol=3e-3)
 ```
 
-The `32 x 16 x 32` CTA tile is divided into a `2 x 2` warp grid. Each warp
-owns a `16 x 16` output tile and executes four physical `m16n8k8`
-instructions. The generated source contains four static MMA instructions,
+The `64 x 16 x 64` CTA tile is divided into a `2 x 2` warp grid. Each warp
+owns a `32 x 32` output tile and executes sixteen physical `m16n8k8`
+instructions. The generated source contains sixteen static MMA instructions,
 which are executed independently by all four warps:
 
 ```cuda
@@ -153,6 +156,19 @@ asm volatile(
     : "r"(a0), "r"(a1), "r"(b0)
 );
 ```
+
+Before MMA, each thread moves eight adjacent FP16/BF16 values into aligned
+shared memory with one 128-bit copy:
+
+```cuda
+*reinterpret_cast<uint4 *>(&shared[index]) =
+    *reinterpret_cast<const uint4 *>(&global[source_index]);
+```
+
+On A100 this raises the best measured kernel throughput from about 24 to 41
+TFLOP/s. See the
+[Version 23 performance report](benchmarks/matmul_vectorized_staging_a100_report.md)
+for the complete methodology, tile sweep, SASS, and Nsight Compute analysis.
 
 FP16 MMA requires `sm_75+`; native BF16 MMA requires `sm_80+`. Unsupported
 types, shapes, and targets retain the CUDA-core fallback. See the

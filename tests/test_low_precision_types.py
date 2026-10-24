@@ -861,8 +861,10 @@ def test_f16_dot_lowers_through_shared_memory_to_f32_cuda(
         "int M, int N, int K, int k_base)"
     ) in cuda_src
 
-    assert "__shared__ __half dot_lhs_29[" in cuda_src
-    assert "__shared__ __half dot_rhs_29[" in cuda_src
+    assert "__shared__ __align__(16) __half dot_lhs_29[" in cuda_src
+    assert "__shared__ __align__(16) __half dot_rhs_29[" in cuda_src
+    assert cuda_src.count("*reinterpret_cast<uint4 *>") == 2
+    assert cuda_src.count("*reinterpret_cast<const uint4 *>") == 2
     assert "float v29 = 0.0f;" in cuda_src
 
     assert (
@@ -985,12 +987,12 @@ def test_bf16_dot_lowers_through_shared_memory_to_f32_cuda(
         "int M, int N, int K, int k_base)"
     ) in cuda_src
 
-    assert "__shared__ __nv_bfloat16 dot_lhs_29[" in cuda_src
-    assert "__shared__ __nv_bfloat16 dot_rhs_29[" in cuda_src
-
-    assert (
-        "dot_lhs_29_in_bounds ? a[dot_lhs_29_source_index] : __float2bfloat16_rn(0.0f);"
-    ) in cuda_src
+    assert "__shared__ __align__(16) __nv_bfloat16 dot_lhs_29[" in cuda_src
+    assert "__shared__ __align__(16) __nv_bfloat16 dot_rhs_29[" in cuda_src
+    assert cuda_src.count("*reinterpret_cast<uint4 *>") == 2
+    assert cuda_src.count("*reinterpret_cast<const uint4 *>") == 2
+    assert "dot_lhs_29_vector_in_bounds" in cuda_src
+    assert "dot_lhs_29_lane_in_bounds" in cuda_src
 
     assert (
         "v29 += "
