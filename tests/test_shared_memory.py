@@ -24,6 +24,7 @@ from mytriton.cuda_dot_staging import (
     CudaDotStagingAnalysis,
     CudaDotStagingAnalyzer,
     CudaDotStagingPlan,
+    CudaGlobalStorePlan,
     CudaGlobalTile,
     CudaGlobalTilePlan,
     CudaSharedBuffer,
@@ -663,6 +664,47 @@ def test_ldmatrix_staging_uses_conflict_free_vector_swizzle() -> None:
         assert len(row_start_banks) == 8
 
 
+def test_cuda_shared_buffer_swizzles_sixteen_segments() -> None:
+    buffer = CudaSharedBuffer(
+        name="tile",
+        logical_shape=(32, 128),
+        element_ty=F16,
+        alignment=16,
+        swizzle_segment_width=8,
+    )
+
+    for row in range(buffer.rows):
+        physical_columns = {
+            buffer.offset(row, column) - row * buffer.row_stride
+            for column in range(buffer.columns)
+        }
+        assert physical_columns == set(range(buffer.columns))
+
+    row_start_banks = tuple(buffer.offset(row, 0) * 2 // 4 % 32 for row in range(8))
+    assert row_start_banks == (
+        0,
+        4,
+        8,
+        12,
+        16,
+        20,
+        24,
+        28,
+    )
+
+    for row in range(8):
+        lower_half = buffer.offset(row, 0) - row * buffer.row_stride
+        upper_half = buffer.offset(row, 64) - row * buffer.row_stride
+
+        assert lower_half == row * 8
+        assert upper_half == 64 + row * 8
+
+    assert "((row) & 7)" in buffer.physical_column(
+        "row",
+        "column",
+    )
+
+
 def test_dot_operand_staging_rejects_incompatible_shapes() -> None:
     codegen = SSACUDACodegen()
     codegen.layout = CudaKernelLayout(
@@ -805,6 +847,30 @@ def test_dot_operand_matcher_recovers_lhs_global_tile() -> None:
         row_bound=Param("M", I32),
         column_bound=Param("K", I32),
         other=Const(0.0),
+    )
+
+
+def test_dot_operand_matcher_recovers_global_store_tile() -> None:
+    ssa_ops, dot_result = make_tiled_dot_ssa()
+    definitions = SSADefinitions(ssa_ops)
+    dot = definitions.require(dot_result, "dot")
+
+    lhs, _ = dot.operands
+    load = definitions.require(lhs, "load")
+    pointer, mask, _ = load.operands
+
+    plan = CudaDotOperandMatcher(definitions).match_store(
+        pointer,
+        mask,
+    )
+
+    assert plan == CudaGlobalStorePlan(
+        base=Param("a", PTR_F32),
+        row_offset=SSAValue(id=1, ty=I32),
+        column_offset=Param("k_base", I32),
+        row_stride=Param("K", I32),
+        row_bound=Param("M", I32),
+        column_bound=Param("K", I32),
     )
 
 

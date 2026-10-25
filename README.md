@@ -59,6 +59,7 @@ full [changelog](CHANGELOG.md) and the accompanying
 | [`ver22`](https://github.com/pbelevich/mytriton/tree/ver22) | [Multi-warp Tensor Core CTAs](docs/implementation.md#multi-warp-cta-tiles) |
 | [`ver23`](https://github.com/pbelevich/mytriton/tree/ver23) | [Vectorized operand staging](docs/implementation.md#vectorized-global-to-shared-staging) |
 | [`ver24`](https://github.com/pbelevich/mytriton/tree/ver24) | [`ldmatrix` operand fragments](docs/implementation.md#warp-cooperative-ldmatrix-fragments) |
+| [`ver25`](https://github.com/pbelevich/mytriton/tree/ver25) | [SM80 production tensor tile](docs/implementation.md#sm80-production-tensor-tile) |
 
 ## Tensor-core matmul
 
@@ -142,19 +143,18 @@ torch.testing.assert_close(out, expected, rtol=3e-3, atol=3e-3)
 ```
 
 The `64 x 16 x 64` CTA tile is divided into a `2 x 2` warp grid. Each warp
-owns a `32 x 32` output tile and executes sixteen physical `m16n8k8`
-instructions. The generated source contains sixteen static MMA instructions,
-which are executed independently by all four warps:
+owns a `32 x 32` output tile. SM80 executes eight physical `m16n8k16`
+instructions per warp; SM75 retains sixteen `m16n8k8` instructions:
 
 ```cuda
 asm volatile(
-    "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+    "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
     "{%0, %1, %2, %3}, "
-    "{%4, %5}, "
-    "{%6}, "
+    "{%4, %5, %6, %7}, "
+    "{%8, %9}, "
     "{%0, %1, %2, %3};"
     : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
-    : "r"(a0), "r"(a1), "r"(b0)
+    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1)
 );
 ```
 
@@ -187,10 +187,15 @@ Version 24 combines `ldmatrix` with a 16-byte XOR-swizzled shared layout. The
 same tile reaches 59.95 TFLOP/s for BF16 and 59.88 TFLOP/s for FP16 at
 `4096^3`, while shared-load bank conflicts fall by 99.3%. See the
 [Version 24 performance report](benchmarks/matmul_ldmatrix_a100_report.md).
+Version 25 adds native SM80 `m16n8k16`, a direct register-to-global epilogue,
+and a correct `128 x 128 x 32` experimental CTA tile. The established
+`64 x 16 x 64` tile remains the fastest default at 63.19 TFLOP/s until an
+asynchronous pipeline can overlap operand transport with MMA. See the
+[Version 25 performance report](benchmarks/matmul_production_tile_a100_report.md).
 
 FP16 MMA requires `sm_75+`; native BF16 MMA requires `sm_80+`. Unsupported
 types, shapes, and targets retain the CUDA-core fallback. See the
-[implementation guide](docs/implementation.md#warp-cooperative-ldmatrix-fragments)
+[implementation guide](docs/implementation.md#sm80-production-tensor-tile)
 for fragment layouts, shared-memory mapping, composition, and accumulation.
 
 ## Documentation

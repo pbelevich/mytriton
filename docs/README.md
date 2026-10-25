@@ -22,8 +22,12 @@ compiler notes live in the [implementation guide](implementation.md).
 - [Multi-warp CTA tiles](implementation.md#multi-warp-cta-tiles)
 - [Vectorized global-to-shared staging](implementation.md#vectorized-global-to-shared-staging)
 - [Warp-cooperative `ldmatrix` fragments](implementation.md#warp-cooperative-ldmatrix-fragments)
+- [SM80 production tensor tile](implementation.md#sm80-production-tensor-tile)
 - [A100 Version 23 performance report](../benchmarks/matmul_vectorized_staging_a100_report.md)
 - [A100 Version 24 `ldmatrix` report](../benchmarks/matmul_ldmatrix_a100_report.md)
+- [A100 Version 25 production-tile report](../benchmarks/matmul_production_tile_a100_report.md)
+- [Version 25 visual report — English](../benchmarks/version25_production_tensor_tile_a100_en.html)
+- [Version 25 visual report — Russian](../benchmarks/version25_production_tensor_tile_a100_ru.html)
 
 ## Runtime and development
 

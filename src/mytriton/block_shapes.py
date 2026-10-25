@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 from .trace import F16, F32, BlockType, ScalarType
 
 if TYPE_CHECKING:
+    from .cuda_target import CudaTarget
     from .ssa import SSAItem
 
 
@@ -89,16 +90,105 @@ class CudaMmaM16N8K8Layout:
 
 
 @dataclass(frozen=True)
+class CudaMmaM16N8K16Layout:
+    """Per-lane fragment layout for PTX mma.m16n8k16."""
+
+    lhs_shape = (16, 16)
+    rhs_shape = (16, 8)
+    result_shape = (16, 8)
+    threads_per_warp = 32
+    thread_shape = (4, 8)
+
+    def lane_parts(self, lane: int) -> tuple[int, int]:
+        if type(lane) is not int or not 0 <= lane < self.threads_per_warp:
+            raise ValueError(f"MMA lane must be between 0 and 31, got {lane}")
+
+        group_id = lane // 4
+        thread_id_in_group = lane % 4
+        return group_id, thread_id_in_group
+
+    def lhs_coordinates(
+        self,
+        lane: int,
+    ) -> tuple[tuple[int, int], ...]:
+        group_id, thread_id = self.lane_parts(lane)
+        first_column = thread_id * 2
+
+        return (
+            (group_id, first_column),
+            (group_id, first_column + 1),
+            (group_id + 8, first_column),
+            (group_id + 8, first_column + 1),
+            (group_id, first_column + 8),
+            (group_id, first_column + 9),
+            (group_id + 8, first_column + 8),
+            (group_id + 8, first_column + 9),
+        )
+
+    def rhs_coordinates(
+        self,
+        lane: int,
+    ) -> tuple[tuple[int, int], ...]:
+        group_id, thread_id = self.lane_parts(lane)
+        first_row = thread_id * 2
+
+        return (
+            (first_row, group_id),
+            (first_row + 1, group_id),
+            (first_row + 8, group_id),
+            (first_row + 9, group_id),
+        )
+
+    def accumulator_coordinates(
+        self,
+        lane: int,
+    ) -> tuple[tuple[int, int], ...]:
+        group_id, thread_id = self.lane_parts(lane)
+        first_column = thread_id * 2
+
+        return (
+            (group_id, first_column),
+            (group_id, first_column + 1),
+            (group_id + 8, first_column),
+            (group_id + 8, first_column + 1),
+        )
+
+
+_DEFAULT_CUDA_MMA_INSTRUCTION_LAYOUT = CudaMmaM16N8K8Layout()
+
+
+def cuda_mma_instruction_layout(
+    target: CudaTarget,
+) -> CudaMmaM16N8K8Layout | CudaMmaM16N8K16Layout | None:
+    """Select the preferred physical MMA instruction for a CUDA target."""
+
+    if target.supports_f16_mma_m16n8k16 or target.supports_bf16_mma_m16n8k16:
+        return CudaMmaM16N8K16Layout()
+
+    if target.supports_f16_mma_m16n8k8 or target.supports_bf16_mma_m16n8k8:
+        return CudaMmaM16N8K8Layout()
+
+    return None
+
+
+@dataclass(frozen=True)
 class CudaMmaWarpTileLayout:
-    """One logical warp tile composed from m16n8k8 MMA instructions."""
+    """One logical warp tile composed from physical MMA instructions."""
 
     m: int
     n: int
     k: int
+    instruction_layout: CudaMmaM16N8K8Layout | CudaMmaM16N8K16Layout = (
+        _DEFAULT_CUDA_MMA_INSTRUCTION_LAYOUT
+    )
 
-    instruction_layout = CudaMmaM16N8K8Layout()
-    threads_per_warp = instruction_layout.threads_per_warp
-    thread_shape = instruction_layout.thread_shape
+    @property
+    def threads_per_warp(self) -> int:
+        return self.instruction_layout.threads_per_warp
+
+    @property
+    def thread_shape(self) -> tuple[int, int]:
+        return self.instruction_layout.thread_shape
 
     def __post_init__(self) -> None:
         instruction_m, instruction_n = self.instruction_layout.result_shape
@@ -328,6 +418,9 @@ class CudaMmaCtaTileLayout:
     """Physical multi-warp MMA layout selected by a matmul schedule."""
 
     schedule: CudaMatmulSchedule
+    instruction_layout: CudaMmaM16N8K8Layout | CudaMmaM16N8K16Layout = (
+        CudaMmaM16N8K8Layout()
+    )
 
     def __post_init__(self) -> None:
         # Constructing the warp layout validates that its M, N and K
@@ -336,6 +429,7 @@ class CudaMmaCtaTileLayout:
             m=self.schedule.warp_m,
             n=self.schedule.warp_n,
             k=self.schedule.block_k,
+            instruction_layout=self.instruction_layout,
         )
 
     @property
@@ -344,6 +438,7 @@ class CudaMmaCtaTileLayout:
             m=self.schedule.warp_m,
             n=self.schedule.warp_n,
             k=self.schedule.block_k,
+            instruction_layout=self.instruction_layout,
         )
 
     @property
@@ -421,6 +516,9 @@ def cuda_mma_warp_tile_layout(
     op: SSAItem,
     *,
     operand_types: frozenset[ScalarType] = frozenset((F16,)),
+    instruction_layout: CudaMmaM16N8K8Layout | CudaMmaM16N8K16Layout = (
+        _DEFAULT_CUDA_MMA_INSTRUCTION_LAYOUT
+    ),
 ) -> CudaMmaWarpTileLayout | None:
     """Return the composable warp layout for a supported low-precision dot."""
 
@@ -470,6 +568,7 @@ def cuda_mma_warp_tile_layout(
             m=lhs_m,
             n=rhs_n,
             k=lhs_k,
+            instruction_layout=instruction_layout,
         )
     except ValueError:
         return None
@@ -480,12 +579,16 @@ def cuda_mma_cta_tile_layout(
     *,
     schedule: CudaMatmulSchedule,
     operand_types: frozenset[ScalarType] = frozenset((F16,)),
+    instruction_layout: CudaMmaM16N8K8Layout | CudaMmaM16N8K16Layout = (
+        _DEFAULT_CUDA_MMA_INSTRUCTION_LAYOUT
+    ),
 ) -> CudaMmaCtaTileLayout | None:
     """Match a low-precision dot against an explicit multi-warp schedule."""
 
     full_tile = cuda_mma_warp_tile_layout(
         op,
         operand_types=operand_types,
+        instruction_layout=instruction_layout,
     )
 
     if full_tile is None:
@@ -513,7 +616,10 @@ def cuda_mma_cta_tile_layout(
         return None
 
     try:
-        return CudaMmaCtaTileLayout(schedule=schedule)
+        return CudaMmaCtaTileLayout(
+            schedule=schedule,
+            instruction_layout=instruction_layout,
+        )
     except ValueError:
         return None
 
@@ -523,6 +629,9 @@ def cuda_mma_cta_tile_layouts(
     *,
     schedule: CudaMatmulSchedule,
     operand_types: frozenset[ScalarType] = frozenset((F16,)),
+    instruction_layout: CudaMmaM16N8K8Layout | CudaMmaM16N8K16Layout = (
+        _DEFAULT_CUDA_MMA_INSTRUCTION_LAYOUT
+    ),
 ) -> dict[int, CudaMmaCtaTileLayout]:
     """Collect schedule-compatible CTA layouts by SSA dot result ID."""
 
@@ -537,6 +646,7 @@ def cuda_mma_cta_tile_layouts(
                     item.body,
                     schedule=schedule,
                     operand_types=operand_types,
+                    instruction_layout=instruction_layout,
                 )
             )
             continue
@@ -545,6 +655,7 @@ def cuda_mma_cta_tile_layouts(
             item,
             schedule=schedule,
             operand_types=operand_types,
+            instruction_layout=instruction_layout,
         )
 
         if layout is None:
@@ -560,6 +671,9 @@ def cuda_mma_warp_tile_layouts(
     ssa_ops: list[SSAItem],
     *,
     operand_types: frozenset[ScalarType] = frozenset((F16,)),
+    instruction_layout: CudaMmaM16N8K8Layout | CudaMmaM16N8K16Layout = (
+        _DEFAULT_CUDA_MMA_INSTRUCTION_LAYOUT
+    ),
 ) -> dict[int, CudaMmaWarpTileLayout]:
     """Collect composable MMA layouts by SSA dot result ID."""
 
@@ -573,6 +687,7 @@ def cuda_mma_warp_tile_layouts(
                 cuda_mma_warp_tile_layouts(
                     item.body,
                     operand_types=operand_types,
+                    instruction_layout=instruction_layout,
                 )
             )
             continue
@@ -580,6 +695,7 @@ def cuda_mma_warp_tile_layouts(
         layout = cuda_mma_warp_tile_layout(
             item,
             operand_types=operand_types,
+            instruction_layout=instruction_layout,
         )
 
         if layout is None:

@@ -11,10 +11,12 @@ from mytriton.block_shapes import (
     CudaMatmulSchedule,
     CudaMmaCtaTileLayout,
     CudaMmaM16N8K8Layout,
+    CudaMmaM16N8K16Layout,
     CudaMmaWarpTileLayout,
     cuda_kernel_layout,
     cuda_mma_cta_tile_layout,
     cuda_mma_cta_tile_layouts,
+    cuda_mma_instruction_layout,
     cuda_mma_m16n8k8_dot_result_ids,
     cuda_mma_warp_tile_layout,
     cuda_mma_warp_tile_layouts,
@@ -24,6 +26,7 @@ from mytriton.block_shapes import (
 )
 from mytriton.cuda_codegen import (
     CudaMmaAccumulatorRef,
+    CudaMmaInstructionOperands,
     CudaRegisterTileRef,
     SSACUDACodegen,
 )
@@ -42,6 +45,7 @@ from mytriton.trace import (
     PTR_F32,
     BlockType,
     Const,
+    ScalarType,
     Type,
 )
 
@@ -100,6 +104,111 @@ def test_mma_m16n8k8_layout_shapes() -> None:
     assert layout.thread_shape == (4, 8)
 
 
+def test_mma_m16n8k16_layout_shapes() -> None:
+    layout = CudaMmaM16N8K16Layout()
+
+    assert layout.lhs_shape == (16, 16)
+    assert layout.rhs_shape == (16, 8)
+    assert layout.result_shape == (16, 8)
+    assert layout.threads_per_warp == 32
+    assert layout.thread_shape == (4, 8)
+
+
+def test_mma_m16n8k16_layout_maps_lane_fragments() -> None:
+    layout = CudaMmaM16N8K16Layout()
+
+    assert layout.lhs_coordinates(0) == (
+        (0, 0),
+        (0, 1),
+        (8, 0),
+        (8, 1),
+        (0, 8),
+        (0, 9),
+        (8, 8),
+        (8, 9),
+    )
+    assert layout.rhs_coordinates(0) == (
+        (0, 0),
+        (1, 0),
+        (8, 0),
+        (9, 0),
+    )
+    assert layout.accumulator_coordinates(0) == (
+        (0, 0),
+        (0, 1),
+        (8, 0),
+        (8, 1),
+    )
+
+    assert layout.lhs_coordinates(31) == (
+        (7, 6),
+        (7, 7),
+        (15, 6),
+        (15, 7),
+        (7, 14),
+        (7, 15),
+        (15, 14),
+        (15, 15),
+    )
+    assert layout.rhs_coordinates(31) == (
+        (6, 7),
+        (7, 7),
+        (14, 7),
+        (15, 7),
+    )
+    assert layout.accumulator_coordinates(31) == (
+        (7, 6),
+        (7, 7),
+        (15, 6),
+        (15, 7),
+    )
+
+
+def test_mma_m16n8k16_layout_covers_each_matrix_once() -> None:
+    layout = CudaMmaM16N8K16Layout()
+
+    lhs_coordinates = {
+        coordinate
+        for lane in range(layout.threads_per_warp)
+        for coordinate in layout.lhs_coordinates(lane)
+    }
+    rhs_coordinates = {
+        coordinate
+        for lane in range(layout.threads_per_warp)
+        for coordinate in layout.rhs_coordinates(lane)
+    }
+    accumulator_coordinates = {
+        coordinate
+        for lane in range(layout.threads_per_warp)
+        for coordinate in layout.accumulator_coordinates(lane)
+    }
+
+    assert lhs_coordinates == {
+        (row, column) for row in range(16) for column in range(16)
+    }
+    assert rhs_coordinates == {
+        (row, column) for row in range(16) for column in range(8)
+    }
+    assert accumulator_coordinates == {
+        (row, column) for row in range(16) for column in range(8)
+    }
+
+
+@pytest.mark.parametrize(
+    ("chip", "expected_layout"),
+    [
+        ("sm_70", None),
+        ("sm_75", CudaMmaM16N8K8Layout()),
+        ("sm_80", CudaMmaM16N8K16Layout()),
+    ],
+)
+def test_selects_mma_instruction_layout_for_cuda_target(
+    chip: str,
+    expected_layout: CudaMmaM16N8K8Layout | CudaMmaM16N8K16Layout | None,
+) -> None:
+    assert cuda_mma_instruction_layout(CudaTarget.from_chip(chip)) == expected_layout
+
+
 def test_composable_mma_warp_tile_layout() -> None:
     layout = CudaMmaWarpTileLayout(m=32, n=16, k=16)
 
@@ -125,6 +234,41 @@ def test_composable_mma_warp_tile_layout() -> None:
         (1, 1, 0),
         (1, 1, 1),
     )
+
+
+def test_composable_mma_warp_tile_layout_uses_m16n8k16() -> None:
+    layout = CudaMmaWarpTileLayout(
+        m=64,
+        n=64,
+        k=32,
+        instruction_layout=CudaMmaM16N8K16Layout(),
+    )
+
+    assert layout.lhs_shape == (64, 32)
+    assert layout.rhs_shape == (32, 64)
+    assert layout.result_shape == (64, 64)
+    assert layout.instruction_shape == (16, 8, 16)
+
+    assert layout.m_tiles == 4
+    assert layout.n_tiles == 8
+    assert layout.k_tiles == 2
+
+    assert layout.instruction_count == 64
+    assert layout.accumulator_fragments_per_lane == 32
+    assert layout.accumulator_elements_per_lane == 128
+
+
+def test_m16n8k16_warp_tile_rejects_incompatible_k() -> None:
+    with pytest.raises(
+        ValueError,
+        match="K dimension must be a positive multiple of 16, got 8",
+    ):
+        CudaMmaWarpTileLayout(
+            m=64,
+            n=64,
+            k=8,
+            instruction_layout=CudaMmaM16N8K16Layout(),
+        )
 
 
 def test_cuda_matmul_schedule_describes_cta_and_warp_tiles() -> None:
@@ -417,6 +561,38 @@ def test_cuda_mma_cta_tile_layout_uses_matmul_schedule() -> None:
         (0, 0),
         (0, 64),
     )
+
+
+def test_cuda_mma_cta_tile_layout_uses_m16n8k16() -> None:
+    schedule = CudaMatmulSchedule(
+        block_m=128,
+        block_k=32,
+        block_n=128,
+        warp_m=64,
+        warp_n=64,
+        warps_m=2,
+        warps_n=2,
+    )
+    instruction_layout = CudaMmaM16N8K16Layout()
+    layout = CudaMmaCtaTileLayout(
+        schedule=schedule,
+        instruction_layout=instruction_layout,
+    )
+
+    assert layout.instruction_layout is instruction_layout
+    assert layout.warp_tile == CudaMmaWarpTileLayout(
+        m=64,
+        n=64,
+        k=32,
+        instruction_layout=instruction_layout,
+    )
+    assert layout.warp_tile.instruction_shape == (16, 8, 16)
+    assert layout.warp_tile.instruction_count == 64
+
+    assert layout.result_shape == (128, 128)
+    assert layout.warp_shape == (2, 2)
+    assert layout.warp_count == 4
+    assert layout.threads_per_block == 128
 
 
 def test_composable_mma_warp_tile_offsets_instruction_fragments() -> None:
@@ -778,6 +954,25 @@ def test_recognizes_composable_f16_mma_warp_tile() -> None:
     )
 
 
+def test_recognizes_composable_m16n8k16_warp_tile() -> None:
+    op = make_dot_op(
+        BlockType((64, 32), F16),
+        BlockType((32, 64), F16),
+        BlockType((64, 64), F32),
+    )
+    instruction_layout = CudaMmaM16N8K16Layout()
+
+    assert cuda_mma_warp_tile_layout(
+        op,
+        instruction_layout=instruction_layout,
+    ) == CudaMmaWarpTileLayout(
+        m=64,
+        n=64,
+        k=32,
+        instruction_layout=instruction_layout,
+    )
+
+
 def test_recognizes_bf16_m16n8k8_dot_when_operand_type_is_enabled() -> None:
     op = make_dot_op(
         BlockType((16, 8), BF16),
@@ -966,6 +1161,80 @@ def test_collects_matching_mma_cta_tile_layouts_recursively() -> None:
     assert layouts == {
         2: CudaMmaCtaTileLayout(schedule=schedule),
         9: CudaMmaCtaTileLayout(schedule=schedule),
+    }
+
+
+def test_collects_m16n8k16_layouts_recursively() -> None:
+    schedule = CudaMatmulSchedule(
+        block_m=128,
+        block_k=32,
+        block_n=128,
+        warp_m=64,
+        warp_n=64,
+        warps_m=2,
+        warps_n=2,
+    )
+    instruction_layout = CudaMmaM16N8K16Layout()
+
+    top_level_dot = make_dot_op(
+        BlockType((128, 32), F16),
+        BlockType((32, 128), F16),
+        BlockType((128, 128), F32),
+        result_id=2,
+    )
+    nested_dot = make_dot_op(
+        BlockType((128, 32), F16),
+        BlockType((32, 128), F16),
+        BlockType((128, 128), F32),
+        result_id=9,
+    )
+    loop = SSAForRange(
+        index=SSAValue(id=6, ty=I32),
+        start=Const(0),
+        stop=Const(32),
+        step=Const(32),
+        carried_inputs=(),
+        carried_args=(),
+        body=[nested_dot],
+        yields=(),
+        results=(),
+    )
+    ssa_ops: list[SSAItem] = [
+        top_level_dot,
+        loop,
+    ]
+
+    assert cuda_mma_cta_tile_layouts(
+        ssa_ops,
+        schedule=schedule,
+        instruction_layout=instruction_layout,
+    ) == {
+        2: CudaMmaCtaTileLayout(
+            schedule=schedule,
+            instruction_layout=instruction_layout,
+        ),
+        9: CudaMmaCtaTileLayout(
+            schedule=schedule,
+            instruction_layout=instruction_layout,
+        ),
+    }
+
+    assert cuda_mma_warp_tile_layouts(
+        ssa_ops,
+        instruction_layout=instruction_layout,
+    ) == {
+        2: CudaMmaWarpTileLayout(
+            m=128,
+            n=128,
+            k=32,
+            instruction_layout=instruction_layout,
+        ),
+        9: CudaMmaWarpTileLayout(
+            m=128,
+            n=128,
+            k=32,
+            instruction_layout=instruction_layout,
+        ),
     }
 
 
@@ -1347,13 +1616,19 @@ def test_cuda_codegen_loads_composable_mma_operands_from_shared_memory() -> None
 
     assert len(instruction_operands) == layout.instruction_count == 8
 
-    assert instruction_operands[0] == (
-        ("mma_a_7_0_0", "mma_a_7_0_1"),
-        "mma_b_7_0_0",
+    assert instruction_operands[0] == CudaMmaInstructionOperands(
+        lhs_registers=(
+            "mma_a_7_0_0",
+            "mma_a_7_0_1",
+        ),
+        rhs_registers=("mma_b_7_0_0",),
     )
-    assert instruction_operands[-1] == (
-        ("mma_a_7_1_2", "mma_a_7_1_3"),
-        "mma_b_7_0_3",
+    assert instruction_operands[-1] == CudaMmaInstructionOperands(
+        lhs_registers=(
+            "mma_a_7_1_2",
+            "mma_a_7_1_3",
+        ),
+        rhs_registers=("mma_b_7_0_3",),
     )
 
     cuda = "\n".join(codegen.lines)
@@ -1362,6 +1637,71 @@ def test_cuda_codegen_loads_composable_mma_operands_from_shared_memory() -> None
     assert "&dot_lhs_7[(24 + (threadIdx.x & 7)) * 16 + (8)]" in cuda
     assert "&dot_rhs_7[(8 + (threadIdx.x & 7)) * 16 + (8)]" in cuda
     assert "__half_as_ushort" not in cuda
+
+
+def test_cuda_codegen_loads_m16n8k16_operands_from_shared_memory() -> None:
+    codegen = SSACUDACodegen(target=CudaTarget.from_chip("sm_80"))
+    codegen.layout = CudaKernelLayout(
+        output_tile_shape=(64, 64),
+        thread_shape=(4, 8),
+    )
+    instruction_layout = CudaMmaM16N8K16Layout()
+    layout = CudaMmaWarpTileLayout(
+        m=64,
+        n=64,
+        k=32,
+        instruction_layout=instruction_layout,
+    )
+    buffers = CudaDotSharedBuffers(
+        lhs=CudaSharedBuffer(
+            name="dot_lhs_7",
+            logical_shape=(64, 32),
+            element_ty=F16,
+        ),
+        rhs=CudaSharedBuffer(
+            name="dot_rhs_7",
+            logical_shape=(32, 64),
+            element_ty=F16,
+        ),
+    )
+
+    instruction_operands = codegen.emit_mma_warp_tile_operand_registers(
+        result_id=7,
+        buffers=buffers,
+        layout=layout,
+    )
+
+    assert len(instruction_operands) == layout.instruction_count == 64
+
+    assert instruction_operands[0] == CudaMmaInstructionOperands(
+        lhs_registers=(
+            "mma_a_7_0_0",
+            "mma_a_7_0_1",
+            "mma_a_7_0_2",
+            "mma_a_7_0_3",
+        ),
+        rhs_registers=(
+            "mma_b_7_0_0",
+            "mma_b_7_0_1",
+        ),
+    )
+    assert instruction_operands[-1] == CudaMmaInstructionOperands(
+        lhs_registers=(
+            "mma_a_7_7_0",
+            "mma_a_7_7_1",
+            "mma_a_7_7_2",
+            "mma_a_7_7_3",
+        ),
+        rhs_registers=(
+            "mma_b_7_7_2",
+            "mma_b_7_7_3",
+        ),
+    )
+
+    cuda = "\n".join(codegen.lines)
+
+    assert cuda.count("ldmatrix.sync.aligned.m8n8.x4.shared.b16") == 8
+    assert cuda.count("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16") == 8
 
 
 def test_cuda_codegen_loads_multi_warp_cta_operands() -> None:
@@ -1517,6 +1857,84 @@ def test_cuda_codegen_emits_mma_into_selected_accumulator_fragment() -> None:
     assert cuda.count("mma.sync.aligned.m16n8k8") == 1
 
 
+@pytest.mark.parametrize(
+    ("operand_ty", "ptx_operand_ty"),
+    [
+        (F16, "f16"),
+        (BF16, "bf16"),
+    ],
+)
+def test_cuda_codegen_emits_mma_m16n8k16_instruction(
+    operand_ty: ScalarType,
+    ptx_operand_ty: str,
+) -> None:
+    codegen = SSACUDACodegen(target=CudaTarget.from_chip("sm_80"))
+
+    codegen.emit_mma_m16n8k16_instruction(
+        accumulator_registers=(
+            "v7_0",
+            "v7_1",
+            "v7_2",
+            "v7_3",
+        ),
+        lhs_registers=(
+            "mma_a_7_0",
+            "mma_a_7_1",
+            "mma_a_7_2",
+            "mma_a_7_3",
+        ),
+        rhs_registers=(
+            "mma_b_7_0",
+            "mma_b_7_1",
+        ),
+        operand_ty=operand_ty,
+    )
+
+    cuda = "\n".join(codegen.lines)
+
+    assert (
+        f"mma.sync.aligned.m16n8k16.row.col.f32.{ptx_operand_ty}.{ptx_operand_ty}.f32"
+    ) in cuda
+    assert '"{%4, %5, %6, %7}, "' in cuda
+    assert '"{%8, %9}, "' in cuda
+    assert (
+        ': "r"(mma_a_7_0), '
+        '"r"(mma_a_7_1), '
+        '"r"(mma_a_7_2), '
+        '"r"(mma_a_7_3), '
+        '"r"(mma_b_7_0), '
+        '"r"(mma_b_7_1)'
+    ) in cuda
+
+
+def test_cuda_codegen_rejects_m16n8k16_before_sm80() -> None:
+    codegen = SSACUDACodegen(target=CudaTarget.from_chip("sm_75"))
+
+    with pytest.raises(
+        TypeError,
+        match="m16n8k16 f16 MMA requires sm_80",
+    ):
+        codegen.emit_mma_m16n8k16_instruction(
+            accumulator_registers=(
+                "v7_0",
+                "v7_1",
+                "v7_2",
+                "v7_3",
+            ),
+            lhs_registers=(
+                "mma_a_7_0",
+                "mma_a_7_1",
+                "mma_a_7_2",
+                "mma_a_7_3",
+            ),
+            rhs_registers=(
+                "mma_b_7_0",
+                "mma_b_7_1",
+            ),
+            operand_ty=F16,
+        )
+
+
 def test_cuda_codegen_composes_warp_tile_from_mma_instructions() -> None:
     codegen = SSACUDACodegen()
     layout = CudaMmaWarpTileLayout(
@@ -1530,12 +1948,12 @@ def test_cuda_codegen_composes_warp_tile_from_mma_instructions() -> None:
     )
 
     instruction_operands = tuple(
-        (
-            (
+        CudaMmaInstructionOperands(
+            lhs_registers=(
                 f"mma_a_7_{m_tile}_{n_tile}_{k_tile}_0",
                 f"mma_a_7_{m_tile}_{n_tile}_{k_tile}_1",
             ),
-            f"mma_b_7_{m_tile}_{n_tile}_{k_tile}_0",
+            rhs_registers=(f"mma_b_7_{m_tile}_{n_tile}_{k_tile}_0",),
         )
         for m_tile, n_tile, k_tile in layout.instruction_coordinates()
     )
@@ -1581,6 +1999,52 @@ def test_cuda_codegen_composes_warp_tile_from_mma_instructions() -> None:
     assert (
         ': "r"(mma_a_7_1_1_1_0), "r"(mma_a_7_1_1_1_1), "r"(mma_b_7_1_1_1_0)'
     ) in cuda
+
+
+def test_cuda_codegen_composes_m16n8k16_warp_tile() -> None:
+    codegen = SSACUDACodegen(target=CudaTarget.from_chip("sm_80"))
+    instruction_layout = CudaMmaM16N8K16Layout()
+    layout = CudaMmaWarpTileLayout(
+        m=16,
+        n=8,
+        k=16,
+        instruction_layout=instruction_layout,
+    )
+    result = SSAValue(
+        id=7,
+        ty=BlockType((16, 8), F32),
+    )
+    instruction_operands = (
+        CudaMmaInstructionOperands(
+            lhs_registers=(
+                "mma_a_7_0",
+                "mma_a_7_1",
+                "mma_a_7_2",
+                "mma_a_7_3",
+            ),
+            rhs_registers=(
+                "mma_b_7_0",
+                "mma_b_7_1",
+            ),
+        ),
+    )
+
+    result_ref = codegen.emit_mma_warp_tile(
+        result=result,
+        layout=layout,
+        instruction_operands=instruction_operands,
+        operand_ty=F16,
+    )
+
+    assert result_ref == CudaMmaAccumulatorRef(
+        base="v7",
+        layout=layout,
+    )
+
+    cuda = "\n".join(codegen.lines)
+
+    assert cuda.count("mma.sync.aligned.m16n8k16") == 1
+    assert "mma.sync.aligned.m16n8k8" not in cuda
 
 
 def test_cuda_codegen_emits_bf16_mma_m16n8k8_instruction() -> None:
@@ -2312,19 +2776,24 @@ def test_bf16_composable_warp_tile_lowers_to_tensor_core_for_sm80(
     )
     assert dot.result is not None
 
+    instruction_layout = CudaMmaM16N8K16Layout()
+
     assert cuda_mma_warp_tile_layouts(
         ssa_ops,
         operand_types=frozenset((F16, BF16)),
+        instruction_layout=instruction_layout,
     )[dot.result.id] == CudaMmaWarpTileLayout(
         m=32,
         n=16,
         k=16,
+        instruction_layout=instruction_layout,
     )
 
     assert cuda_src.startswith("#include <cuda_bf16.h>\n\n")
     assert "#include <cuda_fp16.h>" not in cuda_src
 
-    assert cuda_src.count("mma.sync.aligned.m16n8k8.row.col.f32.bf16.bf16.f32") == 8
+    assert cuda_src.count("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32") == 4
+    assert "mma.sync.aligned.m16n8k8" not in cuda_src
     assert cuda_src.count("ldmatrix.sync.aligned.m8n8.x4.shared.b16") == 2
     assert cuda_src.count("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16") == 1
     assert "static_cast<__nv_bfloat16_raw>" not in cuda_src
@@ -2715,6 +3184,171 @@ def test_f16_multi_warp_cta_schedule_lowers_matmul_loop(
 
     assert cuda_src.count("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32") == 4
     assert "for (int dot_k_" not in cuda_src
+
+
+@pytest.mark.codegen
+def test_sm80_production_cta_uses_m16n8k16(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MYTRITON_BACKEND", "cuda")
+
+    M, N, K = 128, 128, 32
+    BM, BK, BN = 128, 32, 128
+
+    a = np.zeros((M, K), dtype=np.float16)
+    b = np.zeros((K, N), dtype=np.float16)
+    out = np.zeros((M, N), dtype=np.float32)
+
+    tensor_core_matmul_kernel.clear_cache()
+    _, ssa_ops, _ = tensor_core_matmul_kernel[(1, 1)](
+        a,
+        b,
+        out,
+        M,
+        N,
+        K,
+        BM=BM,
+        BK=BK,
+        BN=BN,
+        num_warps=4,
+    )
+
+    schedule = CudaMatmulSchedule(
+        block_m=BM,
+        block_k=BK,
+        block_n=BN,
+        warp_m=64,
+        warp_n=64,
+        warps_m=2,
+        warps_n=2,
+    )
+    instruction_layout = CudaMmaM16N8K16Layout()
+    codegen = SSACUDACodegen(target=CudaTarget.from_chip("sm_80"))
+
+    cuda_src = codegen.generate(
+        "sm80_production_cta_matmul",
+        ssa_ops,
+        [],
+        matmul_schedule=schedule,
+    )
+
+    loop = next(item for item in ssa_ops if isinstance(item, SSAForRange))
+    dot = next(
+        item for item in loop.body if isinstance(item, SSAOp) and item.opcode == "dot"
+    )
+    assert dot.result is not None
+
+    expected_layout = CudaMmaCtaTileLayout(
+        schedule=schedule,
+        instruction_layout=instruction_layout,
+    )
+
+    assert codegen.mma_cta_dot_layouts == {
+        dot.result.id: expected_layout,
+    }
+    assert codegen.layout.output_tile_shape == (128, 128)
+    assert codegen.layout.thread_shape == (8, 16)
+    assert codegen.layout.threads_per_block == 128
+
+    assert expected_layout.warp_tile.result_shape == (64, 64)
+    assert expected_layout.warp_tile.instruction_shape == (16, 8, 16)
+    assert expected_layout.warp_tile.instruction_count == 64
+    assert expected_layout.warp_tile.accumulator_elements_per_lane == 128
+
+    assert cuda_src.count("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32") == 64
+    assert "mma.sync.aligned.m16n8k8" not in cuda_src
+
+    assert cuda_src.count("ldmatrix.sync.aligned.m8n8.x4.shared.b16") == 8
+    assert cuda_src.count("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16") == 8
+
+    assert "int mma_warp_id = threadIdx.x >> 5;" in cuda_src
+    assert "int mma_warp_m = mma_warp_id / 2;" in cuda_src
+    assert "int mma_warp_n = mma_warp_id % 2;" in cuda_src
+    assert "mma_warp_m * 64" in cuda_src
+    assert "mma_warp_n * 64" in cuda_src
+
+    assert codegen.shared_memory_bytes == 32 * 1024
+    assert "mma_result_" not in cuda_src
+    assert "__shared__ float mma_result_" not in cuda_src
+
+    assert cuda_src.count("*reinterpret_cast<float2 *>") == 64
+    assert cuda_src.count("make_float2(") == 64
+
+
+@pytest.mark.execution
+def test_sm80_production_cta_executes_with_direct_epilogue(
+    cp,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capability = int(cp.cuda.Device().compute_capability)
+    if capability < 80:
+        pytest.skip("m16n8k16 MMA requires compute capability 8.0+")
+
+    monkeypatch.setenv("MYTRITON_BACKEND", "cuda")
+
+    BM, BK, BN = 128, 32, 128
+    rng = np.random.default_rng(25)
+
+    tensor_core_matmul_kernel.clear_cache()
+
+    test_shapes = (
+        (128, 128, 32),
+        (117, 109, 29),
+    )
+
+    for M, N, K in test_shapes:
+        a_host = rng.normal(
+            0.0,
+            0.25,
+            size=(M, K),
+        ).astype(np.float16)
+        b_host = rng.normal(
+            0.0,
+            0.25,
+            size=(K, N),
+        ).astype(np.float16)
+
+        a = cp.asarray(a_host)
+        b = cp.asarray(b_host)
+        out = cp.full(
+            (M, N),
+            cp.nan,
+            dtype=cp.float32,
+        )
+
+        _, _, cuda_src = tensor_core_matmul_kernel[(1, 1)](
+            a,
+            b,
+            out,
+            M,
+            N,
+            K,
+            BM=BM,
+            BK=BK,
+            BN=BN,
+            num_warps=4,
+        )
+        cp.cuda.Stream.null.synchronize()
+
+        expected = a_host.astype(np.float32) @ b_host.astype(np.float32)
+
+        cp.testing.assert_allclose(
+            out,
+            cp.asarray(expected),
+            rtol=3e-3,
+            atol=3e-3,
+        )
+
+        assert cuda_src.count("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32") == 64
+        assert "mma.sync.aligned.m16n8k8" not in cuda_src
+
+        assert cuda_src.count("*reinterpret_cast<float2 *>") == 64
+        assert "mma_result_" not in cuda_src
+
+    assert len(tensor_core_matmul_kernel.compilation_cache) == 1
+
+    artifact = next(iter(tensor_core_matmul_kernel.compilation_cache.values()))
+    assert artifact.threads_per_block == 128
 
 
 @pytest.mark.codegen
@@ -3163,7 +3797,12 @@ def test_f16_composable_tensor_core_matmul_executes_on_cuda(
 
     expected = a_host.astype(np.float32) @ b_host.astype(np.float32)
 
-    assert cuda_src.count("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32") == 8
+    if capability >= 80:
+        assert cuda_src.count("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32") == 4
+        assert "mma.sync.aligned.m16n8k8" not in cuda_src
+    else:
+        assert cuda_src.count("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32") == 8
+        assert "mma.sync.aligned.m16n8k16" not in cuda_src
     cp.testing.assert_allclose(
         out,
         cp.asarray(expected),
@@ -3239,15 +3878,14 @@ def test_f16_multi_warp_tensor_core_matmul_executes_on_cuda(
     assert cuda_src.count("vector += 128") == 2
     assert cuda_src.count("*reinterpret_cast<uint4 *>") == 2
 
-    # One warp owns a 16x16 output tile:
-    #
-    #   M: 16 / 16 = 1 MMA tile
-    #   N: 16 / 8  = 2 MMA tiles
-    #   K: 16 / 8  = 2 MMA steps
-    #
-    # Therefore, the static CUDA source contains four mma.sync instructions.
-    # Each of the four warps executes them for its part of the 32x32 CTA tile.
-    assert cuda_src.count("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32") == 4
+    # One warp owns a 16x16 output tile. SM75 executes two K=8
+    # steps for each output fragment, while SM80 executes one K=16 step.
+    if capability >= 80:
+        assert cuda_src.count("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32") == 2
+        assert "mma.sync.aligned.m16n8k8" not in cuda_src
+    else:
+        assert cuda_src.count("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32") == 4
+        assert "mma.sync.aligned.m16n8k16" not in cuda_src
 
     cp.testing.assert_allclose(
         out,
@@ -3385,7 +4023,8 @@ def test_bf16_composable_tensor_core_matmul_executes_on_sm80(
 
     expected = a.float() @ b.float()
 
-    assert cuda_src.count("mma.sync.aligned.m16n8k8.row.col.f32.bf16.bf16.f32") == 8
+    assert cuda_src.count("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32") == 4
+    assert "mma.sync.aligned.m16n8k8" not in cuda_src
     torch.testing.assert_close(
         out,
         expected,
@@ -3463,7 +4102,8 @@ def test_bf16_multi_warp_tensor_core_matmul_executes_on_sm80(
     artifact = next(iter(tensor_core_matmul_kernel.compilation_cache.values()))
     assert artifact.threads_per_block == 128
     assert "int mma_warp_id = threadIdx.x >> 5;" in cuda_src
-    assert cuda_src.count("mma.sync.aligned.m16n8k8.row.col.f32.bf16.bf16.f32") == 4
+    assert cuda_src.count("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32") == 2
+    assert "mma.sync.aligned.m16n8k8" not in cuda_src
 
     torch.testing.assert_close(
         out,
