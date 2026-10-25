@@ -97,6 +97,9 @@ MLIR's GPU/NVVM stack to a cubin.
 - Version 22 (unreleased): Triton-style `num_warps`, inferred multi-warp
   matrix-multiplication schedules, CTA-level Tensor Core tiles, cooperative
   staging, and warp-local accumulator fragments.
+- Version 23 (unreleased): aligned 128-bit FP16/BF16 global-to-shared operand
+  staging with full-vector guards, masked scalar fallback, and reproducible
+  A100 benchmark and profiling tools.
 
 ## AST frontend
 
@@ -960,6 +963,76 @@ and expose a larger output tile per block, but `ldmatrix`, vectorized
 global-to-shared copies, `cp.async`, multi-stage overlap, and autotuning remain
 future work.
 
+### Vectorized global-to-shared staging
+
+Version 23 widens the cooperative copies that fill low-precision dot operand
+tiles. `CudaSharedBuffer` records an explicit byte alignment, and F16/BF16 dot
+buffers are declared with a 16-byte guarantee:
+
+```cuda
+__shared__ __align__(16) __nv_bfloat16 dot_lhs[1024];
+__shared__ __align__(16) __nv_bfloat16 dot_rhs[1024];
+```
+
+The copy planner starts from a 16-byte transaction and divides it by the
+element size. One transaction therefore contains eight FP16/BF16 elements or
+four FP32 elements. A vector copy is legal only when all of these conditions
+hold:
+
+- the shared allocation has at least 16-byte alignment;
+- the logical row width is divisible by the vector width;
+- the padded physical row stride is divisible by the vector width.
+
+Otherwise, lowering reuses the original scalar cooperative-load emitter. The
+current production path opts in aligned low-precision dot buffers while FP32
+buffers keep their existing scalar and conflict-padding behavior.
+
+For the best `BM=64`, `BK=16`, `BN=64`, four-warp schedule, each operand tile
+contains 1,024 BF16 or FP16 elements. Dividing by eight elements per vector
+produces exactly 128 vectors, so every CTA thread stages one vector from A and
+one from B per K tile:
+
+```cuda
+for (int vector = threadIdx.x; vector < 128; vector += 128) {
+    int index = vector * 8;
+    // Compute row, column, and the corresponding global address.
+}
+```
+
+The fast path requires the complete eight-element vector to be in bounds and
+checks the runtime global address for 16-byte alignment before reinterpreting
+the source and destination as `uint4`:
+
+```cuda
+if (vector_in_bounds &&
+    (reinterpret_cast<unsigned long long>(&source[source_index]) & 15ULL)
+        == 0ULL) {
+    *reinterpret_cast<uint4 *>(&shared[index]) =
+        *reinterpret_cast<const uint4 *>(&source[source_index]);
+}
+```
+
+The `else` branch is an unrolled lane loop. It applies the original mask to
+every element and writes the requested `other` value for an out-of-bounds
+lane. This preserves partial M, N, and K tile semantics and also handles an
+otherwise valid tile whose base pointer is not sufficiently aligned.
+
+Multi-stage buffers remain safe because a vectorizable row stride occupies a
+multiple of 16 bytes. Consequently, every row and every stage begins at the
+same required alignment relative to the explicitly aligned buffer base.
+
+On A100, NVRTC lowers the two interior operand-copy sites to two
+`LDG.E.128`/`STS.128` pairs. The best raw kernel result improves from
+24.22 to 40.83 TFLOP/s for a 4096 square BF16 matmul and from 22.91 to 38.46
+TFLOP/s for an 8192 square matmul. FP16 produces the same performance within
+measurement noise. The complete tile sweep and Nsight Compute analysis are in
+the [Version 23 performance report](../benchmarks/matmul_vectorized_staging_a100_report.md).
+
+The profiler also makes the next limitation explicit: MMA fragments are still
+assembled with many scalar `LDS.U16` instructions. Version 23 deliberately
+does not add `ldmatrix`, shared-memory swizzling, `cp.async`, or pipeline
+overlap, so each of those can be introduced and measured independently.
+
 ## Example
 
 ```python
@@ -1226,9 +1299,11 @@ these rewrite passes because they are not region-aware yet.
   divisible by 16, 8, and 8 are composed from Tensor Core
   `mma.sync.m16n8k8` instructions when the CUDA target supports them; other
   operand types, shapes, and targets retain the CUDA-core path. The
-  implementation still assigns one warp to the complete dot tile and has no
-  `ldmatrix`, vectorized operand loads, general shared-memory swizzling,
-  overlapped prefetching, asynchronous copies, or autotuning.
+  implementation supports inferred multi-warp CTA tiles and aligned 128-bit
+  FP16/BF16 global-to-shared copies with a masked scalar fallback. MMA operand
+  fragments are still assembled through scalar shared-memory loads; there is
+  no `ldmatrix`, general shared-memory swizzling, overlapped prefetching,
+  asynchronous copy pipeline, or autotuning.
   `tl.empty`, `tl.full`, and `tl.zeros` continue to represent logical
   per-thread values rather than shared-memory allocations.
 - MLIR lowering currently supports only `ptr<f32>` parameters as
@@ -1259,10 +1334,14 @@ Install the development tools:
 python -m pip install -e ".[dev]"
 ```
 
-To enable CUDA execution with CUDA 12, install the matching CuPy wheel:
+To enable CUDA execution, install the CuPy wheel matching the CUDA major:
 
 ```bash
+# CUDA 12
 python -m pip install -e ".[cuda12]"
+
+# CUDA 13
+python -m pip install -e ".[cuda13]"
 ```
 
 PyTorch is an optional runtime integration rather than a project dependency.

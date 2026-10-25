@@ -27,6 +27,7 @@ def cuda_scalar_nbytes(ty: ScalarType) -> int:
     raise TypeError(f"cannot determine CUDA storage size for {ty}")
 
 
+CUDA_COOPERATIVE_COPY_NBYTES = 16
 CUDA_SHARED_MEMORY_BANKS = 32
 
 
@@ -66,6 +67,7 @@ class CudaSharedBuffer:
     element_ty: ScalarType
     row_padding: int = 0
     stage_count: int = 1
+    alignment: int = 1
 
     def __post_init__(self) -> None:
         if len(self.logical_shape) != 2 or any(
@@ -86,6 +88,16 @@ class CudaSharedBuffer:
             raise ValueError(
                 "shared buffer stage count must be a positive integer, "
                 f"got {self.stage_count}"
+            )
+
+        if (
+            type(self.alignment) is not int
+            or self.alignment <= 0
+            or self.alignment & (self.alignment - 1)
+        ):
+            raise ValueError(
+                "shared buffer alignment must be a positive power of two, "
+                f"got {self.alignment}"
             )
 
     @property
@@ -157,6 +169,24 @@ class CudaSharedBuffer:
             )
 
         return f"{self.name}[(({stage}) * {self.stage_size}) + {element_offset}]"
+
+
+def cuda_cooperative_copy_width(buffer: CudaSharedBuffer) -> int:
+    """Return the number of elements in one aligned 128-bit tile copy."""
+
+    element_nbytes = cuda_scalar_nbytes(buffer.element_ty)
+    vector_width = CUDA_COOPERATIVE_COPY_NBYTES // element_nbytes
+
+    if buffer.alignment < CUDA_COOPERATIVE_COPY_NBYTES:
+        return 1
+
+    if buffer.columns % vector_width != 0:
+        return 1
+
+    if buffer.row_stride % vector_width != 0:
+        return 1
+
+    return vector_width
 
 
 @dataclass(frozen=True)

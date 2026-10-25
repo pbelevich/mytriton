@@ -5,6 +5,7 @@ from typing import (
     TYPE_CHECKING,
     Annotated,
     Any,
+    ClassVar,
     TypeAlias,
     get_args,
     get_origin,
@@ -608,7 +609,7 @@ class Ptr:
 
 
 class Builder:
-    _current = None
+    _current: ClassVar[Builder | None] = None
 
     def __init__(self):
         self.ops = []

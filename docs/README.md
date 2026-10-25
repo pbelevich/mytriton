@@ -19,6 +19,9 @@ compiler notes live in the [implementation guide](implementation.md).
 - [Low-precision dot](implementation.md#low-precision-types-and-mixed-precision-dot)
 - [Tensor-core `mma.sync`](implementation.md#tensor-core-dot)
 - [Composable warp MMA tiles](implementation.md#composable-warp-mma-tiles)
+- [Multi-warp CTA tiles](implementation.md#multi-warp-cta-tiles)
+- [Vectorized global-to-shared staging](implementation.md#vectorized-global-to-shared-staging)
+- [A100 Version 23 performance report](../benchmarks/matmul_vectorized_staging_a100_report.md)
 
 ## Runtime and development
 

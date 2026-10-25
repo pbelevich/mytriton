@@ -22,6 +22,7 @@ from .cuda_dot_staging import (
     CudaGlobalTilePlan,
     CudaSharedBuffer,
     SSADefinitions,
+    cuda_cooperative_copy_width,
     cuda_f32_shared_row_padding,
     cuda_scalar_nbytes,
     match_cuda_dot_double_buffering,
@@ -1450,8 +1451,9 @@ class SSACUDACodegen:
 
     def append_shared_buffer_declaration(self, buffer: CudaSharedBuffer) -> None:
         cuda_ty = self.cuda_type(buffer.element_ty)
+        alignment = f" __align__({buffer.alignment})" if buffer.alignment > 1 else ""
         self.shared_lines.append(
-            f"    __shared__ {cuda_ty} {buffer.name}[{buffer.size}];"
+            f"    __shared__{alignment} {cuda_ty} {buffer.name}[{buffer.size}];"
         )
 
     def declare_shared_buffer(
@@ -1531,6 +1533,127 @@ class SSACUDACodegen:
             ]
         )
 
+    def emit_vectorized_cooperative_load(
+        self,
+        target: CudaSharedBuffer,
+        source: CudaGlobalTile,
+        *,
+        stage: str | None = None,
+        order: tuple[int, ...] = (1, 0),
+    ) -> None:
+        vector_width = cuda_cooperative_copy_width(target)
+
+        if vector_width == 1:
+            self.emit_cooperative_load(
+                target,
+                source,
+                stage=stage,
+                order=order,
+            )
+            return
+
+        cooperative_layout = self.layout.cooperative_tile_layout(
+            target.logical_shape,
+            order=order,
+        )
+        if cooperative_layout.order != (1, 0):
+            raise ValueError(
+                "CUDA cooperative dot loads require row-major order (1, 0), "
+                f"got {cooperative_layout.order}"
+            )
+
+        vector_count = cooperative_layout.size // vector_width
+        vector_nbytes = vector_width * cuda_scalar_nbytes(target.element_ty)
+        alignment_mask = vector_nbytes - 1
+
+        vector = f"{target.name}_vector"
+        index = f"{target.name}_index"
+        row = f"{target.name}_row"
+        column = f"{target.name}_column"
+        global_row = f"{target.name}_global_row"
+        global_column = f"{target.name}_global_column"
+        source_index = f"{target.name}_source_index"
+        vector_in_bounds = f"{target.name}_vector_in_bounds"
+        lane = f"{target.name}_lane"
+        lane_global_column = f"{target.name}_lane_global_column"
+        lane_in_bounds = f"{target.name}_lane_in_bounds"
+
+        target_element = target.element(
+            row,
+            column,
+            stage=stage,
+        )
+        lane_target_element = target.element(
+            row,
+            f"{column} + {lane}",
+            stage=stage,
+        )
+        other = self.cuda_cast_expression(
+            source.other,
+            F32,
+            target.element_ty,
+        )
+
+        self.lines.extend(
+            [
+                (
+                    f"    for (int {vector} = threadIdx.x; "
+                    f"{vector} < {vector_count}; "
+                    f"{vector} += {cooperative_layout.threads_per_block}) {{"
+                ),
+                f"        int {index} = {vector} * {vector_width};",
+                f"        int {row} = {index} / {target.columns};",
+                f"        int {column} = {index} % {target.columns};",
+                f"        int {global_row} = ({source.row_offset}) + {row};",
+                (f"        int {global_column} = ({source.column_offset}) + {column};"),
+                (
+                    f"        int {source_index} = "
+                    f"{global_row} * ({source.row_stride}) + {global_column};"
+                ),
+                (
+                    f"        bool {vector_in_bounds} = "
+                    f"{global_row} < ({source.row_bound}) && "
+                    f"{global_column} + {vector_width - 1} "
+                    f"< ({source.column_bound});"
+                ),
+                (
+                    f"        if ({vector_in_bounds} && "
+                    f"(reinterpret_cast<unsigned long long>("
+                    f"&{source.base}[{source_index}]) & "
+                    f"{alignment_mask}ULL) == 0ULL) {{"
+                ),
+                (
+                    f"            *reinterpret_cast<uint4 *>("
+                    f"&{target_element}) = "
+                    f"*reinterpret_cast<const uint4 *>("
+                    f"&{source.base}[{source_index}]);"
+                ),
+                "        } else {",
+                "            #pragma unroll",
+                (
+                    f"            for (int {lane} = 0; "
+                    f"{lane} < {vector_width}; ++{lane}) {{"
+                ),
+                (
+                    f"                int {lane_global_column} = "
+                    f"{global_column} + {lane};"
+                ),
+                (
+                    f"                bool {lane_in_bounds} = "
+                    f"{global_row} < ({source.row_bound}) && "
+                    f"{lane_global_column} < ({source.column_bound});"
+                ),
+                (
+                    f"                {lane_target_element} = "
+                    f"{lane_in_bounds} ? "
+                    f"{source.base}[{source_index} + {lane}] : {other};"
+                ),
+                "            }",
+                "        }",
+                "    }",
+            ]
+        )
+
     def emit_block_barrier(self) -> None:
         self.lines.append("    __syncthreads();")
 
@@ -1552,6 +1675,8 @@ class SSACUDACodegen:
                 f"got {lhs_shape} and {rhs_shape}"
             )
 
+        shared_alignment = 16 if element_ty in (F16, BF16) else 1
+
         lhs_row_padding = (
             cuda_f32_shared_row_padding(
                 columns=lhs_shape[1],
@@ -1567,12 +1692,14 @@ class SSACUDACodegen:
             element_ty=element_ty,
             row_padding=lhs_row_padding,
             stage_count=stage_count,
+            alignment=shared_alignment,
         )
         rhs = CudaSharedBuffer(
             name=f"dot_rhs_{dot_result_id}",
             logical_shape=rhs_shape,
             element_ty=element_ty,
             stage_count=stage_count,
+            alignment=shared_alignment,
         )
 
         # Reserve both operands before mutating the generated CUDA fragment.
@@ -1580,12 +1707,12 @@ class SSACUDACodegen:
         self.append_shared_buffer_declaration(lhs)
         self.append_shared_buffer_declaration(rhs)
 
-        self.emit_cooperative_load(
+        self.emit_vectorized_cooperative_load(
             lhs,
             lhs_source,
             stage=stage,
         )
-        self.emit_cooperative_load(
+        self.emit_vectorized_cooperative_load(
             rhs,
             rhs_source,
             stage=stage,
