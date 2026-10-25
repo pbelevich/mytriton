@@ -89,10 +89,14 @@ MLIR's GPU/NVVM stack to a cubin.
   warp-fragment layouts, packed 16-bit PTX operands, fused loop-carried `f32`
   accumulation across K-tiles, fragment redistribution for masked stores,
   and CUDA execution tests covering partial boundary tiles.
-- Version 21 (unreleased): composable one-warp MMA tiles whose M, N, and K
-  dimensions are positive multiples of 16, 8, and 8, respectively; logical
-  dots are decomposed into grids of `mma.sync.m16n8k8` instructions with one
-  FP32 accumulator fragment per `16 x 8` output region.
+- [ver21](https://github.com/pbelevich/mytriton/tree/ver21): composable
+  one-warp MMA tiles whose M, N, and K dimensions are positive multiples of
+  16, 8, and 8, respectively; logical dots are decomposed into grids of
+  `mma.sync.m16n8k8` instructions with one FP32 accumulator fragment per
+  `16 x 8` output region.
+- Version 22 (unreleased): Triton-style `num_warps`, inferred multi-warp
+  matrix-multiplication schedules, CTA-level Tensor Core tiles, cooperative
+  staging, and warp-local accumulator fragments.
 
 ## AST frontend
 
@@ -816,13 +820,145 @@ current checkout, validates FP16/BF16 GPU support, and streams the complete
 pytest output. The CUDA optional dependencies include `ml_dtypes`, which CuPy
 needs to consume PyTorch BF16 storage through DLPack.
 
-The current implementation focuses on correctness and a visible end-to-end
-tensor-core lowering. A logical tile may contain multiple physical MMA atoms,
-but it is still owned by one warp. Operand fragments use repeated scalar
-shared-memory reads and packing, and the result uses an extra shared-memory
-redistribution before the store. The backend does not yet provide `ldmatrix`,
-multiple warps per output tile, asynchronous copies, software pipelining,
-fragment swizzling, or autotuning.
+Version 21 focuses on correctness and a visible end-to-end tensor-core
+lowering. A logical tile may contain multiple physical MMA atoms, but it is
+still owned by one warp. Operand fragments use repeated scalar shared-memory
+reads and packing, and the result uses an extra shared-memory redistribution
+before the store.
+
+### Multi-warp CTA tiles
+
+Version 22 extends the composable warp tile into a CTA-level matrix
+multiplication schedule. The public launch syntax follows Triton:
+
+```python
+kernel[grid](
+    *arguments,
+    num_warps=4,
+)
+```
+
+`num_warps` is a launch option rather than a kernel argument. The compiler
+removes it before binding the Python kernel signature and includes it in the
+compilation-cache key. Consequently, one-warp and four-warp launches of the
+same kernel produce independent CUDA artifacts.
+
+The current implementation accepts positive powers of two up to 32. It
+applies the option only to CUDA kernels containing a Tensor-Core-compatible
+`tl.dot`. Other CUDA kernels and the experimental MLIR backend reject it
+explicitly rather than silently ignoring the requested launch configuration.
+
+`CudaMatmulSchedule` separates the logical CTA tile from the tile owned by one
+warp:
+
+```text
+CTA tile:  block_m x block_k x block_n
+warp tile: warp_m  x block_k x warp_n
+warp grid: warps_m x warps_n
+
+block_m = warp_m * warps_m
+block_n = warp_n * warps_n
+num_warps = warps_m * warps_n
+threads_per_block = num_warps * 32
+```
+
+The scheduler enumerates factor pairs of `num_warps`, rejects candidates whose
+warp tiles cannot be composed from `m16n8k8`, and prefers the candidate with
+the most square warp tile. A secondary score prefers a balanced warp grid.
+
+For this launch:
+
+```python
+BM, BK, BN = 32, 16, 32
+
+kernel[grid](
+    a,
+    b,
+    out,
+    M,
+    N,
+    K,
+    BM=BM,
+    BK=BK,
+    BN=BN,
+    num_warps=4,
+)
+```
+
+the inferred schedule is:
+
+```text
+CTA tile:  32 x 16 x 32
+warp grid: 2 x 2
+warp tile: 16 x 16
+threads:   4 * 32 = 128
+```
+
+CUDA lowering derives the physical warp and lane IDs from `threadIdx.x`:
+
+```cuda
+int mma_warp_id = threadIdx.x >> 5;
+int mma_lane_id = threadIdx.x & 31;
+int mma_warp_m = mma_warp_id / 2;
+int mma_warp_n = mma_warp_id % 2;
+```
+
+The warp coordinates select a disjoint part of the CTA output:
+
+```text
+warp 0 -> rows  0..15, columns  0..15
+warp 1 -> rows  0..15, columns 16..31
+warp 2 -> rows 16..31, columns  0..15
+warp 3 -> rows 16..31, columns 16..31
+```
+
+Each warp tile is still composed from the Version 21 physical instruction
+layout. A `16 x 16 x 16` warp tile requires:
+
+```text
+M atoms = 16 / 16 = 1
+N atoms = 16 / 8  = 2
+K atoms = 16 / 8  = 2
+
+mma.sync instructions per warp = 1 * 2 * 2 = 4
+```
+
+The CUDA source therefore contains four static `mma.sync` instructions. Every
+warp executes those instructions with different shared-memory offsets, so the
+CTA performs sixteen MMA operations in total.
+
+All CTA threads cooperatively load the complete A and B tiles into shared
+memory. The generated copy loops advance by the complete block size:
+
+```cuda
+for (int index = threadIdx.x; index < tile_size; index += 128) {
+    // masked global-to-shared copy
+}
+```
+
+After the block barrier, each warp reads only the fragments belonging to its
+warp tile. A uses `mma_warp_m` to offset rows, while B uses `mma_warp_n` to
+offset columns. K remains shared because every warp traverses the same
+reduction tile.
+
+Each warp carries its own FP32 accumulator fragments through the runtime
+K-loop. After the loop, the warps spill those fragments into disjoint regions
+of one row-major shared result tile. A block barrier makes the entire CTA
+result visible before the ordinary register-tile store path performs masked
+global stores. This preserves partial M and N boundary handling without
+requiring the frontend or SSA representation to understand physical warp
+fragments.
+
+The compiler infers the schedule both before and after SSA optimization.
+Verification therefore uses the same thread-block size as CUDA generation
+even if dead-code elimination changes the operations contributing to layout
+inference.
+
+Version 22 intentionally keeps scalar shared-memory fragment loads and the
+existing synchronous staging pipeline. Multi-warp CTAs improve operand reuse
+and expose a larger output tile per block, but `ldmatrix`, vectorized
+global-to-shared copies, `cp.async`, multi-stage overlap, and autotuning remain
+future work.
 
 ## Example
 

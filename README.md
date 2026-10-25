@@ -10,8 +10,8 @@
 Triton-style Python kernel becomes GPU code. It parses kernel source, builds a
 symbolic IR, lowers it to verified typed SSA, and emits CUDA C++ with inline
 PTX. The current development version includes shared-memory tiled matrix
-multiplication, FP16/BF16 inputs, FP32 accumulation, and composable one-warp
-Tensor Core tiles built from NVIDIA `mma.sync` instructions.
+multiplication, FP16/BF16 inputs, FP32 accumulation, and multi-warp Tensor Core
+CTA tiles built from NVIDIA `mma.sync` instructions.
 
 ```text
 Python kernel
@@ -54,6 +54,7 @@ full [changelog](CHANGELOG.md) and the accompanying
 | [`ver19`](https://github.com/pbelevich/mytriton/tree/ver19) | [Mixed-precision types and casts](https://pbelevich.github.io/2026/09/12/My_Triton_From_Scratch_Part_19_Mixed_Precision_Types.html) |
 | [`ver20`](https://github.com/pbelevich/mytriton/tree/ver20) | [Tensor-core `mma.sync` lowering](https://pbelevich.github.io/2026/09/13/My_Triton_From_Scratch_Part_20_Tensor_Cores.html) |
 | [`ver21`](https://github.com/pbelevich/mytriton/tree/ver21) | [Composable warp MMA tiles](docs/implementation.md#composable-warp-mma-tiles) |
+| [`ver22`](https://github.com/pbelevich/mytriton/tree/ver22) | [Multi-warp Tensor Core CTAs](docs/implementation.md#multi-warp-cta-tiles) |
 
 ## Tensor-core matmul
 
@@ -111,7 +112,7 @@ def matmul_kernel(
 
 
 M, N, K = 128, 128, 128
-BM, BK, BN = 32, 16, 16
+BM, BK, BN = 32, 16, 32
 
 torch.manual_seed(0)
 a = torch.randn((M, K), device="cuda", dtype=torch.float16)
@@ -129,14 +130,17 @@ _, _, cuda_source = matmul_kernel[grid](
     BM=BM,
     BK=BK,
     BN=BN,
+    num_warps=4,
 )
 
 expected = a.float() @ b.float()
 torch.testing.assert_close(out, expected, rtol=3e-3, atol=3e-3)
 ```
 
-A logical `32 x 16 x 16` dot is composed from eight physical `m16n8k8`
-instructions. Each instruction has the canonical form:
+The `32 x 16 x 32` CTA tile is divided into a `2 x 2` warp grid. Each warp
+owns a `16 x 16` output tile and executes four physical `m16n8k8`
+instructions. The generated source contains four static MMA instructions,
+which are executed independently by all four warps:
 
 ```cuda
 asm volatile(

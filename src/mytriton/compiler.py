@@ -3,10 +3,23 @@ import os
 from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, replace
-from typing import Any, Generic, Literal, ParamSpec, TypeAlias, cast
+from typing import (
+    Any,
+    Generic,
+    Literal,
+    ParamSpec,
+    Protocol,
+    TypeAlias,
+    cast,
+    overload,
+)
 
 from .ast_frontend import trace
-from .block_shapes import cuda_threads_per_block
+from .block_shapes import (
+    CudaMatmulSchedule,
+    cuda_threads_per_block,
+    infer_cuda_matmul_schedule,
+)
 from .cuda_codegen import SSACUDACodegen
 from .cuda_target import DEFAULT_CUDA_TARGET, CudaTarget
 from .cuda_utils import (
@@ -22,6 +35,9 @@ from .optim import ConstantFoldPass, CSEPass, DCEPass, PassManager
 from .ssa import SSAItem, SSALowering
 from .ssa_verification import SSAVerifier
 from .trace import (
+    BF16,
+    F16,
+    ScalarType,
     is_constexpr_annotation,
     make_runtime_params,
 )
@@ -33,7 +49,38 @@ Grid: TypeAlias = LaunchDimensions | Callable[[Meta], LaunchDimensions]
 CompilationResult: TypeAlias = tuple[list[Any], list[SSAItem], str]
 
 
+class KernelLauncher(Protocol[P]):
+    @overload
+    def __call__(
+        self,
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> CompilationResult: ...
+
+    @overload
+    def __call__(
+        self,
+        *args: Any,
+        num_warps: int,
+        **kwargs: Any,
+    ) -> CompilationResult: ...
+
+
 Backend: TypeAlias = Literal["cuda", "mlir"]
+
+
+def _cuda_mma_operand_types(
+    target: CudaTarget,
+) -> frozenset[ScalarType]:
+    operand_types: set[ScalarType] = set()
+
+    if target.supports_f16_mma_m16n8k8:
+        operand_types.add(F16)
+
+    if target.supports_bf16_mma_m16n8k8:
+        operand_types.add(BF16)
+
+    return frozenset(operand_types)
 
 
 def _constexpr_key(
@@ -87,9 +134,34 @@ class CompiledKernel(Generic[P]):
             )
         return cast(Backend, selected)
 
-    def __getitem__(self, grid: Grid) -> Callable[P, CompilationResult]:
+    def __getitem__(
+        self,
+        grid: Grid,
+    ) -> KernelLauncher[P]:
 
-        def launch(*args: P.args, **kwargs: P.kwargs) -> CompilationResult:
+        def launch(
+            *args: Any,
+            **kwargs: Any,
+        ) -> CompilationResult:
+            num_warps: int | None = kwargs.pop(
+                "num_warps",
+                None,
+            )
+
+            if num_warps is not None and (
+                type(num_warps) is not int
+                or num_warps <= 0
+                or num_warps & (num_warps - 1)
+            ):
+                raise ValueError(
+                    f"num_warps must be a positive power of two, got {num_warps}"
+                )
+
+            if num_warps is not None and num_warps > 32:
+                raise ValueError(
+                    f"CUDA kernels support at most 32 warps per block, got {num_warps}"
+                )
+
             bound = self.signature.bind(*args, **kwargs)
             bound.apply_defaults()
 
@@ -130,11 +202,20 @@ class CompiledKernel(Generic[P]):
                 except CudaUnavailableError:
                     chip = "sm_80"
 
+            if backend != "cuda" and num_warps is not None:
+                raise ValueError(
+                    "num_warps launch option is currently supported "
+                    "only by the CUDA backend"
+                )
+
+            supported_mma_operand_types = _cuda_mma_operand_types(cuda_target)
+
             cache_key = (
                 backend,
                 chip,
                 tuple(param.ty for param in params),
                 _constexpr_key(meta),
+                num_warps,
             )
 
             artifact = self.compilation_cache.get(cache_key)
@@ -147,7 +228,25 @@ class CompiledKernel(Generic[P]):
                     runtime_params=params,
                 )
                 ssa_ops = SSALowering().lower(ops)
-                threads_per_block = cuda_threads_per_block(ssa_ops)
+
+                matmul_schedule: CudaMatmulSchedule | None = None
+                if num_warps is not None:
+                    matmul_schedule = infer_cuda_matmul_schedule(
+                        ssa_ops,
+                        num_warps=num_warps,
+                        operand_types=supported_mma_operand_types,
+                    )
+                    if matmul_schedule is None:
+                        raise ValueError(
+                            "num_warps currently requires a "
+                            "tensor-core-compatible tl.dot"
+                        )
+
+                threads_per_block = cuda_threads_per_block(
+                    ssa_ops,
+                    matmul_schedule=matmul_schedule,
+                    mma_operand_types=supported_mma_operand_types,
+                )
 
                 # The optimizer assumes lowering produced valid SSA.
                 verifier = SSAVerifier(threads_per_block)
@@ -166,7 +265,23 @@ class CompiledKernel(Generic[P]):
 
                 # Recompute after optimization: DCE/CSE may remove the vector
                 # ops that originally determined the CUDA block size.
-                threads_per_block = cuda_threads_per_block(ssa_ops)
+                if num_warps is not None:
+                    matmul_schedule = infer_cuda_matmul_schedule(
+                        ssa_ops,
+                        num_warps=num_warps,
+                        operand_types=supported_mma_operand_types,
+                    )
+                    if matmul_schedule is None:
+                        raise ValueError(
+                            "optimized SSA no longer contains a "
+                            "tensor-core-compatible tl.dot"
+                        )
+
+                threads_per_block = cuda_threads_per_block(
+                    ssa_ops,
+                    matmul_schedule=matmul_schedule,
+                    mma_operand_types=supported_mma_operand_types,
+                )
                 SSAVerifier(threads_per_block).verify(ssa_ops)
 
                 cubin = None
@@ -177,6 +292,7 @@ class CompiledKernel(Generic[P]):
                         self.fn.__name__,
                         ssa_ops,
                         params,
+                        matmul_schedule=matmul_schedule,
                     )
 
                 artifact = _CompilationArtifact(
@@ -226,7 +342,7 @@ class CompiledKernel(Generic[P]):
                 artifact.src,
             )
 
-        return launch
+        return cast(KernelLauncher[P], launch)
 
 
 def jit(fn: Callable[P, Any]) -> CompiledKernel[P]:
