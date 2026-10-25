@@ -66,6 +66,10 @@ class CudaTarget:
     def supports_ldmatrix(self) -> bool:
         return self.compute_capability >= 75
 
+    @property
+    def supports_cp_async(self) -> bool:
+        return self.compute_capability >= 80
+
 
 # Compilation-only calls do not select a CUDA device. sm_75 is the oldest target
 # supported by the current f16 tensor-core lowering and remains a conservative

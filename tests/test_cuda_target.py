@@ -38,18 +38,21 @@ def test_cuda_target_reports_mma_features() -> None:
     assert not sm_70.supports_f16_mma_m16n8k16
     assert not sm_70.supports_bf16_mma_m16n8k16
     assert not sm_70.supports_ldmatrix
+    assert not sm_70.supports_cp_async
 
     assert sm_75.supports_f16_mma_m16n8k8
     assert not sm_75.supports_bf16_mma_m16n8k8
     assert not sm_75.supports_f16_mma_m16n8k16
     assert not sm_75.supports_bf16_mma_m16n8k16
     assert sm_75.supports_ldmatrix
+    assert not sm_75.supports_cp_async
 
     assert sm_80.supports_f16_mma_m16n8k8
     assert sm_80.supports_bf16_mma_m16n8k8
     assert sm_80.supports_f16_mma_m16n8k16
     assert sm_80.supports_bf16_mma_m16n8k16
     assert sm_80.supports_ldmatrix
+    assert sm_80.supports_cp_async
 
 
 def test_default_cuda_target_is_sm75() -> None:

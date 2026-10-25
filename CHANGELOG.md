@@ -6,6 +6,22 @@ were built.
 
 ## Unreleased
 
+### Version 26: Pipelined Tensor Core GEMM
+
+- Added target-aware SM80 `cp.async` lowering with three shared-memory stages,
+  explicit commit/wait groups, and overlap between the next global-memory tile
+  and current `ldmatrix`/MMA work.
+- Added a scalar zero-filling fallback for partial or misaligned vectors, so
+  irregular matrix tails retain the same correctness as synchronous staging.
+- Consumed operand fragments one K slice at a time and selected eight warps for
+  the `128x32x128` benchmark default, reducing the production configuration to
+  126 registers per thread at 25% measured/theoretical occupancy.
+- Improved A100 BF16 `4096^3` raw throughput from Version 25's 63.19 TFLOP/s to
+  146.21 TFLOP/s in the final 30-sample run, with 162.49 TFLOP/s observed in
+  the warp-count sweep. FP16 reaches 166.11 TFLOP/s.
+- Added reproducible benchmark/NCU defaults and full/tail A100 execution
+  coverage for the pipelined kernel.
+
 ### Version 25: SM80 production Tensor Core tile
 
 - Added target-aware `mma.sync.m16n8k16` lowering for FP16 and BF16 on
