@@ -491,6 +491,7 @@ class SSACUDACodegen:
         layout: CudaMmaWarpTileLayout,
         cta_layout: CudaMmaCtaTileLayout | None = None,
         stage: str | None = None,
+        k_tile: int | None = None,
     ) -> tuple[CudaMmaInstructionOperands, ...]:
         """Load packed operands for every physical MMA instruction."""
 
@@ -565,6 +566,13 @@ class SSACUDACodegen:
         half_instruction_m = instruction_m // 2
         k_matrices = instruction_k // 8
 
+        if k_tile is not None and not 0 <= k_tile < layout.k_tiles:
+            raise ValueError(
+                f"MMA K tile must be between 0 and {layout.k_tiles - 1}, got {k_tile}"
+            )
+
+        selected_k_tiles = range(layout.k_tiles) if k_tile is None else (k_tile,)
+
         def add_offset(expression: str, offset: int) -> str:
             if offset == 0:
                 return expression
@@ -573,7 +581,7 @@ class SSACUDACodegen:
             return f"{expression} + {offset}"
 
         lhs_matrices: list[tuple[tuple[int, int, int], tuple[str, str]]] = []
-        for k_tile in range(layout.k_tiles):
+        for selected_k_tile in selected_k_tiles:
             for m_tile in range(layout.m_tiles):
                 row_offset = m_tile * instruction_m
                 if lhs_warp_row_offset is None:
@@ -587,23 +595,23 @@ class SSACUDACodegen:
                     )
 
                 for k_matrix in range(k_matrices):
-                    column = str(k_tile * instruction_k + k_matrix * 8)
+                    column = str(selected_k_tile * instruction_k + k_matrix * 8)
                     first_fragment = k_matrix * 2
                     lhs_matrices.extend(
                         (
                             (
-                                (m_tile, k_tile, first_fragment),
+                                (m_tile, selected_k_tile, first_fragment),
                                 (row, column),
                             ),
                             (
-                                (m_tile, k_tile, first_fragment + 1),
+                                (m_tile, selected_k_tile, first_fragment + 1),
                                 (second_row, column),
                             ),
                         )
                     )
 
         rhs_matrices: list[tuple[tuple[int, int, int], tuple[str, str]]] = []
-        for k_tile in range(layout.k_tiles):
+        for selected_k_tile in selected_k_tiles:
             for n_tile in range(layout.n_tiles):
                 column_offset = n_tile * instruction_n
                 if rhs_warp_column_offset is None:
@@ -615,10 +623,10 @@ class SSACUDACodegen:
                     )
 
                 for k_matrix in range(k_matrices):
-                    row = str(k_tile * instruction_k + k_matrix * 8)
+                    row = str(selected_k_tile * instruction_k + k_matrix * 8)
                     rhs_matrices.append(
                         (
-                            (k_tile, n_tile, k_matrix),
+                            (selected_k_tile, n_tile, k_matrix),
                             (row, column),
                         )
                     )
@@ -653,31 +661,38 @@ class SSACUDACodegen:
                 batch_index += 1
             return loaded
 
+        register_suffix = "" if k_tile is None else f"_k{k_tile}"
         lhs_registers = emit_matrix_batches(
-            prefix=f"mma_a_{result_id}",
+            prefix=f"mma_a_{result_id}{register_suffix}",
             matrices=lhs_matrices,
             transpose=False,
             buffer=buffers.lhs,
         )
         rhs_registers = emit_matrix_batches(
-            prefix=f"mma_b_{result_id}",
+            prefix=f"mma_b_{result_id}{register_suffix}",
             matrices=rhs_matrices,
             transpose=True,
             buffer=buffers.rhs,
         )
 
+        instruction_coordinates = tuple(
+            coordinates
+            for coordinates in layout.instruction_coordinates()
+            if k_tile is None or coordinates[2] == k_tile
+        )
+
         return tuple(
             CudaMmaInstructionOperands(
                 lhs_registers=tuple(
-                    lhs_registers[(m_tile, k_tile, fragment)]
+                    lhs_registers[(m_tile, selected_k_tile, fragment)]
                     for fragment in range(k_matrices * 2)
                 ),
                 rhs_registers=tuple(
-                    rhs_registers[(k_tile, n_tile, fragment)]
+                    rhs_registers[(selected_k_tile, n_tile, fragment)]
                     for fragment in range(k_matrices)
                 ),
             )
-            for m_tile, n_tile, k_tile in layout.instruction_coordinates()
+            for m_tile, n_tile, selected_k_tile in instruction_coordinates
         )
 
     def emit_mma_m16n8k8_instruction(
@@ -849,6 +864,105 @@ class SSACUDACodegen:
 
         self.values[result.id] = result_ref
         return result_ref
+
+    def emit_mma_warp_tile_k_slices_in_place(
+        self,
+        *,
+        result: SSAValue,
+        buffers: CudaDotSharedBuffers,
+        layout: CudaMmaWarpTileLayout,
+        cta_layout: CudaMmaCtaTileLayout | None,
+        accumulator: CudaMmaAccumulatorRef,
+        stage: str,
+    ) -> None:
+        """Load and consume one K fragment at a time into an existing accumulator."""
+
+        if (
+            accumulator.warp_tile_layout != layout
+            or accumulator.cta_layout != cta_layout
+        ):
+            raise TypeError(
+                "pipelined MMA requires a compatible accumulator layout, "
+                f"got {accumulator.layout}"
+            )
+
+        operand_ty = buffers.lhs.element_ty
+
+        for k_tile in range(layout.k_tiles):
+            instruction_operands = self.emit_mma_warp_tile_operand_registers(
+                result_id=result.id,
+                buffers=buffers,
+                layout=layout,
+                cta_layout=cta_layout,
+                stage=stage,
+                k_tile=k_tile,
+            )
+            coordinates = tuple(
+                coordinates
+                for coordinates in layout.instruction_coordinates()
+                if coordinates[2] == k_tile
+            )
+
+            for (m_tile, n_tile, _), operands in zip(
+                coordinates,
+                instruction_operands,
+                strict=True,
+            ):
+                fragment = accumulator.fragment_elements(
+                    m_tile=m_tile,
+                    n_tile=n_tile,
+                )
+                accumulator_registers = (
+                    fragment[0],
+                    fragment[1],
+                    fragment[2],
+                    fragment[3],
+                )
+
+                if isinstance(
+                    layout.instruction_layout,
+                    CudaMmaM16N8K16Layout,
+                ):
+                    if (
+                        len(operands.lhs_registers) != 4
+                        or len(operands.rhs_registers) != 2
+                    ):
+                        raise ValueError(
+                            "m16n8k16 requires four A registers and two B registers"
+                        )
+                    self.emit_mma_m16n8k16_instruction(
+                        accumulator_registers=accumulator_registers,
+                        lhs_registers=(
+                            operands.lhs_registers[0],
+                            operands.lhs_registers[1],
+                            operands.lhs_registers[2],
+                            operands.lhs_registers[3],
+                        ),
+                        rhs_registers=(
+                            operands.rhs_registers[0],
+                            operands.rhs_registers[1],
+                        ),
+                        operand_ty=operand_ty,
+                    )
+                else:
+                    if (
+                        len(operands.lhs_registers) != 2
+                        or len(operands.rhs_registers) != 1
+                    ):
+                        raise ValueError(
+                            "m16n8k8 requires two A registers and one B register"
+                        )
+                    self.emit_mma_m16n8k8_instruction(
+                        accumulator_registers=accumulator_registers,
+                        lhs_registers=(
+                            operands.lhs_registers[0],
+                            operands.lhs_registers[1],
+                        ),
+                        rhs_register=operands.rhs_registers[0],
+                        operand_ty=operand_ty,
+                    )
+
+        self.values[result.id] = accumulator
 
     def emit_mma_warp_tile(
         self,
@@ -1744,7 +1858,6 @@ class SSACUDACodegen:
             F32,
             target.element_ty,
         )
-
         self.lines.extend(
             [
                 (
@@ -1895,6 +2008,149 @@ class SSACUDACodegen:
             ]
         )
 
+    def emit_cp_async_cooperative_load(
+        self,
+        target: CudaSharedBuffer,
+        source: CudaGlobalTile,
+        *,
+        stage: str,
+        indent: str = "",
+    ) -> None:
+        """Issue zero-filling 16-byte global-to-shared copies for one tile."""
+
+        if not self.target.supports_cp_async:
+            raise TypeError(f"cp.async requires sm_80+, got {self.target.chip}")
+
+        vector_width = cuda_cooperative_copy_width(target)
+        if vector_width * cuda_scalar_nbytes(target.element_ty) != 16:
+            raise TypeError(
+                "cp.async staging requires aligned 16-byte shared vectors, "
+                f"got width {vector_width} for {target.element_ty}"
+            )
+
+        cooperative_layout = self.layout.cooperative_tile_layout(
+            target.logical_shape,
+            order=(1, 0),
+        )
+        vector_count = cooperative_layout.size // vector_width
+        prefix = f"{target.name}_async"
+        vector = f"{prefix}_vector"
+        index = f"{prefix}_index"
+        row = f"{prefix}_row"
+        column = f"{prefix}_column"
+        global_row = f"{prefix}_global_row"
+        global_column = f"{prefix}_global_column"
+        source_index = f"{prefix}_source_index"
+        valid_elements = f"{prefix}_valid_elements"
+        destination_address = f"{prefix}_destination"
+        lane = f"{prefix}_lane"
+        full_tile = f"{prefix}_full_tile"
+        target_element = target.element(row, column, stage=stage)
+        lane_target_element = target.element(
+            row,
+            f"{column} + {lane}",
+            stage=stage,
+        )
+        other = self.cuda_cast_expression(
+            source.other,
+            F32,
+            target.element_ty,
+        )
+        element_nbytes = cuda_scalar_nbytes(target.element_ty)
+
+        lines = [
+            (
+                f"bool {full_tile} = ({source.row_offset}) + {target.rows} "
+                f"<= ({source.row_bound}) && ({source.column_offset}) + "
+                f"{target.columns} <= ({source.column_bound}) && "
+                f"((({source.row_stride}) * {element_nbytes}) & 15) == 0 && "
+                f"(reinterpret_cast<unsigned long long>(&{source.base}["
+                f"({source.row_offset}) * ({source.row_stride}) + "
+                f"({source.column_offset})]) & 15ULL) == 0ULL;"
+            ),
+            f"if ({full_tile}) {{",
+            "    #pragma unroll",
+            (
+                f"    for (int {vector} = threadIdx.x; {vector} < {vector_count}; "
+                f"{vector} += {cooperative_layout.threads_per_block}) {{"
+            ),
+            f"        int {index} = {vector} * {vector_width};",
+            f"        int {row} = {index} / {target.columns};",
+            f"        int {column} = {index} % {target.columns};",
+            f"        int {global_row} = ({source.row_offset}) + {row};",
+            f"        int {global_column} = ({source.column_offset}) + {column};",
+            (
+                f"        int {source_index} = "
+                f"{global_row} * ({source.row_stride}) + {global_column};"
+            ),
+            (
+                f"        unsigned {destination_address} = static_cast<unsigned>("
+                f"__cvta_generic_to_shared(&{target_element}));"
+            ),
+            "        asm volatile(",
+            '            "cp.async.cg.shared.global.L2::128B [%0], [%1], 16;"',
+            "            :",
+            (
+                f'            : "r"({destination_address}), '
+                f'"l"(&{source.base}[{source_index}])'
+            ),
+            '            : "memory"',
+            "        );",
+            "    }",
+            "} else {",
+            "    #pragma unroll",
+            (
+                f"    for (int {vector} = threadIdx.x; {vector} < {vector_count}; "
+                f"{vector} += {cooperative_layout.threads_per_block}) {{"
+            ),
+            f"        int {index} = {vector} * {vector_width};",
+            f"        int {row} = {index} / {target.columns};",
+            f"        int {column} = {index} % {target.columns};",
+            f"        int {global_row} = ({source.row_offset}) + {row};",
+            f"        int {global_column} = ({source.column_offset}) + {column};",
+            (
+                f"        int {source_index} = "
+                f"{global_row} * ({source.row_stride}) + {global_column};"
+            ),
+            (
+                f"        int {valid_elements} = {global_row} < ({source.row_bound}) "
+                f"? (({source.column_bound}) - {global_column} <= 0 ? 0 : "
+                f"(({source.column_bound}) - {global_column} < {vector_width} "
+                f"? ({source.column_bound}) - {global_column} : {vector_width})) : 0;"
+            ),
+            "        #pragma unroll",
+            (f"        for (int {lane} = 0; {lane} < {vector_width}; ++{lane}) {{"),
+            (
+                f"            {lane_target_element} = {lane} < {valid_elements} "
+                f"? {source.base}[{source_index} + {lane}] : {other};"
+            ),
+            "        }",
+            "    }",
+            "}",
+        ]
+        self.lines.extend(f"{indent}    {line}" for line in lines)
+
+    def emit_cp_async_commit_group(self, *, indent: str = "") -> None:
+        self.lines.append(
+            f'{indent}    asm volatile("cp.async.commit_group;" : : : "memory");'
+        )
+
+    def emit_cp_async_wait_group(
+        self,
+        pending_groups: int,
+        *,
+        indent: str = "",
+    ) -> None:
+        if type(pending_groups) is not int or not 0 <= pending_groups <= 7:
+            raise ValueError(
+                "cp.async pending group count must be between 0 and 7, "
+                f"got {pending_groups}"
+            )
+        self.lines.append(
+            f'{indent}    asm volatile("cp.async.wait_group {pending_groups};" '
+            ': : : "memory");'
+        )
+
     def emit_block_barrier(self) -> None:
         self.lines.append("    __syncthreads();")
 
@@ -1910,6 +2166,39 @@ class SSACUDACodegen:
         stage_count: int = 1,
         stage: str | None = None,
     ) -> CudaDotSharedBuffers:
+        buffers = self.declare_dot_operand_buffers(
+            dot_result_id=dot_result_id,
+            lhs_shape=lhs_shape,
+            rhs_shape=rhs_shape,
+            element_ty=element_ty,
+            stage_count=stage_count,
+        )
+
+        self.emit_vectorized_cooperative_load(
+            buffers.lhs,
+            lhs_source,
+            stage=stage,
+        )
+        self.emit_vectorized_cooperative_load(
+            buffers.rhs,
+            rhs_source,
+            stage=stage,
+        )
+        self.emit_block_barrier()
+
+        return buffers
+
+    def declare_dot_operand_buffers(
+        self,
+        *,
+        dot_result_id: int,
+        lhs_shape: tuple[int, ...],
+        rhs_shape: tuple[int, ...],
+        element_ty: ScalarType,
+        stage_count: int,
+    ) -> CudaDotSharedBuffers:
+        """Allocate staged shared storage without emitting producer copies."""
+
         if len(lhs_shape) != 2 or len(rhs_shape) != 2 or lhs_shape[1] != rhs_shape[0]:
             raise ValueError(
                 "dot staging expects compatible rank-2 operands, "
@@ -1924,7 +2213,6 @@ class SSACUDACodegen:
         swizzle_segment_width = (
             16 // cuda_scalar_nbytes(element_ty) if uses_ldmatrix else 0
         )
-
         lhs_row_padding = (
             cuda_f32_shared_row_padding(
                 columns=lhs_shape[1],
@@ -1956,18 +2244,6 @@ class SSACUDACodegen:
         self.reserve_shared_memory(lhs.nbytes + rhs.nbytes)
         self.append_shared_buffer_declaration(lhs)
         self.append_shared_buffer_declaration(rhs)
-
-        self.emit_vectorized_cooperative_load(
-            lhs,
-            lhs_source,
-            stage=stage,
-        )
-        self.emit_vectorized_cooperative_load(
-            rhs,
-            rhs_source,
-            stage=stage,
-        )
-        self.emit_block_barrier()
 
         return CudaDotSharedBuffers(
             lhs=lhs,
@@ -2366,6 +2642,184 @@ class SSACUDACodegen:
         )
         self.assign(result, f"{shared}[0]")
 
+    def emit_pipelined_tensor_core_loop(
+        self,
+        *,
+        loop: SSAForRange,
+        plan_dot_result_id: int,
+        accumulation_result_id: int,
+        mma_layout: CudaMmaWarpTileLayout,
+        cta_layout: CudaMmaCtaTileLayout | None,
+        accumulator: CudaMmaAccumulatorRef,
+        start: str,
+        stop: str,
+        step: str,
+    ) -> bool:
+        """Emit an SM80 three-stage cp.async loop when its contract is met."""
+
+        if not self.target.supports_cp_async:
+            return False
+
+        dot = next(
+            (
+                item
+                for item in loop.body
+                if isinstance(item, SSAOp)
+                and item.opcode == "dot"
+                and item.result is not None
+                and item.result.id == plan_dot_result_id
+            ),
+            None,
+        )
+        if dot is None or dot.result is None:
+            return False
+
+        lhs_operand, rhs_operand = dot.operands
+        if (
+            not isinstance(lhs_operand, SSAValue)
+            or not isinstance(lhs_operand.ty, BlockType)
+            or not isinstance(rhs_operand, SSAValue)
+            or not isinstance(rhs_operand.ty, BlockType)
+        ):
+            return False
+
+        element_ty = lhs_operand.ty.element
+        if element_ty not in (F16, BF16) or rhs_operand.ty.element != element_ty:
+            return False
+
+        stage_count = 3
+        required_shared_bytes = (
+            stage_count
+            * (math.prod(lhs_operand.ty.shape) + math.prod(rhs_operand.ty.shape))
+            * cuda_scalar_nbytes(element_ty)
+        )
+        if (
+            self.shared_memory_bytes + required_shared_bytes
+            > self.MAX_SHARED_MEMORY_BYTES
+        ):
+            return False
+
+        staging_plan = self.staging_analysis.plan_for(plan_dot_result_id)
+        placeholder = f"pipeline_k_{plan_dot_result_id}"
+        self.values[loop.index.id] = placeholder
+        lhs_source = self.resolve_global_tile(staging_plan.lhs)
+        rhs_source = self.resolve_global_tile(staging_plan.rhs)
+        buffers = self.declare_dot_operand_buffers(
+            dot_result_id=plan_dot_result_id,
+            lhs_shape=lhs_operand.ty.shape,
+            rhs_shape=rhs_operand.ty.shape,
+            element_ty=element_ty,
+            stage_count=stage_count,
+        )
+
+        def sources_at(k_expression: str) -> tuple[CudaGlobalTile, CudaGlobalTile]:
+            return (
+                CudaGlobalTile(
+                    base=lhs_source.base,
+                    row_offset=lhs_source.row_offset,
+                    column_offset=k_expression,
+                    row_stride=lhs_source.row_stride,
+                    row_bound=lhs_source.row_bound,
+                    column_bound=lhs_source.column_bound,
+                    other=lhs_source.other,
+                ),
+                CudaGlobalTile(
+                    base=rhs_source.base,
+                    row_offset=k_expression,
+                    column_offset=rhs_source.column_offset,
+                    row_stride=rhs_source.row_stride,
+                    row_bound=rhs_source.row_bound,
+                    column_bound=rhs_source.column_bound,
+                    other=rhs_source.other,
+                ),
+            )
+
+        tile = f"dot_pipeline_tile_{plan_dot_result_id}"
+        tile_count = f"dot_pipeline_tiles_{plan_dot_result_id}"
+        prefetch = f"dot_pipeline_prefetch_{plan_dot_result_id}"
+        prefetch_k = f"dot_pipeline_prefetch_k_{plan_dot_result_id}"
+        write_stage = f"dot_pipeline_write_stage_{plan_dot_result_id}"
+        read_stage = f"dot_pipeline_read_stage_{plan_dot_result_id}"
+
+        self.lines.append(
+            f"    int {tile_count} = (({stop}) - ({start}) + ({step}) - 1) / ({step});"
+        )
+        self.lines.append(
+            f"    for (int {prefetch} = 0; {prefetch} < 2; ++{prefetch}) {{"
+        )
+        self.lines.append(f"        if ({prefetch} < {tile_count}) {{")
+        self.lines.append(
+            f"            int {prefetch_k} = ({start}) + {prefetch} * ({step});"
+        )
+        self.lines.append(
+            f"            int {write_stage} = {prefetch} % {stage_count};"
+        )
+        prologue_lhs, prologue_rhs = sources_at(prefetch_k)
+        self.emit_cp_async_cooperative_load(
+            buffers.lhs,
+            prologue_lhs,
+            stage=write_stage,
+            indent="        ",
+        )
+        self.emit_cp_async_cooperative_load(
+            buffers.rhs,
+            prologue_rhs,
+            stage=write_stage,
+            indent="        ",
+        )
+        self.lines.append("        }")
+        self.emit_cp_async_commit_group(indent="    ")
+        self.lines.append("    }")
+        self.emit_cp_async_wait_group(1)
+        self.emit_block_barrier()
+
+        self.lines.append(
+            f"    for (int {tile} = 0; {tile} < {tile_count}; ++{tile}) {{"
+        )
+        self.lines.append(f"        int {prefetch} = {tile} + 2;")
+        self.lines.append(f"        if ({prefetch} < {tile_count}) {{")
+        self.lines.append(
+            f"            int {prefetch_k} = ({start}) + {prefetch} * ({step});"
+        )
+        self.lines.append(
+            f"            int {write_stage} = {prefetch} % {stage_count};"
+        )
+        body_lhs, body_rhs = sources_at(prefetch_k)
+        self.emit_cp_async_cooperative_load(
+            buffers.lhs,
+            body_lhs,
+            stage=write_stage,
+            indent="        ",
+        )
+        self.emit_cp_async_cooperative_load(
+            buffers.rhs,
+            body_rhs,
+            stage=write_stage,
+            indent="        ",
+        )
+        self.lines.append("        }")
+        self.emit_cp_async_commit_group(indent="    ")
+        self.lines.append(f"        int {read_stage} = {tile} % {stage_count};")
+
+        mma_start = len(self.lines)
+        self.emit_mma_warp_tile_k_slices_in_place(
+            result=dot.result,
+            buffers=buffers,
+            layout=mma_layout,
+            cta_layout=cta_layout,
+            accumulator=accumulator,
+            stage=read_stage,
+        )
+        self.lines[mma_start:] = [f"    {line}" for line in self.lines[mma_start:]]
+        self.emit_cp_async_wait_group(1, indent="    ")
+        self.lines.append("        __syncthreads();")
+        self.lines.append("    }")
+
+        self.values[plan_dot_result_id] = accumulator
+        self.values[accumulation_result_id] = accumulator
+        self.values[loop.index.id] = f"({start}) + {tile} * ({step})"
+        return True
+
     def emit_for_range(self, loop: SSAForRange) -> None:
         double_buffering = match_cuda_dot_double_buffering(
             loop,
@@ -2498,6 +2952,26 @@ class SSACUDACodegen:
             self.values[carried_arg.id] = register_result_ref
             self.values[result.id] = register_result_ref
             carried_values.append(register_result_ref)
+
+        if (
+            tensor_core_loop
+            and double_buffering is not None
+            and mma_loop_layout is not None
+            and len(carried_values) == 1
+            and isinstance(carried_values[0], CudaMmaAccumulatorRef)
+            and self.emit_pipelined_tensor_core_loop(
+                loop=loop,
+                plan_dot_result_id=double_buffering.dot_result_id,
+                accumulation_result_id=double_buffering.accumulation_result_id,
+                mma_layout=mma_loop_layout,
+                cta_layout=mma_loop_cta_layout,
+                accumulator=carried_values[0],
+                start=start,
+                stop=stop,
+                step=step,
+            )
+        ):
+            return
 
         self.lines.append(
             f"    for (int {index_name} = {start}; "

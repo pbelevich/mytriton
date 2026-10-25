@@ -32,7 +32,7 @@ from mytriton.cuda_utils import cuda_module
 
 Tile = tuple[int, int, int]
 
-DEFAULT_TILES: tuple[Tile, ...] = ((64, 16, 64),)
+DEFAULT_TILES: tuple[Tile, ...] = ((128, 32, 128),)
 
 
 @triton.jit
@@ -508,7 +508,7 @@ def parse_args() -> argparse.Namespace:
         metavar="BMxBKxBN",
     )
     parser.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
-    parser.add_argument("--num-warps", type=int, default=4)
+    parser.add_argument("--num-warps", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)

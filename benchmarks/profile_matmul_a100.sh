@@ -17,17 +17,17 @@ export CUPY_CACHE_SAVE_CUDA_SOURCE=1
 
 "$MYTRITON_PYTHON" "$SCRIPT_DIR/benchmark_matmul.py" \
     --sizes 4096 \
-    --tiles 64x16x64 \
+    --tiles 128x32x128 \
     --dtype bf16 \
-    --num-warps 4 \
+    --num-warps 8 \
     --warmup 3 \
     --repeats 10 \
     --artifacts-dir "$RUN_DIR" \
     --output "$RUN_DIR/benchmark.json" \
     | tee "$RUN_DIR/benchmark.txt"
 
-SOURCE="$RUN_DIR/matmul_bf16_m4096_n4096_k4096_bm64_bk16_bn64_nw4.cu"
-SOURCE_METADATA="$RUN_DIR/matmul_bf16_m4096_n4096_k4096_bm64_bk16_bn64_nw4.json"
+SOURCE="$RUN_DIR/matmul_bf16_m4096_n4096_k4096_bm128_bk32_bn128_nw8.cu"
+SOURCE_METADATA="$RUN_DIR/matmul_bf16_m4096_n4096_k4096_bm128_bk32_bn128_nw8.json"
 NVRTC_CUBIN="$RUN_DIR/matmul_bf16_sm80_nvrtc.cubin"
 NVCC_PTX="$RUN_DIR/matmul_bf16_sm80_nvcc.ptx"
 
@@ -89,9 +89,9 @@ ncu \
     --export "$NCU_REPORT_BASE" \
     "$MYTRITON_PYTHON" "$SCRIPT_DIR/benchmark_matmul.py" \
         --sizes 4096 \
-        --tiles 64x16x64 \
+        --tiles 128x32x128 \
         --dtype bf16 \
-        --num-warps 4 \
+        --num-warps 8 \
         --warmup 0 \
         --repeats 1 \
         --no-graphs \

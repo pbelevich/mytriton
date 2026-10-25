@@ -1202,6 +1202,68 @@ the synchronous load-to-MMA latency. Until that pipeline exists, the smaller
 course correction are recorded in the
 [Version 25 performance report](../benchmarks/matmul_production_tile_a100_report.md).
 
+### Pipelined Tensor Core GEMM
+
+Version 26 turns the synchronous K loop into a three-stage SM80 producer and
+consumer pipeline. Two tiles are prefetched before the loop. While
+`ldmatrix` and `mma.sync` consume stage `tile % 3`, cooperative threads issue
+the global-to-shared copies for stage `(tile + 2) % 3`:
+
+```text
+time --->
+
+shared stage 0:  consume K0                         refill K3
+shared stage 1:  prefetched K1  consume K1                    refill K4
+shared stage 2:                 prefetched K2  consume K2
+
+copy engine:     cp.async K2    cp.async K3        cp.async K4
+tensor cores:    MMA K0         MMA K1             MMA K2
+```
+
+Every 16-byte producer instruction belongs to a per-thread asynchronous copy
+group. `cp.async.commit_group` closes the group and `cp.async.wait_group 1`
+allows one newer group to remain in flight. A block barrier after the wait
+publishes the completed stage to every warp and also prevents a producer from
+overwriting a stage that another warp is still reading.
+
+```cuda
+asm volatile(
+    "cp.async.cg.shared.global.L2::128B [%0], [%1], 16;"
+    :
+    : "r"(shared_address), "l"(global_pointer)
+    : "memory"
+);
+asm volatile("cp.async.commit_group;" : : : "memory");
+
+// Independent ldmatrix and mma.sync work executes here.
+
+asm volatile("cp.async.wait_group 1;" : : : "memory");
+__syncthreads();
+```
+
+The fast producer path requires a complete tile, a 16-byte-aligned source,
+and a row stride divisible by 16 bytes. Boundary tiles and odd leading
+dimensions use a scalar producer that copies valid elements and writes zero
+for the rest of the vector. It participates in the same commit/wait/barrier
+protocol, so full and tail CTAs can execute the same generated kernel without
+out-of-bounds reads.
+
+Three stages change the shared allocation for `128 x 128 x 32` from 32 KiB to
+48 KiB. Operand fragments are loaded and consumed one physical K slice at a
+time instead of keeping every `BK=32` fragment live until all MMA instructions
+have been emitted. For the selected eight-warp schedule, each warp owns a
+`64 x 32` output tile and the compiled kernel uses 126 registers per thread.
+
+The final 30-sample A100 BF16 `4096^3` run measures 146.21 TFLOP/s; the
+warp-count sweep reaches 162.49 TFLOP/s for the same eight-warp configuration.
+FP16 reaches 166.11 TFLOP/s. Nsight Compute reports 55.36% SM throughput,
+49.69% memory throughput, 42.49% issue-slot utilization, and 23.95% achieved
+occupancy. This is a substantial improvement over Version 25, but the 55.47%
+no-eligible-warp rate shows that instruction scheduling and register-level
+load/MMA interleaving remain useful future work. See the
+[Version 26 performance report](../benchmarks/matmul_pipeline_a100_report.md)
+for the complete measurements.
+
 ## Example
 
 ```python
@@ -1472,8 +1534,10 @@ these rewrite passes because they are not region-aware yet.
   implementation supports inferred multi-warp CTA tiles and aligned 128-bit
   FP16/BF16 global-to-shared copies with a masked scalar fallback. Eligible
   MMA operands use grouped warp-cooperative `ldmatrix` loads from XOR-swizzled
-  shared memory. There is still no overlapped prefetching, asynchronous copy
-  pipeline, register-fragment double buffering, or autotuning.
+  shared memory. On SM80, canonical low-precision K loops use a three-stage
+  `cp.async` pipeline with scalar zero-fill fallback for partial or misaligned
+  vectors. There is still no register-fragment double buffering, automatic
+  instruction scheduling, or autotuning.
   `tl.empty`, `tl.full`, and `tl.zeros` continue to represent logical
   per-thread values rather than shared-memory allocations.
 - MLIR lowering currently supports only `ptr<f32>` parameters as

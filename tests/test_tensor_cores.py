@@ -3267,7 +3267,13 @@ def test_sm80_production_cta_uses_m16n8k16(
     assert "mma_warp_m * 64" in cuda_src
     assert "mma_warp_n * 64" in cuda_src
 
-    assert codegen.shared_memory_bytes == 32 * 1024
+    assert codegen.shared_memory_bytes == 48 * 1024
+    assert cuda_src.count("cp.async.cg.shared.global.L2::128B") == 4
+    assert cuda_src.count("cp.async.commit_group") == 2
+    assert cuda_src.count("cp.async.wait_group 1") == 2
+    assert "dot_pipeline_tiles_" in cuda_src
+    assert "dot_pipeline_write_stage_" in cuda_src
+    assert "dot_pipeline_read_stage_" in cuda_src
     assert "mma_result_" not in cuda_src
     assert "__shared__ float mma_result_" not in cuda_src
 
@@ -3875,15 +3881,17 @@ def test_f16_multi_warp_tensor_core_matmul_executes_on_cuda(
     assert "int mma_warp_id = threadIdx.x >> 5;" in cuda_src
     assert "int mma_warp_m = mma_warp_id / 2;" in cuda_src
     assert "int mma_warp_n = mma_warp_id % 2;" in cuda_src
-    assert cuda_src.count("vector += 128") == 2
-    assert cuda_src.count("*reinterpret_cast<uint4 *>") == 2
-
     # One warp owns a 16x16 output tile. SM75 executes two K=8
     # steps for each output fragment, while SM80 executes one K=16 step.
     if capability >= 80:
+        assert cuda_src.count("cp.async.cg.shared.global.L2::128B") == 4
+        assert cuda_src.count("cp.async.commit_group") == 2
+        assert cuda_src.count("cp.async.wait_group 1") == 2
         assert cuda_src.count("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32") == 2
         assert "mma.sync.aligned.m16n8k8" not in cuda_src
     else:
+        assert cuda_src.count("vector += 128") == 2
+        assert cuda_src.count("*reinterpret_cast<uint4 *>") == 2
         assert cuda_src.count("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32") == 4
         assert "mma.sync.aligned.m16n8k16" not in cuda_src
 

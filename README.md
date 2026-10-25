@@ -13,7 +13,7 @@ PTX. The current development version includes shared-memory tiled matrix
 multiplication, FP16/BF16 inputs, FP32 accumulation, and multi-warp Tensor Core
 CTA tiles built from NVIDIA `mma.sync` instructions.
 Low-precision operands are cooperatively staged with aligned 128-bit
-global-to-shared copies, then loaded into warp fragments with `ldmatrix`.
+`cp.async` copies, then loaded into warp fragments with `ldmatrix`.
 
 ```text
 Python kernel
@@ -60,6 +60,7 @@ full [changelog](CHANGELOG.md) and the accompanying
 | [`ver23`](https://github.com/pbelevich/mytriton/tree/ver23) | [Vectorized operand staging](docs/implementation.md#vectorized-global-to-shared-staging) |
 | [`ver24`](https://github.com/pbelevich/mytriton/tree/ver24) | [`ldmatrix` operand fragments](docs/implementation.md#warp-cooperative-ldmatrix-fragments) |
 | [`ver25`](https://github.com/pbelevich/mytriton/tree/ver25) | [SM80 production tensor tile](docs/implementation.md#sm80-production-tensor-tile) |
+| [`ver26`](https://github.com/pbelevich/mytriton/tree/ver26) | [Three-stage `cp.async` pipeline](docs/implementation.md#pipelined-tensor-core-gemm) |
 
 ## Tensor-core matmul
 
@@ -117,7 +118,7 @@ def matmul_kernel(
 
 
 M, N, K = 128, 128, 128
-BM, BK, BN = 64, 16, 64
+BM, BK, BN = 128, 32, 128
 
 torch.manual_seed(0)
 a = torch.randn((M, K), device="cuda", dtype=torch.float16)
@@ -135,16 +136,16 @@ _, _, cuda_source = matmul_kernel[grid](
     BM=BM,
     BK=BK,
     BN=BN,
-    num_warps=4,
+    num_warps=8,
 )
 
 expected = a.float() @ b.float()
 torch.testing.assert_close(out, expected, rtol=3e-3, atol=3e-3)
 ```
 
-The `64 x 16 x 64` CTA tile is divided into a `2 x 2` warp grid. Each warp
-owns a `32 x 32` output tile. SM80 executes eight physical `m16n8k16`
-instructions per warp; SM75 retains sixteen `m16n8k8` instructions:
+The `128 x 32 x 128` CTA tile is divided into a `2 x 4` warp grid. Each warp
+owns a `64 x 32` output tile. SM80 executes physical `m16n8k16`
+instructions while FP16 SM75 tiles retain `m16n8k8`:
 
 ```cuda
 asm volatile(
@@ -158,12 +159,14 @@ asm volatile(
 );
 ```
 
-Before MMA, each thread moves eight adjacent FP16/BF16 values into aligned
-shared memory with one 128-bit copy:
+Before MMA, each thread asynchronously moves eight adjacent FP16/BF16 values
+into aligned shared memory:
 
 ```cuda
-*reinterpret_cast<uint4 *>(&shared[index]) =
-    *reinterpret_cast<const uint4 *>(&global[source_index]);
+asm volatile(
+    "cp.async.cg.shared.global.L2::128B [%0], [%1], 16;"
+    : : "r"(shared_address), "l"(global_pointer) : "memory"
+);
 ```
 
 Each warp then loads the shared A and B tiles directly into the packed
@@ -192,10 +195,15 @@ and a correct `128 x 128 x 32` experimental CTA tile. The established
 `64 x 16 x 64` tile remains the fastest default at 63.19 TFLOP/s until an
 asynchronous pipeline can overlap operand transport with MMA. See the
 [Version 25 performance report](benchmarks/matmul_production_tile_a100_report.md).
+Version 26 adds that three-stage pipeline, aligned `cp.async` loads with a
+correct scalar tail fallback, and K-sliced fragment consumption. With eight
+warps the `128 x 32 x 128` BF16 kernel reaches 146.21 TFLOP/s in the final
+30-sample run and 162.49 TFLOP/s in the configuration sweep on A100. See the
+[Version 26 performance report](benchmarks/matmul_pipeline_a100_report.md).
 
 FP16 MMA requires `sm_75+`; native BF16 MMA requires `sm_80+`. Unsupported
 types, shapes, and targets retain the CUDA-core fallback. See the
-[implementation guide](docs/implementation.md#sm80-production-tensor-tile)
+[implementation guide](docs/implementation.md#pipelined-tensor-core-gemm)
 for fragment layouts, shared-memory mapping, composition, and accumulation.
 
 ## Documentation
