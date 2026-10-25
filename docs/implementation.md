@@ -1074,7 +1074,7 @@ Generated CUDA first converts the selected generic shared pointer into the
 
 ```cuda
 unsigned address = static_cast<unsigned>(
-    __cvta_generic_to_shared(&shared[row * stride + column])
+    __cvta_generic_to_shared(&shared[row * stride + physical_column])
 );
 ```
 
@@ -1109,10 +1109,33 @@ K tiles still become zero-filled, complete shared-memory tiles before any warp
 executes `ldmatrix`. The existing block barrier remains the producer/consumer
 boundary, and the accumulator and output redistribution layouts are unchanged.
 
-Version 24 deliberately changes only shared-to-register fragment loading.
-Shared-memory swizzling, asynchronous global copies, pipeline overlap, larger
-K stages, and autotuning remain separate optimizations so their effects can be
-measured independently.
+`ldmatrix` alone is insufficient with a plain row-major shared layout. Its
+eight row addresses can repeatedly hit the same banks even though the
+instruction count is lower. Version 24 therefore treats each aligned
+eight-element FP16/BF16 vector as one 16-byte physical segment and XORs its
+logical segment index with selected row bits. For the default shapes:
+
+```text
+A, two segments:   physical = logical XOR ((row >> 2) & 1)
+B, eight segments: physical = logical XOR (row & 7)
+```
+
+The mapping lives in `CudaSharedBuffer.element()`, so the vectorized writer,
+masked scalar fallback, and `ldmatrix` reader cannot disagree about physical
+storage. Segment contents remain contiguous, preserving Version 23's
+`uint4` copies, and the permutation consumes no additional shared memory.
+
+On A100, the resulting cubin contains four `LDSM`, zero scalar `LDS.U16`, and
+the same sixteen `HMMA` instructions. Shared-load bank conflicts fall by
+99.3%, total shared wavefronts fall by 69.7%, and the established
+`64 x 16 x 64` BF16 tile improves from 40.83 to 59.95 TFLOP/s at `4096^3`.
+FP16 reaches 59.88 TFLOP/s. The complete ablation and Nsight Compute analysis
+are in the
+[Version 24 performance report](../benchmarks/matmul_ldmatrix_a100_report.md).
+
+Asynchronous global copies, larger CTA and warp tiles, pipeline overlap, and
+autotuning remain separate steps so their effects can be measured
+independently.
 
 ## Example
 

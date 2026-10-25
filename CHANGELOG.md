@@ -16,6 +16,11 @@ were built.
   `mma.sync` instructions instead of reloading it for every M/N combination.
 - Added generated-PTX validation, architecture checks, and FP16 execution
   coverage for single-warp, composable, and multi-warp Tensor Core tiles.
+- Added a shared 16-byte-segment XOR swizzle used consistently by vectorized
+  staging and `ldmatrix`, without increasing shared-memory allocation.
+- Reduced A100 shared-load bank conflicts by 99.3% and improved the primary
+  `4096^3` BF16 kernel from 40.83 to 59.95 TFLOP/s (1.47x); FP16 reaches
+  59.88 TFLOP/s.
 
 ### Version 23: Vectorized global-to-shared staging
 

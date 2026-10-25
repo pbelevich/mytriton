@@ -183,12 +183,15 @@ On A100 this raises the best measured kernel throughput from about 24 to 41
 TFLOP/s. See the
 [Version 23 performance report](benchmarks/matmul_vectorized_staging_a100_report.md)
 for the complete methodology, tile sweep, SASS, and Nsight Compute analysis.
+Version 24 combines `ldmatrix` with a 16-byte XOR-swizzled shared layout. The
+same tile reaches 59.95 TFLOP/s for BF16 and 59.88 TFLOP/s for FP16 at
+`4096^3`, while shared-load bank conflicts fall by 99.3%. See the
+[Version 24 performance report](benchmarks/matmul_ldmatrix_a100_report.md).
 
 FP16 MMA requires `sm_75+`; native BF16 MMA requires `sm_80+`. Unsupported
 types, shapes, and targets retain the CUDA-core fallback. See the
 [implementation guide](docs/implementation.md#warp-cooperative-ldmatrix-fragments)
-for fragment layouts, composition, accumulation, and current performance
-limitations.
+for fragment layouts, shared-memory mapping, composition, and accumulation.
 
 ## Documentation
 
