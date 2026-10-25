@@ -68,6 +68,7 @@ class CudaSharedBuffer:
     row_padding: int = 0
     stage_count: int = 1
     alignment: int = 1
+    swizzle_segment_width: int = 0
 
     def __post_init__(self) -> None:
         if len(self.logical_shape) != 2 or any(
@@ -99,6 +100,31 @@ class CudaSharedBuffer:
                 "shared buffer alignment must be a positive power of two, "
                 f"got {self.alignment}"
             )
+
+        if type(self.swizzle_segment_width) is not int:
+            raise ValueError(
+                "shared buffer swizzle segment width must be an integer, "
+                f"got {self.swizzle_segment_width}"
+            )
+
+        if self.swizzle_segment_width < 0:
+            raise ValueError(
+                "shared buffer swizzle segment width must be non-negative, "
+                f"got {self.swizzle_segment_width}"
+            )
+
+        if self.swizzle_segment_width:
+            segment_count, remainder = divmod(
+                self.row_stride,
+                self.swizzle_segment_width,
+            )
+            if remainder or segment_count not in (1, 2, 4, 8):
+                raise ValueError(
+                    "swizzled shared row must contain 1, 2, 4, or 8 "
+                    "complete segments, got row stride "
+                    f"{self.row_stride} and segment width "
+                    f"{self.swizzle_segment_width}"
+                )
 
     @property
     def rows(self) -> int:
@@ -143,7 +169,44 @@ class CudaSharedBuffer:
                 f"0 <= stage < {self.stage_count}"
             )
 
+        if self.swizzle_segment_width:
+            segment_count = self.row_stride // self.swizzle_segment_width
+            if segment_count == 2:
+                row_swizzle = (row >> 2) & 1
+            elif segment_count == 4:
+                row_swizzle = (row & 2) | ((row >> 2) & 1)
+            elif segment_count == 8:
+                row_swizzle = row & 7
+            else:
+                row_swizzle = 0
+
+            segment = column // self.swizzle_segment_width
+            within_segment = column % self.swizzle_segment_width
+            column = (
+                segment ^ row_swizzle
+            ) * self.swizzle_segment_width + within_segment
+
         return stage * self.stage_size + row * self.row_stride + column
+
+    def physical_column(self, row: str, column: str) -> str:
+        if not self.swizzle_segment_width:
+            return column
+
+        segment_count = self.row_stride // self.swizzle_segment_width
+        if segment_count == 2:
+            row_swizzle = f"((({row}) >> 2) & 1)"
+        elif segment_count == 4:
+            row_swizzle = f"((({row}) & 2) | ((({row}) >> 2) & 1))"
+        elif segment_count == 8:
+            row_swizzle = f"(({row}) & 7)"
+        else:
+            row_swizzle = "0"
+
+        width = self.swizzle_segment_width
+        return (
+            f"((({column}) / {width}) ^ {row_swizzle}) * {width} "
+            f"+ (({column}) % {width})"
+        )
 
     def element(
         self,
@@ -152,7 +215,8 @@ class CudaSharedBuffer:
         *,
         stage: str | None = None,
     ) -> str:
-        element_offset = f"({row}) * {self.row_stride} + ({column})"
+        physical_column = self.physical_column(row, column)
+        element_offset = f"({row}) * {self.row_stride} + ({physical_column})"
 
         if self.stage_count == 1:
             if stage is not None:

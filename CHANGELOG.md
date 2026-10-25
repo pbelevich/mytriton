@@ -6,6 +6,22 @@ were built.
 
 ## Unreleased
 
+### Version 24: Warp-cooperative `ldmatrix` fragments
+
+- Replaced scalar FP16/BF16 shared-memory reads and manual 16-bit packing with
+  target-aware `ldmatrix.sync.aligned.m8n8` operand loads.
+- Added non-transposed A loads, transposed B loads, shared-address conversion,
+  and `.x1`/`.x2`/`.x4` matrix groups.
+- Reused each loaded A or B register fragment across all matching physical
+  `mma.sync` instructions instead of reloading it for every M/N combination.
+- Added generated-PTX validation, architecture checks, and FP16 execution
+  coverage for single-warp, composable, and multi-warp Tensor Core tiles.
+- Added a shared 16-byte-segment XOR swizzle used consistently by vectorized
+  staging and `ldmatrix`, without increasing shared-memory allocation.
+- Reduced A100 shared-load bank conflicts by 99.3% and improved the primary
+  `4096^3` BF16 kernel from 40.83 to 59.95 TFLOP/s (1.47x); FP16 reaches
+  59.88 TFLOP/s.
+
 ### Version 23: Vectorized global-to-shared staging
 
 - Added 16-byte-aligned low-precision shared buffers and cooperative 128-bit

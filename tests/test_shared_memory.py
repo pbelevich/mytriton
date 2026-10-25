@@ -8,6 +8,8 @@ import mytriton.language as tl
 from mytriton.ast_frontend import trace as trace_ast
 from mytriton.block_shapes import (
     CudaKernelLayout,
+    CudaMatmulSchedule,
+    CudaMmaCtaTileLayout,
     cuda_kernel_layout,
 )
 from mytriton.cuda_codegen import (
@@ -604,6 +606,61 @@ def test_cuda_codegen_vectorizes_low_precision_dot_staging() -> None:
     assert cuda_fragment.count("*reinterpret_cast<uint4 *>") == 2
     assert cuda_fragment.count("*reinterpret_cast<const uint4 *>") == 2
     assert codegen.lines[-1] == "    __syncthreads();"
+
+
+def test_ldmatrix_staging_uses_conflict_free_vector_swizzle() -> None:
+    schedule = CudaMatmulSchedule(
+        block_m=64,
+        block_k=16,
+        block_n=64,
+        warp_m=32,
+        warp_n=32,
+        warps_m=2,
+        warps_n=2,
+    )
+    cta_layout = CudaMmaCtaTileLayout(schedule=schedule)
+    codegen = SSACUDACodegen()
+    codegen.layout = CudaKernelLayout(
+        output_tile_shape=cta_layout.result_shape,
+        thread_shape=cta_layout.thread_shape,
+    )
+    codegen.mma_cta_dot_layouts = {7: cta_layout}
+
+    buffers = codegen.emit_dot_operand_staging(
+        dot_result_id=7,
+        lhs_shape=cta_layout.lhs_shape,
+        rhs_shape=cta_layout.rhs_shape,
+        element_ty=BF16,
+        lhs_source=CudaGlobalTile(
+            base="a",
+            row_offset="blockIdx.x * 64",
+            column_offset="k_base",
+            row_stride="K",
+            row_bound="M",
+            column_bound="K",
+        ),
+        rhs_source=CudaGlobalTile(
+            base="b",
+            row_offset="k_base",
+            column_offset="blockIdx.y * 64",
+            row_stride="N",
+            row_bound="K",
+            column_bound="N",
+        ),
+    )
+
+    assert buffers.lhs.row_padding == 0
+    assert buffers.lhs.row_stride == 16
+    assert buffers.lhs.swizzle_segment_width == 8
+    assert buffers.rhs.row_padding == 0
+    assert buffers.rhs.row_stride == 64
+    assert buffers.rhs.swizzle_segment_width == 8
+    assert cuda_cooperative_copy_width(buffers.lhs) == 8
+    assert cuda_cooperative_copy_width(buffers.rhs) == 8
+
+    for buffer in (buffers.lhs, buffers.rhs):
+        row_start_banks = {buffer.offset(row, 0) * 2 // 4 % 32 for row in range(8)}
+        assert len(row_start_banks) == 8
 
 
 def test_dot_operand_staging_rejects_incompatible_shapes() -> None:

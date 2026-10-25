@@ -21,7 +21,9 @@ compiler notes live in the [implementation guide](implementation.md).
 - [Composable warp MMA tiles](implementation.md#composable-warp-mma-tiles)
 - [Multi-warp CTA tiles](implementation.md#multi-warp-cta-tiles)
 - [Vectorized global-to-shared staging](implementation.md#vectorized-global-to-shared-staging)
+- [Warp-cooperative `ldmatrix` fragments](implementation.md#warp-cooperative-ldmatrix-fragments)
 - [A100 Version 23 performance report](../benchmarks/matmul_vectorized_staging_a100_report.md)
+- [A100 Version 24 `ldmatrix` report](../benchmarks/matmul_ldmatrix_a100_report.md)
 
 ## Runtime and development
 

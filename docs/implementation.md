@@ -100,6 +100,9 @@ MLIR's GPU/NVVM stack to a cubin.
 - Version 23 (unreleased): aligned 128-bit FP16/BF16 global-to-shared operand
   staging with full-vector guards, masked scalar fallback, and reproducible
   A100 benchmark and profiling tools.
+- Version 24 (unreleased): warp-cooperative `ldmatrix` fragment loads,
+  transposed B fragments, grouped `.x1`/`.x2`/`.x4` instructions, and operand
+  register reuse across physical `mma.sync` operations.
 
 ## AST frontend
 
@@ -1033,6 +1036,107 @@ assembled with many scalar `LDS.U16` instructions. Version 23 deliberately
 does not add `ldmatrix`, shared-memory swizzling, `cp.async`, or pipeline
 overlap, so each of those can be introduced and measured independently.
 
+### Warp-cooperative `ldmatrix` fragments
+
+Version 24 optimizes the second half of operand transport. Version 23 already
+moves A and B from global memory into shared memory with 128-bit transactions,
+but the warp previously reconstructed every MMA operand register with scalar
+shared-memory reads and explicit 16-bit packing. That repeated the same A
+fragment for every N atom and the same B fragment for every M atom.
+
+PTX `ldmatrix.sync.aligned.m8n8` is a warp-level operation designed for this
+exact shared-to-register step. One instruction collectively loads one, two,
+or four `8 x 8` matrices of 16-bit elements. Eight lanes provide row-start
+addresses for each matrix, while the hardware distributes packed 32-bit
+register fragments across all 32 lanes. It requires `sm_75+`; native BF16 MMA
+still requires `sm_80+`. See NVIDIA's
+[PTX ISA `ldmatrix` documentation](https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-load-instruction-ldmatrix)
+for the complete address and fragment mapping.
+
+The A operand of `mma.sync.m16n8k8.row.col` is row-major. Its `16 x 8`
+instruction fragment consists of two `8 x 8` matrices, so the smallest path
+uses one non-transposed `.x2` load:
+
+```cuda
+ldmatrix.sync.aligned.m8n8.x2.shared.b16 {a0, a1}, [a_address];
+```
+
+B is logically stored as a row-major `8 x 8` tile in shared memory, while the
+MMA instruction consumes a column-major fragment. The `.trans` qualifier
+performs the required fragment transpose during the load:
+
+```cuda
+ldmatrix.sync.aligned.m8n8.x1.trans.shared.b16 {b0}, [b_address];
+```
+
+Generated CUDA first converts the selected generic shared pointer into the
+32-bit shared address expected by inline PTX:
+
+```cuda
+unsigned address = static_cast<unsigned>(
+    __cvta_generic_to_shared(&shared[row * stride + physical_column])
+);
+```
+
+All lanes execute the same `ldmatrix.sync.aligned` instruction. For `.x4`,
+lanes `0..7`, `8..15`, `16..23`, and `24..31` provide the row addresses of
+four independent matrices. For `.x2` and `.x1`, higher lane groups repeat
+valid lower-group addresses. This also satisfies the stricter address rule of
+the oldest supported `sm_75` target.
+
+The composable warp lowering enumerates unique logical fragments before it
+emits physical MMA instructions:
+
+```text
+A key: (m_tile, k_tile) -> two packed registers
+B key: (k_tile, n_tile) -> one packed register
+```
+
+It batches the corresponding `8 x 8` matrices greedily as `.x4`, `.x2`, or
+`.x1`, records which register belongs to each key, and then wires those cached
+registers into every matching `mma.sync`. For the default `64 x 16 x 64` CTA,
+four warps each own a `32 x 32 x 16` warp tile. The static warp program has
+sixteen MMA instructions but only four `ldmatrix.x4` instructions: two for A
+and two transposed loads for B.
+
+```text
+Version 23: repeated scalar LDS + packing for each MMA atom
+Version 24: 4 grouped ldmatrix loads -> 16 MMA atoms
+```
+
+The global-to-shared masked fallback remains unchanged, so partial M, N, and
+K tiles still become zero-filled, complete shared-memory tiles before any warp
+executes `ldmatrix`. The existing block barrier remains the producer/consumer
+boundary, and the accumulator and output redistribution layouts are unchanged.
+
+`ldmatrix` alone is insufficient with a plain row-major shared layout. Its
+eight row addresses can repeatedly hit the same banks even though the
+instruction count is lower. Version 24 therefore treats each aligned
+eight-element FP16/BF16 vector as one 16-byte physical segment and XORs its
+logical segment index with selected row bits. For the default shapes:
+
+```text
+A, two segments:   physical = logical XOR ((row >> 2) & 1)
+B, eight segments: physical = logical XOR (row & 7)
+```
+
+The mapping lives in `CudaSharedBuffer.element()`, so the vectorized writer,
+masked scalar fallback, and `ldmatrix` reader cannot disagree about physical
+storage. Segment contents remain contiguous, preserving Version 23's
+`uint4` copies, and the permutation consumes no additional shared memory.
+
+On A100, the resulting cubin contains four `LDSM`, zero scalar `LDS.U16`, and
+the same sixteen `HMMA` instructions. Shared-load bank conflicts fall by
+99.3%, total shared wavefronts fall by 69.7%, and the established
+`64 x 16 x 64` BF16 tile improves from 40.83 to 59.95 TFLOP/s at `4096^3`.
+FP16 reaches 59.88 TFLOP/s. The complete ablation and Nsight Compute analysis
+are in the
+[Version 24 performance report](../benchmarks/matmul_ldmatrix_a100_report.md).
+
+Asynchronous global copies, larger CTA and warp tiles, pipeline overlap, and
+autotuning remain separate steps so their effects can be measured
+independently.
+
 ## Example
 
 ```python
@@ -1300,10 +1404,10 @@ these rewrite passes because they are not region-aware yet.
   `mma.sync.m16n8k8` instructions when the CUDA target supports them; other
   operand types, shapes, and targets retain the CUDA-core path. The
   implementation supports inferred multi-warp CTA tiles and aligned 128-bit
-  FP16/BF16 global-to-shared copies with a masked scalar fallback. MMA operand
-  fragments are still assembled through scalar shared-memory loads; there is
-  no `ldmatrix`, general shared-memory swizzling, overlapped prefetching,
-  asynchronous copy pipeline, or autotuning.
+  FP16/BF16 global-to-shared copies with a masked scalar fallback. Eligible
+  MMA operands use grouped warp-cooperative `ldmatrix` loads from shared
+  memory. There is still no general shared-memory swizzling, overlapped
+  prefetching, asynchronous copy pipeline, or autotuning.
   `tl.empty`, `tl.full`, and `tl.zeros` continue to represent logical
   per-thread values rather than shared-memory allocations.
 - MLIR lowering currently supports only `ptr<f32>` parameters as
