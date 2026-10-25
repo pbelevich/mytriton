@@ -6,6 +6,22 @@ were built.
 
 ## Unreleased
 
+### Version 25: SM80 production Tensor Core tile
+
+- Added target-aware `mma.sync.m16n8k16` lowering for FP16 and BF16 on
+  `sm_80+`, while preserving the `m16n8k8` path for `sm_75` and K=8 tiles.
+- Extended warp and CTA layouts, grouped `ldmatrix.x4` operand loading, and
+  shared-memory swizzling to the `128x128x32` CTA and `64x64` warp tiles.
+- Replaced the 64 KiB shared-memory accumulator redistribution tile with a
+  direct masked register-to-global FP32 epilogue using aligned `float2` stores
+  and a scalar fallback for odd strides and boundary columns.
+- Added full and irregular-shape SM80 execution coverage for the production
+  tile; all FP16/BF16 Tensor Core execution tests pass on A100.
+- Improved the established `64x16x64` BF16 kernel from 59.95 to 63.19
+  TFLOP/s. The experimental four-warp `128x32x128` tile reaches 36.08 TFLOP/s;
+  profiling shows that it needs asynchronous and register-level pipelining
+  before it should replace the current default.
+
 ### Version 24: Warp-cooperative `ldmatrix` fragments
 
 - Replaced scalar FP16/BF16 shared-memory reads and manual 16-bit packing with

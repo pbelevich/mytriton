@@ -118,9 +118,9 @@ class CudaSharedBuffer:
                 self.row_stride,
                 self.swizzle_segment_width,
             )
-            if remainder or segment_count not in (1, 2, 4, 8):
+            if remainder or segment_count not in (1, 2, 4, 8, 16):
                 raise ValueError(
-                    "swizzled shared row must contain 1, 2, 4, or 8 "
+                    "swizzled shared row must contain 1, 2, 4, 8, or 16 "
                     "complete segments, got row stride "
                     f"{self.row_stride} and segment width "
                     f"{self.swizzle_segment_width}"
@@ -175,7 +175,7 @@ class CudaSharedBuffer:
                 row_swizzle = (row >> 2) & 1
             elif segment_count == 4:
                 row_swizzle = (row & 2) | ((row >> 2) & 1)
-            elif segment_count == 8:
+            elif segment_count in (8, 16):
                 row_swizzle = row & 7
             else:
                 row_swizzle = 0
@@ -197,7 +197,7 @@ class CudaSharedBuffer:
             row_swizzle = f"((({row}) >> 2) & 1)"
         elif segment_count == 4:
             row_swizzle = f"((({row}) & 2) | ((({row}) >> 2) & 1))"
-        elif segment_count == 8:
+        elif segment_count in (8, 16):
             row_swizzle = f"(({row}) & 7)"
         else:
             row_swizzle = "0"
@@ -273,6 +273,16 @@ class CudaGlobalTilePlan:
     row_bound: SSAOperand
     column_bound: SSAOperand
     other: SSAOperand
+
+
+@dataclass(frozen=True)
+class CudaGlobalStorePlan:
+    base: SSAOperand
+    row_offset: SSAOperand
+    column_offset: SSAOperand
+    row_stride: SSAOperand
+    row_bound: SSAOperand
+    column_bound: SSAOperand
 
 
 @dataclass(frozen=True)
@@ -480,10 +490,11 @@ class CudaDotOperandMatcher:
 
         return row_bound, column_bound
 
-    def match(self, load_value: SSAOperand) -> CudaGlobalTilePlan:
-        load = self.definitions.require(load_value, "load")
-        pointer, mask, other = load.operands
-
+    def _match_address(
+        self,
+        pointer: SSAOperand,
+        mask: SSAOperand,
+    ) -> CudaGlobalStorePlan:
         outer_addptr = self.definitions.require(pointer, "addptr")
         row_pointer, columns = outer_addptr.operands
 
@@ -503,7 +514,8 @@ class CudaDotOperandMatcher:
 
         if not isinstance(columns, SSAValue):
             raise TypeError(
-                f"dot staging expects block-shaped column coordinates, got {columns}"
+                f"CUDA global tile expects block-shaped column coordinates, "
+                f"got {columns}"
             )
 
         if not isinstance(base, Param) or not isinstance(
@@ -511,15 +523,8 @@ class CudaDotOperandMatcher:
             PointerType,
         ):
             raise TypeError(
-                f"dot staging expects a global pointer parameter, got {base}"
+                f"CUDA global tile expects a global pointer parameter, got {base}"
             )
-
-        if (
-            not isinstance(other, Const)
-            or type(other.value) is not float
-            or other.value != 0.0
-        ):
-            raise TypeError("dot staging requires masked loads with other=0.0")
 
         row_offset = self._match_axis_offset(rows, axis=1)
         column_offset = self._match_axis_offset(columns, axis=0)
@@ -529,15 +534,44 @@ class CudaDotOperandMatcher:
             columns,
         )
 
-        return CudaGlobalTilePlan(
+        return CudaGlobalStorePlan(
             base=base,
             row_offset=row_offset,
             column_offset=column_offset,
             row_stride=row_stride,
             row_bound=row_bound,
             column_bound=column_bound,
+        )
+
+    def match(self, load_value: SSAOperand) -> CudaGlobalTilePlan:
+        load = self.definitions.require(load_value, "load")
+        pointer, mask, other = load.operands
+
+        if (
+            not isinstance(other, Const)
+            or type(other.value) is not float
+            or other.value != 0.0
+        ):
+            raise TypeError("dot staging requires masked loads with other=0.0")
+
+        address = self._match_address(pointer, mask)
+
+        return CudaGlobalTilePlan(
+            base=address.base,
+            row_offset=address.row_offset,
+            column_offset=address.column_offset,
+            row_stride=address.row_stride,
+            row_bound=address.row_bound,
+            column_bound=address.column_bound,
             other=other,
         )
+
+    def match_store(
+        self,
+        pointer: SSAOperand,
+        mask: SSAOperand,
+    ) -> CudaGlobalStorePlan:
+        return self._match_address(pointer, mask)
 
 
 @dataclass(frozen=True)

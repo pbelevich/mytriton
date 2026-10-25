@@ -1137,6 +1137,71 @@ Asynchronous global copies, larger CTA and warp tiles, pipeline overlap, and
 autotuning remain separate steps so their effects can be measured
 independently.
 
+### SM80 production tensor tile
+
+Version 25 adds the physical Tensor Core atom used by the eventual SM80 fast
+path. On `sm_80+`, compatible FP16 and BF16 dots prefer
+`mma.sync.aligned.m16n8k16.row.col.f32`; `sm_75` and K=8 tiles retain the
+existing `m16n8k8` lowering. The K=16 instruction consumes four packed A
+registers and two packed B registers per lane while retaining the same four
+FP32 accumulator registers and `16 x 8` result fragment.
+
+The larger experimental schedule is:
+
+```text
+CTA tile:         128 x 128 x 32
+warp grid:        2 x 2
+warp tile:         64 x 64 x 32
+physical atom:     16 x 8 x 16
+threads per CTA:  128
+```
+
+Each warp executes `4 x 8 x 2 = 64` physical MMA instructions per K tile.
+Operand fragments are grouped into eight non-transposed `ldmatrix.x4` loads
+for A and eight transposed `ldmatrix.x4` loads for B. A 16-segment extension
+of the shared XOR mapping keeps every 16-byte vector contiguous and makes the
+`128`-column B tile representable without padding.
+
+The larger result exposed a separate architectural problem. The old epilogue
+first spilled the complete `128 x 128` FP32 accumulator to shared memory and
+then reloaded it through the ordinary output register layout. That temporary
+tile alone requires 64 KiB; together with the two-stage A/B buffers it raised
+static shared memory to 96 KiB. Version 25 instead matches the canonical store
+pointer and mask in SSA and maps each lane's four accumulator registers
+directly to global row-major coordinates:
+
+```text
+row0 = block_row + warp_m * 64 + mma_m * 16 + lane / 4
+row1 = row0 + 8
+col  = block_col + warp_n * 64 + mma_n * 8 + (lane % 4) * 2
+```
+
+Two adjacent FP32 values use one aligned `float2` store. Odd row strides and
+boundary columns use masked scalar stores. This removes the 64 KiB result
+buffer and its block barrier, leaving 32 KiB of staged operands for the
+`128 x 128 x 32` configuration. Execution tests cover both a complete tile
+and the irregular `117 x 109 x 29` case on A100.
+
+The larger tile is a correctness and lowering milestone, not yet the fastest
+schedule. BF16 `4096^3` measurements on A100 are:
+
+| CTA tile | Warps | Registers/thread | Estimated occupancy | Raw TFLOP/s |
+|---|---:|---:|---:|---:|
+| `64 x 16 x 64` | 4 | 64 | 50.0% | **63.19** |
+| `128 x 32 x 128` | 4 | 202 | 12.5% | 36.08 |
+| `128 x 32 x 128` | 8 | 121 | 25.0% | 59.61 |
+| `128 x 16 x 128` | 16 | 64 | 50.0% | 66.18 |
+
+Nsight Compute reports that the four-warp production tile spends 86.45% of
+scheduler cycles with no eligible warp and about 9.6 cycles per issued
+instruction waiting on an L1TEX scoreboard dependency. There are no local
+memory spills. The large warp tile therefore needs `cp.async`, multiple shared
+stages, and double-buffered register fragments before its reuse can outweigh
+the synchronous load-to-MMA latency. Until that pipeline exists, the smaller
+`64 x 16 x 64` tile remains the benchmark default. Full measurements and the
+course correction are recorded in the
+[Version 25 performance report](../benchmarks/matmul_production_tile_a100_report.md).
+
 ## Example
 
 ```python
@@ -1400,14 +1465,15 @@ these rewrite passes because they are not region-aware yet.
   Conflict-aware row padding reduces bank conflicts for A, and canonical K
   loops alternate between two shared-memory stages to remove a tile-reuse
   barrier. Eligible `f16`/`bf16` dots whose M, N, and K dimensions are
-  divisible by 16, 8, and 8 are composed from Tensor Core
-  `mma.sync.m16n8k8` instructions when the CUDA target supports them; other
+  divisible by the selected physical MMA shape are composed from Tensor Core
+  instructions when the CUDA target supports them. SM80 prefers
+  `mma.sync.m16n8k16`; SM75 and K=8 tiles use `mma.sync.m16n8k8`. Other
   operand types, shapes, and targets retain the CUDA-core path. The
   implementation supports inferred multi-warp CTA tiles and aligned 128-bit
   FP16/BF16 global-to-shared copies with a masked scalar fallback. Eligible
-  MMA operands use grouped warp-cooperative `ldmatrix` loads from shared
-  memory. There is still no general shared-memory swizzling, overlapped
-  prefetching, asynchronous copy pipeline, or autotuning.
+  MMA operands use grouped warp-cooperative `ldmatrix` loads from XOR-swizzled
+  shared memory. There is still no overlapped prefetching, asynchronous copy
+  pipeline, register-fragment double buffering, or autotuning.
   `tl.empty`, `tl.full`, and `tl.zeros` continue to represent logical
   per-thread values rather than shared-memory allocations.
 - MLIR lowering currently supports only `ptr<f32>` parameters as

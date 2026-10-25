@@ -51,12 +51,20 @@ class CudaTarget:
         return self.compute_capability >= 75
 
     @property
-    def supports_ldmatrix(self) -> bool:
-        return self.compute_capability >= 75
-
-    @property
     def supports_bf16_mma_m16n8k8(self) -> bool:
         return self.compute_capability >= 80
+
+    @property
+    def supports_f16_mma_m16n8k16(self) -> bool:
+        return self.compute_capability >= 80
+
+    @property
+    def supports_bf16_mma_m16n8k16(self) -> bool:
+        return self.compute_capability >= 80
+
+    @property
+    def supports_ldmatrix(self) -> bool:
+        return self.compute_capability >= 75
 
 
 # Compilation-only calls do not select a CUDA device. sm_75 is the oldest target

@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>mytriton Version 25 — Production Tensor Tile для SM80</title>
+  <style>
+    :root { color-scheme:dark; --bg:#07111f; --panel:#0e1d31; --ink:#edf7ff; --muted:#9db1c8; --cyan:#39d9ff; --violet:#a78bfa; --green:#48e0a4; --amber:#ffc857; --red:#ff6b7a; --line:#28415d; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:radial-gradient(circle at 80% 0,#173561 0,transparent 35%),var(--bg); color:var(--ink); font:16px/1.55 Inter,ui-sans-serif,system-ui,sans-serif; }
+    main { width:min(1180px,calc(100% - 32px)); margin:auto; padding:48px 0 80px; }
+    h1 { font-size:clamp(2.3rem,6vw,5.4rem); line-height:.96; letter-spacing:-.055em; margin:18px 0; max-width:1000px; }
+    h2 { margin:64px 0 20px; font-size:clamp(1.55rem,3vw,2.4rem); letter-spacing:-.03em; }
+    h3 { margin:0 0 8px; } p { color:var(--muted); } code { color:#c9f4ff; }
+    .eyebrow { display:inline-block; border:1px solid #406182; border-radius:999px; padding:6px 12px; color:var(--cyan); font-weight:700; letter-spacing:.08em; text-transform:uppercase; font-size:.73rem; }
+    .lead { max-width:850px; font-size:1.2rem; }
+    .grid { display:grid; gap:18px; }.metrics { grid-template-columns:repeat(4,1fr); margin:34px 0; }
+    .card { background:linear-gradient(145deg,rgba(20,42,69,.94),rgba(10,25,43,.94)); border:1px solid var(--line); border-radius:20px; padding:22px; box-shadow:0 18px 50px rgba(0,0,0,.2); }
+    .metric strong { display:block; font-size:2rem; }.metric span { color:var(--muted); font-size:.88rem; }
+    .good { color:var(--green)!important }.warn { color:var(--amber)!important }.bad { color:var(--red)!important }
+    .split { grid-template-columns:1.1fr .9fr; align-items:stretch }.diagram { overflow:auto } svg { width:100%; height:auto; display:block }
+    .legend { display:flex; flex-wrap:wrap; gap:14px; color:var(--muted); font-size:.85rem }.dot { width:10px; height:10px; border-radius:50%; display:inline-block; margin-right:6px }
+    table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums } th,td { padding:12px 10px; border-bottom:1px solid var(--line); text-align:right } th:first-child,td:first-child { text-align:left }
+    .flow { display:grid; grid-template-columns:repeat(5,1fr); gap:10px }.step { min-height:112px; display:grid; place-items:center; text-align:center; border-radius:16px; padding:12px; border:1px solid var(--line); background:#10243b }
+    .callout { border-left:4px solid var(--amber); padding:4px 20px; margin:28px 0 }.callout strong { color:var(--amber) }
+    .timeline { display:grid; grid-template-columns:repeat(4,1fr); gap:14px }.timeline b { color:var(--cyan) }
+    footer { margin-top:64px; color:var(--muted); border-top:1px solid var(--line); padding-top:22px }
+    @media(max-width:850px){.metrics,.split,.timeline{grid-template-columns:1fr 1fr}.flow{grid-template-columns:1fr}.step{min-height:72px}}
+    @media(max-width:560px){.metrics,.split,.timeline{grid-template-columns:1fr}main{width:min(100% - 20px,1180px)}}
+  </style>
+</head>
+<body>
+<main>
+  <span class="eyebrow">mytriton · Version 25 · A100 / SM80</span>
+  <h1>Production-shaped Tensor Core tile — и стена latency, которую он обнаружил.</h1>
+  <p class="lead">Version 25 добавляет нативный <code>m16n8k16</code>, CTA <code>128×128×32</code>, сгруппированные <code>ldmatrix.x4</code> и прямой epilogue из регистров в global memory. Результат корректен. Но пока не быстр — и profiler точно показывает почему.</p>
+
+  <section class="grid metrics">
+    <div class="card metric"><strong class="good">63.19</strong><span>TFLOP/s · лучший текущий tile</span></div>
+    <div class="card metric"><strong class="bad">36.08</strong><span>TFLOP/s · 4-warp tile 128²</span></div>
+    <div class="card metric"><strong>202</strong><span>регистра на поток</span></div>
+    <div class="card metric"><strong class="warn">86.45%</strong><span>циклов без готового warp</span></div>
+  </section>
+
+  <div class="callout"><strong>Вывод по измерениям.</strong> Изначальная цель 130–190 TFLOP/s для большого tile без pipeline была ошибочной. Повторное использование данных не окупается, пока копирование, загрузка фрагментов и MMA не перекрываются.</div>
+
+  <h2>1. Новая иерархия вычислений</h2>
+  <section class="grid split">
+    <div class="card diagram">
+      <svg viewBox="0 0 700 500" role="img" aria-label="CTA 128 на 128, разделённый на четыре warp tile 64 на 64">
+        <defs><linearGradient id="g" x1="0" x2="1"><stop stop-color="#39d9ff"/><stop offset="1" stop-color="#a78bfa"/></linearGradient></defs>
+        <rect x="65" y="45" width="480" height="384" rx="18" fill="#091827" stroke="url(#g)" stroke-width="4"/>
+        <rect x="65" y="45" width="240" height="192" fill="#123b55"/><rect x="305" y="45" width="240" height="192" fill="#292452"/><rect x="65" y="237" width="240" height="192" fill="#173c3b"/><rect x="305" y="237" width="240" height="192" fill="#3d2f28"/>
+        <path d="M305 45v384M65 237h480" stroke="#edf7ff" stroke-opacity=".65" stroke-width="2"/>
+        <g fill="#edf7ff" font-family="system-ui" text-anchor="middle"><text x="305" y="25" font-size="22">CTA output 128 × 128</text><text x="185" y="140" font-size="22">warp 0</text><text x="425" y="140" font-size="22">warp 1</text><text x="185" y="332" font-size="22">warp 2</text><text x="425" y="332" font-size="22">warp 3</text></g>
+        <g fill="#9db1c8" font-family="system-ui" text-anchor="middle" font-size="16"><text x="185" y="166">64 × 64 результата</text><text x="425" y="166">64 × 64 результата</text><text x="185" y="358">64 × 64 результата</text><text x="425" y="358">64 × 64 результата</text></g>
+        <path d="M575 80v320" stroke="#ffc857" stroke-width="3"/><path d="M565 80h20M565 400h20" stroke="#ffc857" stroke-width="3"/><text x="620" y="245" fill="#ffc857" font-family="system-ui" text-anchor="middle" transform="rotate(90 620 245)">reduction slice BK = 32</text>
+      </svg>
+    </div>
+    <div class="card">
+      <h3>Физическая работа одного warp</h3>
+      <p>Warp владеет output tile <code>64×64</code>. На SM80 срез K=32 раскладывается так:</p>
+      <table><tr><td>M atoms</td><td>64 / 16 = 4</td></tr><tr><td>N atoms</td><td>64 / 8 = 8</td></tr><tr><td>K atoms</td><td>32 / 16 = 2</td></tr><tr><td><b>MMA-инструкций</b></td><td><b>64</b></td></tr></table>
+      <p>Каждая lane хранит 128 FP32 accumulator values. Это увеличивает reuse, но одновременно создаёт длинный dependency graph и register pressure.</p>
+      <div class="legend"><span><i class="dot" style="background:#39d9ff"></i>warp по M</span><span><i class="dot" style="background:#a78bfa"></i>warp по N</span><span><i class="dot" style="background:#ffc857"></i>срез K</span></div>
+    </div>
+  </section>
+
+  <h2>2. От 96 KiB к прямому epilogue</h2>
+  <section class="flow">
+    <div class="step"><div><b>MMA-регистры</b><br><small>4 значения / fragment / lane</small></div></div>
+    <div class="step"><div><b>Lane mapping</b><br><small>group = lane / 4<br>pair = lane % 4</small></div></div>
+    <div class="step"><div><b>Global coordinates</b><br><small>warp + atom + lane</small></div></div>
+    <div class="step"><div><b>float2</b><br><small>выровненная пара</small></div></div>
+    <div class="step"><div><b>Scalar fallback</b><br><small>нечётный stride или tail</small></div></div>
+  </section>
+  <section class="grid split" style="margin-top:18px">
+    <div class="card"><h3 class="bad">Раньше</h3><p>32 KiB staging A/B + 64 KiB spill FP32 result = <b>96 KiB</b>. Требовались block barrier и повторный проход через обычный register layout.</p></div>
+    <div class="card"><h3 class="good">Version 25</h3><p>Accumulator registers сразу записываются в C. Остаются только <b>32 KiB</b> операндов. Полный tile и tail <code>117×109×29</code> проходят на A100.</p></div>
+  </section>
+
+  <h2>3. Что показал benchmark</h2>
+  <section class="card diagram">
+    <svg viewBox="0 0 900 390" role="img" aria-label="Сравнение TFLOPS конфигураций Version 25">
+      <g stroke="#28415d"><path d="M120 320H850M120 250H850M120 180H850M120 110H850M120 40H850"/></g>
+      <g fill="#9db1c8" font-family="system-ui" font-size="14" text-anchor="end"><text x="105" y="325">0</text><text x="105" y="255">20</text><text x="105" y="185">40</text><text x="105" y="115">60</text><text x="105" y="45">80 TF/s</text></g>
+      <g><rect x="165" y="99" width="100" height="221" rx="8" fill="#48e0a4"/><rect x="330" y="194" width="100" height="126" rx="8" fill="#ff6b7a"/><rect x="495" y="111" width="100" height="209" rx="8" fill="#ffc857"/><rect x="660" y="88" width="100" height="232" rx="8" fill="#39d9ff"/></g>
+      <g fill="#edf7ff" font-family="system-ui" text-anchor="middle" font-weight="700"><text x="215" y="88">63.19</text><text x="380" y="183">36.08</text><text x="545" y="100">59.61</text><text x="710" y="77">66.18</text></g>
+      <g fill="#9db1c8" font-family="system-ui" text-anchor="middle" font-size="14"><text x="215" y="345">64×16×64</text><text x="215" y="365">4 warps</text><text x="380" y="345">128×32×128</text><text x="380" y="365">4 warps</text><text x="545" y="345">128×32×128</text><text x="545" y="365">8 warps</text><text x="710" y="345">128×16×128</text><text x="710" y="365">16 warps</text></g>
+    </svg>
+  </section>
+
+  <h2>4. Почему большой tile простаивает</h2>
+  <section class="grid split">
+    <div class="card diagram">
+      <svg viewBox="0 0 760 360" role="img" aria-label="Последовательный текущий pipeline и будущий pipeline с перекрытием">
+        <g font-family="system-ui"><text x="20" y="35" fill="#edf7ff" font-size="20">Текущая последовательная K-итерация</text>
+        <rect x="20" y="58" width="175" height="54" rx="9" fill="#194867"/><rect x="205" y="58" width="85" height="54" rx="9" fill="#614d20"/><rect x="300" y="58" width="160" height="54" rx="9" fill="#432c64"/><rect x="470" y="58" width="210" height="54" rx="9" fill="#174b3c"/>
+        <g fill="#edf7ff" text-anchor="middle" font-size="15"><text x="107" y="91">global → shared</text><text x="247" y="91">barrier</text><text x="380" y="91">ldmatrix</text><text x="575" y="91">64 MMA atoms</text></g>
+        <text x="20" y="170" fill="#edf7ff" font-size="20">Необходимый pipeline с перекрытием</text>
+        <rect x="20" y="195" width="280" height="42" rx="8" fill="#194867"/><rect x="250" y="247" width="250" height="42" rx="8" fill="#432c64"/><rect x="430" y="195" width="280" height="42" rx="8" fill="#174b3c"/>
+        <g fill="#edf7ff" text-anchor="middle" font-size="14"><text x="160" y="221">cp.async tile k+2</text><text x="375" y="273">ldmatrix tile k+1</text><text x="570" y="221">MMA tile k</text></g>
+        <path d="M20 315H710" stroke="#9db1c8"/><text x="365" y="342" fill="#9db1c8" text-anchor="middle">время →</text></g>
+      </svg>
+    </div>
+    <div class="card">
+      <h3>Данные profiler</h3>
+      <table><tr><td>Нет eligible warp</td><td class="bad">86.45%</td></tr><tr><td>Eligible warps / scheduler</td><td>0.16</td></tr><tr><td>Warp cycles / instruction</td><td>14.53</td></tr><tr><td>Long-scoreboard stall</td><td>9.6 cycles</td></tr><tr><td>Compute throughput</td><td>15.20%</td></tr><tr><td>DRAM throughput</td><td>4.49%</td></tr><tr><td>Local spills</td><td class="good">0</td></tr></table>
+      <p>Низкая загрузка DRAM и отсутствие spills исключают очевидные причины. GPU ждёт зависимые L1TEX/shared fragment operations.</p>
+    </div>
+  </section>
+
+  <h2>5. Исправленный путь к быстрому kernel</h2>
+  <section class="timeline">
+    <div class="card"><b>Version 25</b><h3>Фундамент</h3><p>K=16 MMA, production layouts, direct epilogue, correctness.</p></div>
+    <div class="card"><b>Дальше</b><h3>Async staging</h3><p><code>cp.async</code> и компактное shared-кольцо на три stage.</p></div>
+    <div class="card"><b>Затем</b><h3>Register pipeline</h3><p>Загружать fragments tile k+1, пока MMA считает tile k.</p></div>
+    <div class="card"><b>После</b><h3>Autotune</h3><p>Выбирать измеренные schedules по shape, dtype и target.</p></div>
+  </section>
+
+  <footer>Измерено 25 октября 2026 · NVIDIA A100-SXM4-40GB · BF16 inputs · FP32 accumulation/output · Источник: <code>matmul_production_tile_a100_report.md</code></footer>
+</main>
+</body>
+</html>

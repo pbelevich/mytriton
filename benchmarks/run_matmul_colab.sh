@@ -16,7 +16,7 @@ Run benchmark_matmul.py in the VS Code Colab runtime.
 Usage:
   ./benchmarks/run_matmul_colab.sh [benchmark_matmul.py arguments]
 
-With no arguments, benchmark the best Version 22 BF16 tile found on A100:
+With no arguments, benchmark the best current BF16 tile found on A100:
   --sizes 4096 8192 --tiles 64x16x64 --dtype bf16 --warmup 3 --repeats 10
 
 Examples:
