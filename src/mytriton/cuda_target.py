@@ -51,6 +51,10 @@ class CudaTarget:
         return self.compute_capability >= 75
 
     @property
+    def supports_ldmatrix(self) -> bool:
+        return self.compute_capability >= 75
+
+    @property
     def supports_bf16_mma_m16n8k8(self) -> bool:
         return self.compute_capability >= 80
 

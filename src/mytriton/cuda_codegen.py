@@ -1,4 +1,5 @@
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -330,50 +331,81 @@ class SSACUDACodegen:
 
         raise TypeError(f"Cannot convert CUDA value to {destination_ty}")
 
-    def pack_f16x2(
+    def emit_ldmatrix_m8n8(
         self,
-        low: str,
-        high: str,
-    ) -> str:
-        """Pack two f16 values into one PTX .f16x2 register."""
+        *,
+        name: str,
+        buffer: CudaSharedBuffer,
+        matrix_origins: tuple[tuple[str, str], ...],
+        lane: str,
+        transpose: bool = False,
+        stage: str | None = None,
+    ) -> tuple[str, ...]:
+        """Collectively load one to four 8x8 b16 matrices into warp registers."""
 
-        self.required_headers.add("#include <cuda_fp16.h>")
+        matrix_count = len(matrix_origins)
+        if matrix_count not in (1, 2, 4):
+            raise ValueError(
+                f"ldmatrix matrix count must be 1, 2, or 4, got {matrix_count}"
+            )
 
-        return (
-            "(static_cast<unsigned>("
-            f"__half_as_ushort({low})) | "
-            "(static_cast<unsigned>("
-            f"__half_as_ushort({high})) << 16))"
+        if not self.target.supports_ldmatrix:
+            raise TypeError(f"ldmatrix requires sm_75+, got {self.target.chip}")
+
+        if buffer.element_ty not in (F16, BF16):
+            raise TypeError(
+                "ldmatrix requires 16-bit shared-memory elements, "
+                f"got {buffer.element_ty}"
+            )
+
+        row = f"({lane} & 7)"
+
+        def row_expression(origin: str) -> str:
+            if origin == "0":
+                return row
+            return f"{origin} + {row}"
+
+        addresses = tuple(
+            f"&{buffer.element(row_expression(row_origin), column_origin, stage=stage)}"
+            for row_origin, column_origin in matrix_origins
         )
 
-    def pack_bf16x2(
-        self,
-        low: str,
-        high: str,
-    ) -> str:
-        """Pack two bf16 values into one PTX .bf16x2 register."""
+        if matrix_count == 1:
+            address = addresses[0]
+        else:
+            matrix = f"(({lane} >> 3) & {matrix_count - 1})"
+            address = addresses[-1]
+            for index in reversed(range(matrix_count - 1)):
+                address = f"({matrix} == {index} ? {addresses[index]} : {address})"
 
-        self.required_headers.add("#include <cuda_bf16.h>")
+        address_name = f"{name}_address"
+        registers = tuple(f"{name}_{index}" for index in range(matrix_count))
+        outputs = ", ".join(f'"=r"({register})' for register in registers)
+        placeholders = ", ".join(f"%{index}" for index in range(matrix_count))
+        address_placeholder = matrix_count
+        transpose_suffix = ".trans" if transpose else ""
 
-        return (
-            "(static_cast<unsigned>("
-            f"static_cast<__nv_bfloat16_raw>({low}).x) | "
-            "(static_cast<unsigned>("
-            f"static_cast<__nv_bfloat16_raw>({high}).x) << 16))"
+        self.lines.extend(
+            [
+                (
+                    f"    unsigned {address_name} = static_cast<unsigned>("
+                    f"__cvta_generic_to_shared({address}));"
+                ),
+                *(f"    unsigned {register};" for register in registers),
+                "    asm volatile(",
+                (
+                    '        "ldmatrix.sync.aligned.m8n8.'
+                    f"x{matrix_count}{transpose_suffix}.shared.b16 "
+                    f'{{{placeholders}}}, [%{address_placeholder}];"'
+                ),
+                f"        : {outputs}",
+                f'        : "r"({address_name})',
+                '        : "memory"',
+                "    );",
+            ]
         )
 
-    def pack_mma_operand_pair(
-        self,
-        low: str,
-        high: str,
-        operand_ty: ScalarType,
-    ) -> str:
-        if operand_ty == F16:
-            return self.pack_f16x2(low, high)
-        if operand_ty == BF16:
-            return self.pack_bf16x2(low, high)
-
-        raise TypeError(f"m16n8k8 MMA does not support {operand_ty} operands")
+        return registers
 
     def emit_mma_operand_registers(
         self,
@@ -418,71 +450,25 @@ class SSACUDACodegen:
         if operand_ty == BF16 and not self.target.supports_bf16_mma_m16n8k8:
             raise TypeError(f"m16n8k8 bf16 MMA requires sm_80+, got {self.target.chip}")
 
-        group = f"mma_group_{result_id}"
-        thread = f"mma_thread_{result_id}"
-        lhs_register_0 = f"mma_a_{result_id}_0"
-        lhs_register_1 = f"mma_a_{result_id}_1"
-        rhs_register = f"mma_b_{result_id}_0"
-
-        self.lines.extend(
-            [
-                f"    int {group} = threadIdx.x >> 2;",
-                f"    int {thread} = threadIdx.x & 3;",
-            ]
-        )
-
-        lhs_0_low = buffers.lhs.element(
-            group,
-            f"{thread} * 2",
+        lhs_registers = self.emit_ldmatrix_m8n8(
+            name=f"mma_a_{result_id}",
+            buffer=buffers.lhs,
+            matrix_origins=(("0", "0"), ("8", "0")),
+            lane="threadIdx.x",
             stage=stage,
         )
-        lhs_0_high = buffers.lhs.element(
-            group,
-            f"{thread} * 2 + 1",
+        rhs_registers = self.emit_ldmatrix_m8n8(
+            name=f"mma_b_{result_id}",
+            buffer=buffers.rhs,
+            matrix_origins=(("0", "0"),),
+            lane="threadIdx.x",
+            transpose=True,
             stage=stage,
-        )
-        lhs_1_low = buffers.lhs.element(
-            f"{group} + 8",
-            f"{thread} * 2",
-            stage=stage,
-        )
-        lhs_1_high = buffers.lhs.element(
-            f"{group} + 8",
-            f"{thread} * 2 + 1",
-            stage=stage,
-        )
-
-        rhs_low = buffers.rhs.element(
-            f"{thread} * 2",
-            group,
-            stage=stage,
-        )
-        rhs_high = buffers.rhs.element(
-            f"{thread} * 2 + 1",
-            group,
-            stage=stage,
-        )
-
-        self.lines.extend(
-            [
-                (
-                    f"    unsigned {lhs_register_0} = "
-                    f"{self.pack_mma_operand_pair(lhs_0_low, lhs_0_high, operand_ty)};"
-                ),
-                (
-                    f"    unsigned {lhs_register_1} = "
-                    f"{self.pack_mma_operand_pair(lhs_1_low, lhs_1_high, operand_ty)};"
-                ),
-                (
-                    f"    unsigned {rhs_register} = "
-                    f"{self.pack_mma_operand_pair(rhs_low, rhs_high, operand_ty)};"
-                ),
-            ]
         )
 
         return (
-            (lhs_register_0, lhs_register_1),
-            rhs_register,
+            (lhs_registers[0], lhs_registers[1]),
+            rhs_registers[0],
         )
 
     def emit_mma_warp_tile_operand_registers(
@@ -553,123 +539,102 @@ class SSACUDACodegen:
         if operand_ty == BF16 and not self.target.supports_bf16_mma_m16n8k8:
             raise TypeError(f"m16n8k8 bf16 MMA requires sm_80+, got {self.target.chip}")
 
-        group = f"mma_group_{result_id}"
-        thread = f"mma_thread_{result_id}"
-
-        self.lines.extend(
-            [
-                f"    int {group} = {lane} >> 2;",
-                f"    int {thread} = {lane} & 3;",
-            ]
-        )
-
         instruction_m, instruction_n, instruction_k = layout.instruction_shape
         half_instruction_m = instruction_m // 2
-        thread_pair = f"{thread} * 2"
 
         def add_offset(expression: str, offset: int) -> str:
             if offset == 0:
                 return expression
+            if expression.isdigit():
+                return str(int(expression) + offset)
             return f"{expression} + {offset}"
 
-        instruction_operands: list[tuple[tuple[str, str], str]] = []
-
-        for m_tile, n_tile, k_tile in layout.instruction_coordinates():
-            m_offset = m_tile * instruction_m
-            n_offset = n_tile * instruction_n
-            k_offset = k_tile * instruction_k
-
-            lhs_row_0 = add_offset(group, m_offset)
-            lhs_row_1 = add_offset(
-                group,
-                m_offset + half_instruction_m,
-            )
-            lhs_column_0 = add_offset(thread_pair, k_offset)
-            lhs_column_1 = add_offset(thread_pair, k_offset + 1)
-
-            rhs_row_0 = add_offset(thread_pair, k_offset)
-            rhs_row_1 = add_offset(thread_pair, k_offset + 1)
-            rhs_column = add_offset(group, n_offset)
-
-            if lhs_warp_row_offset is not None:
-                lhs_row_0 = f"{lhs_warp_row_offset} + {lhs_row_0}"
-                lhs_row_1 = f"{lhs_warp_row_offset} + {lhs_row_1}"
-
-            if rhs_warp_column_offset is not None:
-                rhs_column = f"{rhs_warp_column_offset} + {rhs_column}"
-
-            lhs_0_low = buffers.lhs.element(
-                lhs_row_0,
-                lhs_column_0,
-                stage=stage,
-            )
-            lhs_0_high = buffers.lhs.element(
-                lhs_row_0,
-                lhs_column_1,
-                stage=stage,
-            )
-            lhs_1_low = buffers.lhs.element(
-                lhs_row_1,
-                lhs_column_0,
-                stage=stage,
-            )
-            lhs_1_high = buffers.lhs.element(
-                lhs_row_1,
-                lhs_column_1,
-                stage=stage,
-            )
-
-            rhs_low = buffers.rhs.element(
-                rhs_row_0,
-                rhs_column,
-                stage=stage,
-            )
-            rhs_high = buffers.rhs.element(
-                rhs_row_1,
-                rhs_column,
-                stage=stage,
-            )
-
-            register_suffix = f"{result_id}_{m_tile}_{n_tile}_{k_tile}"
-            lhs_register_0 = f"mma_a_{register_suffix}_0"
-            lhs_register_1 = f"mma_a_{register_suffix}_1"
-            rhs_register = f"mma_b_{register_suffix}_0"
-
-            packed_lhs_0 = self.pack_mma_operand_pair(
-                lhs_0_low,
-                lhs_0_high,
-                operand_ty,
-            )
-            packed_lhs_1 = self.pack_mma_operand_pair(
-                lhs_1_low,
-                lhs_1_high,
-                operand_ty,
-            )
-            packed_rhs = self.pack_mma_operand_pair(
-                rhs_low,
-                rhs_high,
-                operand_ty,
-            )
-
-            self.lines.extend(
-                [
-                    (f"    unsigned {lhs_register_0} = {packed_lhs_0};"),
-                    (f"    unsigned {lhs_register_1} = {packed_lhs_1};"),
-                    (f"    unsigned {rhs_register} = {packed_rhs};"),
-                ]
-            )
-
-            instruction_operands.append(
-                (
+        lhs_matrices: list[tuple[tuple[int, int, int], tuple[str, str]]] = []
+        for k_tile in range(layout.k_tiles):
+            for m_tile in range(layout.m_tiles):
+                row_offset = m_tile * instruction_m
+                column_offset = k_tile * instruction_k
+                if lhs_warp_row_offset is None:
+                    row = str(row_offset)
+                    second_row = str(row_offset + half_instruction_m)
+                else:
+                    row = add_offset(lhs_warp_row_offset, row_offset)
+                    second_row = add_offset(
+                        lhs_warp_row_offset,
+                        row_offset + half_instruction_m,
+                    )
+                column = str(column_offset)
+                lhs_matrices.extend(
                     (
-                        lhs_register_0,
-                        lhs_register_1,
-                    ),
-                    rhs_register,
+                        ((m_tile, k_tile, 0), (row, column)),
+                        ((m_tile, k_tile, 1), (second_row, column)),
+                    )
                 )
-            )
 
-        return tuple(instruction_operands)
+        rhs_matrices: list[tuple[tuple[int, int], tuple[str, str]]] = []
+        for k_tile in range(layout.k_tiles):
+            for n_tile in range(layout.n_tiles):
+                row = str(k_tile * instruction_k)
+                column_offset = n_tile * instruction_n
+                if rhs_warp_column_offset is None:
+                    column = str(column_offset)
+                else:
+                    column = add_offset(rhs_warp_column_offset, column_offset)
+                rhs_matrices.append(((k_tile, n_tile), (row, column)))
+
+        def emit_matrix_batches(
+            *,
+            prefix: str,
+            matrices: Sequence[tuple[tuple[int, ...], tuple[str, str]]],
+            transpose: bool,
+            buffer: CudaSharedBuffer,
+        ) -> dict[tuple[int, ...], str]:
+            loaded: dict[tuple[int, ...], str] = {}
+            offset = 0
+            batch_index = 0
+            while offset < len(matrices):
+                remaining = len(matrices) - offset
+                batch_size = 4 if remaining >= 4 else 2 if remaining >= 2 else 1
+                batch = matrices[offset : offset + batch_size]
+                registers = self.emit_ldmatrix_m8n8(
+                    name=f"{prefix}_{batch_index}",
+                    buffer=buffer,
+                    matrix_origins=tuple(origin for _, origin in batch),
+                    lane=lane,
+                    transpose=transpose,
+                    stage=stage,
+                )
+                loaded.update(
+                    (key, register)
+                    for (key, _), register in zip(batch, registers, strict=True)
+                )
+                offset += batch_size
+                batch_index += 1
+            return loaded
+
+        lhs_registers = emit_matrix_batches(
+            prefix=f"mma_a_{result_id}",
+            matrices=lhs_matrices,
+            transpose=False,
+            buffer=buffers.lhs,
+        )
+        rhs_registers = emit_matrix_batches(
+            prefix=f"mma_b_{result_id}",
+            matrices=rhs_matrices,
+            transpose=True,
+            buffer=buffers.rhs,
+        )
+
+        return tuple(
+            (
+                (
+                    lhs_registers[(m_tile, k_tile, 0)],
+                    lhs_registers[(m_tile, k_tile, 1)],
+                ),
+                rhs_registers[(k_tile, n_tile)],
+            )
+            for m_tile, n_tile, k_tile in layout.instruction_coordinates()
+        )
 
     def emit_mma_m16n8k8_instruction(
         self,

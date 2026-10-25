@@ -13,7 +13,7 @@ PTX. The current development version includes shared-memory tiled matrix
 multiplication, FP16/BF16 inputs, FP32 accumulation, and multi-warp Tensor Core
 CTA tiles built from NVIDIA `mma.sync` instructions.
 Low-precision operands are cooperatively staged with aligned 128-bit
-global-to-shared copies and a safe masked scalar fallback.
+global-to-shared copies, then loaded into warp fragments with `ldmatrix`.
 
 ```text
 Python kernel
@@ -58,6 +58,7 @@ full [changelog](CHANGELOG.md) and the accompanying
 | [`ver21`](https://github.com/pbelevich/mytriton/tree/ver21) | [Composable warp MMA tiles](docs/implementation.md#composable-warp-mma-tiles) |
 | [`ver22`](https://github.com/pbelevich/mytriton/tree/ver22) | [Multi-warp Tensor Core CTAs](docs/implementation.md#multi-warp-cta-tiles) |
 | [`ver23`](https://github.com/pbelevich/mytriton/tree/ver23) | [Vectorized operand staging](docs/implementation.md#vectorized-global-to-shared-staging) |
+| [`ver24`](https://github.com/pbelevich/mytriton/tree/ver24) | [`ldmatrix` operand fragments](docs/implementation.md#warp-cooperative-ldmatrix-fragments) |
 
 ## Tensor-core matmul
 
@@ -165,6 +166,19 @@ shared memory with one 128-bit copy:
     *reinterpret_cast<const uint4 *>(&global[source_index]);
 ```
 
+Each warp then loads the shared A and B tiles directly into the packed
+register layout required by `mma.sync`:
+
+```cuda
+asm volatile(
+    "ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
+    "{%0, %1, %2, %3}, [%4];"
+    : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
+    : "r"(shared_address)
+    : "memory"
+);
+```
+
 On A100 this raises the best measured kernel throughput from about 24 to 41
 TFLOP/s. See the
 [Version 23 performance report](benchmarks/matmul_vectorized_staging_a100_report.md)
@@ -172,8 +186,9 @@ for the complete methodology, tile sweep, SASS, and Nsight Compute analysis.
 
 FP16 MMA requires `sm_75+`; native BF16 MMA requires `sm_80+`. Unsupported
 types, shapes, and targets retain the CUDA-core fallback. See the
-[implementation guide](docs/implementation.md#tensor-core-dot) for fragment
-layouts, composition, accumulation, and current performance limitations.
+[implementation guide](docs/implementation.md#warp-cooperative-ldmatrix-fragments)
+for fragment layouts, composition, accumulation, and current performance
+limitations.
 
 ## Documentation
 
