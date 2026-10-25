@@ -1641,6 +1641,13 @@ class SSACUDACodegen:
             )
 
         shared_alignment = 16 if element_ty in (F16, BF16) else 1
+        uses_ldmatrix = element_ty in (F16, BF16) and (
+            dot_result_id in self.mma_dot_layouts
+            or dot_result_id in self.mma_cta_dot_layouts
+        )
+        swizzle_segment_width = (
+            16 // cuda_scalar_nbytes(element_ty) if uses_ldmatrix else 0
+        )
 
         lhs_row_padding = (
             cuda_f32_shared_row_padding(
@@ -1658,6 +1665,7 @@ class SSACUDACodegen:
             row_padding=lhs_row_padding,
             stage_count=stage_count,
             alignment=shared_alignment,
+            swizzle_segment_width=swizzle_segment_width,
         )
         rhs = CudaSharedBuffer(
             name=f"dot_rhs_{dot_result_id}",
@@ -1665,6 +1673,7 @@ class SSACUDACodegen:
             element_ty=element_ty,
             stage_count=stage_count,
             alignment=shared_alignment,
+            swizzle_segment_width=swizzle_segment_width,
         )
 
         # Reserve both operands before mutating the generated CUDA fragment.
