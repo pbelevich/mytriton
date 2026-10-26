@@ -1,4 +1,5 @@
 import importlib
+import statistics
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any, Protocol, TypeGuard
@@ -231,6 +232,60 @@ def execute_cuda_if_needed(
             (threads_per_block,),
             tuple(_convert_runtime_arg(value) for value in normalized_args),
         )
+
+
+def benchmark_cuda_kernel(
+    *,
+    kernel_cache: CudaKernelCache,
+    cuda_src: str,
+    kernel_name: str,
+    launch_grid: tuple[int, ...],
+    threads_per_block: int,
+    runtime_args: tuple[object, ...],
+    warmup: int,
+    rep: int,
+) -> float:
+    """Return median kernel latency in milliseconds using CUDA events."""
+
+    if not cuda_execution_required(runtime_args, backend_name="CUDA benchmark"):
+        raise TypeError("CUDA benchmark requires CUDA array arguments")
+
+    cp = cuda_module()
+    with _cuda_launch_context(cp, runtime_args):
+        max_threads = cp.cuda.Device().attributes["MaxThreadsPerBlock"]
+        if threads_per_block > max_threads:
+            raise ValueError(
+                f"CUDA block size {threads_per_block} "
+                f"exceeds device limit {max_threads}"
+            )
+
+        cache_key = (cuda_src, kernel_name, cp.cuda.Device().id)
+        if cache_key not in kernel_cache:
+            kernel_cache[cache_key] = cp.RawKernel(
+                cuda_src,
+                kernel_name,
+                options=("--std=c++14",),
+            )
+
+        normalized_args = _normalize_cuda_array_args(cp, runtime_args)
+        converted_args = tuple(_convert_runtime_arg(value) for value in normalized_args)
+        kernel = kernel_cache[cache_key]
+
+        for _ in range(warmup):
+            kernel(launch_grid, (threads_per_block,), converted_args)
+        cp.cuda.get_current_stream().synchronize()
+
+        samples = []
+        for _ in range(rep):
+            start = cp.cuda.Event()
+            end = cp.cuda.Event()
+            start.record()
+            kernel(launch_grid, (threads_per_block,), converted_args)
+            end.record()
+            end.synchronize()
+            samples.append(cp.cuda.get_elapsed_time(start, end))
+
+    return statistics.median(samples)
 
 
 def cuda_chip(runtime_args: tuple[object, ...] = ()) -> str:

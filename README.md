@@ -14,6 +14,8 @@ multiplication, FP16/BF16 inputs, FP32 accumulation, and multi-warp Tensor Core
 CTA tiles built from NVIDIA `mma.sync` instructions.
 Low-precision operands are cooperatively staged with aligned 128-bit
 `cp.async` copies, then loaded into warp fragments with `ldmatrix`.
+Triton-style `Config` and `autotune` APIs select a CUDA schedule per problem
+shape and cache the measured winner.
 
 ```text
 Python kernel
@@ -62,6 +64,7 @@ full [changelog](CHANGELOG.md) and the accompanying
 | [`ver25`](https://github.com/pbelevich/mytriton/tree/ver25) | [SM80 production tensor tile](docs/implementation.md#sm80-production-tensor-tile) |
 | [`ver26`](https://github.com/pbelevich/mytriton/tree/ver26) | [Three-stage `cp.async` pipeline](docs/implementation.md#pipelined-tensor-core-gemm) |
 | [`ver27`](https://github.com/pbelevich/mytriton/tree/ver27) | [Static register pipeline](docs/implementation.md#static-register-pipeline) |
+| [`ver28`](https://github.com/pbelevich/mytriton/tree/ver28) | [CUDA event autotuning](docs/implementation.md#cuda-event-autotuning) |
 
 ## Tensor-core matmul
 
@@ -76,6 +79,13 @@ import mytriton as triton
 import mytriton.language as tl
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BM": 64, "BK": 32, "BN": 64}, num_warps=4),
+        triton.Config({"BM": 128, "BK": 32, "BN": 128}, num_warps=4),
+    ],
+    key=["M", "N", "K"],
+)
 @triton.jit
 def matmul_kernel(
     a,
@@ -118,15 +128,17 @@ def matmul_kernel(
     tl.store(output_pointers, accumulator, mask=output_mask)
 
 
-M, N, K = 128, 128, 128
-BM, BK, BN = 128, 32, 128
+M, N, K = 4096, 4096, 4096
 
 torch.manual_seed(0)
 a = torch.randn((M, K), device="cuda", dtype=torch.float16)
 b = torch.randn((K, N), device="cuda", dtype=torch.float16)
 out = torch.empty((M, N), device="cuda", dtype=torch.float32)
 
-grid = (triton.cdiv(M, BM), triton.cdiv(N, BN))
+grid = lambda meta: (
+    triton.cdiv(M, meta["BM"]),
+    triton.cdiv(N, meta["BN"]),
+)
 _, _, cuda_source = matmul_kernel[grid](
     a,
     b,
@@ -134,10 +146,6 @@ _, _, cuda_source = matmul_kernel[grid](
     M,
     N,
     K,
-    BM=BM,
-    BK=BK,
-    BN=BN,
-    num_warps=4,
 )
 
 expected = a.float() @ b.float()
@@ -206,10 +214,15 @@ schedule, warp-raked copies, precomputed shared addresses, and two live K
 fragment sets. The final BF16 `4096^3` run reaches 187.19 TFLOP/s, with
 202.14 TFLOP/s observed in a same-day run; FP16 reaches 203.67 TFLOP/s. See the
 [Version 27 performance report](benchmarks/matmul_static_pipeline_a100_report.md).
+Version 28 adds CUDA-event autotuning and a per-device, per-dtype, per-shape
+winner cache. It selects `64 x 32 x 64` for smaller square matrices and the
+static `128 x 32 x 128` pipeline for large matrices. On A100, BF16 `8192^3`
+reaches 210.21 TFLOP/s, 86.7% of torch/cuBLAS in the same run. See the
+[Version 28 performance report](benchmarks/matmul_autotune_a100_report.md).
 
 FP16 MMA requires `sm_75+`; native BF16 MMA requires `sm_80+`. Unsupported
 types, shapes, and targets retain the CUDA-core fallback. See the
-[implementation guide](docs/implementation.md#static-register-pipeline)
+[implementation guide](docs/implementation.md#cuda-event-autotuning)
 for fragment layouts, shared-memory mapping, composition, and accumulation.
 
 ## Documentation

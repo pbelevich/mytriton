@@ -25,6 +25,7 @@ compiler notes live in the [implementation guide](implementation.md).
 - [SM80 production tensor tile](implementation.md#sm80-production-tensor-tile)
 - [Pipelined Tensor Core GEMM](implementation.md#pipelined-tensor-core-gemm)
 - [Static register pipeline](implementation.md#static-register-pipeline)
+- [CUDA event autotuning](implementation.md#cuda-event-autotuning)
 - [A100 Version 23 performance report](../benchmarks/matmul_vectorized_staging_a100_report.md)
 - [A100 Version 24 `ldmatrix` report](../benchmarks/matmul_ldmatrix_a100_report.md)
 - [A100 Version 25 production-tile report](../benchmarks/matmul_production_tile_a100_report.md)
@@ -36,6 +37,9 @@ compiler notes live in the [implementation guide](implementation.md).
 - [A100 Version 27 static-pipeline report](../benchmarks/matmul_static_pipeline_a100_report.md)
 - [Version 27 visual report — English](../benchmarks/version27_static_pipeline_a100_en.html)
 - [Version 27 visual report — Russian](../benchmarks/version27_static_pipeline_a100_ru.html)
+- [A100 Version 28 autotune report](../benchmarks/matmul_autotune_a100_report.md)
+- [Version 28 visual report — English](../benchmarks/version28_autotune_a100_en.html)
+- [Version 28 visual report — Russian](../benchmarks/version28_autotune_a100_ru.html)
 
 ## Runtime and development
 

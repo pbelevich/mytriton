@@ -1312,6 +1312,61 @@ See the
 [Version 27 performance report](../benchmarks/matmul_static_pipeline_a100_report.md)
 for methodology and profiler counters.
 
+## CUDA event autotuning
+
+Version 28 moves schedule selection from benchmark command lines into the
+public kernel API. Its common form intentionally matches Triton's decorator
+order:
+
+```python
+@mytriton.autotune(
+    configs=[
+        mytriton.Config({"BM": 64, "BK": 32, "BN": 64}, num_warps=4),
+        mytriton.Config({"BM": 128, "BK": 32, "BN": 128}, num_warps=4),
+    ],
+    key=["M", "N", "K"],
+)
+@mytriton.jit
+def matmul(..., BM: tl.constexpr, BK: tl.constexpr, BN: tl.constexpr):
+    ...
+```
+
+`Config` owns compile-time kernel arguments and the CUDA `num_warps` launch
+option. Configuration values must name `tl.constexpr` parameters; a launch is
+rejected if it tries to override a value owned by the tuner. The configuration
+mapping is copied and made immutable so changing the caller's dictionary cannot
+silently invalidate a cached decision.
+
+For a new tuning key, `AutotunedKernel` performs five steps:
+
+1. Bind runtime arguments and inject each candidate's constexpr values.
+2. Compile and launch each candidate once, populating the existing compiler
+   and CuPy kernel caches outside the measured interval.
+3. Normalize Torch or CuPy arguments once and measure the cached RawKernel with
+   CUDA events on the active framework stream.
+4. Store the configuration with the lowest median latency.
+5. Launch that winner once more through the public path, leaving output buffers
+   with the selected configuration's result.
+
+The winner key contains the selected `key=[...]` values plus the backend, CUDA
+architecture, device index, and inferred runtime SSA types. Equal dimensions on
+two devices or with FP16 versus BF16 pointers cannot accidentally share a
+decision. `best_config` reports the latest winner, `timings` retains candidate
+measurements, and `clear_cache()` clears tuning and compiler caches.
+
+CPU-array calls remain compile-only and deterministically use the first config.
+The initial CUDA tuning call executes the kernel multiple times, so kernels
+with accumulative side effects need a future reset/restore hook. Version 28
+supports the common `kwargs`, `num_warps`, `key`, `warmup`, and `rep` subset;
+Triton's pruning hooks, persistent winner cache, `num_stages`, `num_ctas`, and
+output reset/restore controls are not implemented.
+
+The A100 sweep demonstrates why the key matters. BF16 square GEMMs choose a
+`64 x 32 x 64` tile at 1024 and 2048, then switch to the static
+`128 x 32 x 128` pipeline at 4096 and 8192. The largest case reaches 210.21
+TFLOP/s, or 86.7% of torch/cuBLAS in the same run. Full results are in the
+[Version 28 performance report](../benchmarks/matmul_autotune_a100_report.md).
+
 ## Example
 
 ```python
@@ -1584,8 +1639,9 @@ these rewrite passes because they are not region-aware yet.
   MMA operands use grouped warp-cooperative `ldmatrix` loads from XOR-swizzled
   shared memory. On SM80, canonical low-precision K loops use a three-stage
   `cp.async` pipeline with scalar zero-fill fallback for partial or misaligned
-  vectors. There is still no register-fragment double buffering, automatic
-  instruction scheduling, or autotuning.
+  vectors. A CUDA-event autotuner can select constexpr tile shapes and
+  `num_warps` per runtime key, but there is no persistent winner cache,
+  candidate pruning, reset/restore hook, or automatic schedule generation.
   `tl.empty`, `tl.full`, and `tl.zeros` continue to represent logical
   per-thread values rather than shared-memory allocations.
 - MLIR lowering currently supports only `ptr<f32>` parameters as
