@@ -20,6 +20,16 @@ def _mypy_contract() -> None:
     typed_kernel[(1,)](1, num_warps=4)
     typed_kernel[(1,)]("not an int")  # type: ignore[call-overload]
 
+    @triton.autotune(
+        configs=[triton.Config({"BLOCK": 32}, num_warps=1)],
+        key=["value"],
+    )
+    @triton.jit
+    def autotuned_kernel(value: int, BLOCK: tl.constexpr) -> None:
+        del value, BLOCK
+
+    autotuned_kernel[(1,)](1)
+
 
 def test_public_dsl_functions_have_annotations():
     for function in (

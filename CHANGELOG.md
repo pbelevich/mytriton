@@ -6,6 +6,21 @@ were built.
 
 ## Unreleased
 
+### Version 28: CUDA event autotuning
+
+- Added public `Config` and `autotune` APIs with Triton-style decorator order,
+  compile-time meta-parameter injection, `num_warps`, and runtime tuning keys.
+- Added accurate CUDA-event timing on the active CuPy or PyTorch stream after
+  compilation, so Python tracing and artifact-copy overhead do not influence
+  schedule selection.
+- Added a winner cache separated by backend, CUDA architecture, device, runtime
+  types, and user-selected key values, plus `best_config`, timing records, and
+  cache reset support.
+- Added a five-configuration A100 GEMM sweep and reproducible Colab runner.
+  BF16 selects `64x32x64` for `1024^3`/`2048^3` and `128x32x128` for
+  `4096^3`/`8192^3`; the latter reaches 210.21 TFLOP/s at `8192^3`, 86.7% of
+  torch/cuBLAS in the same run.
+
 ### Version 27: Static register pipeline
 
 - Added a specialized SM80 `128x32x128`, four-warp lowering with a static

@@ -1,3 +1,4 @@
+from .autotuner import Config, autotune
 from .compiler import jit
 from .cuda_utils import cuda_available
 
@@ -12,4 +13,11 @@ def next_power_of_2(value):
     return 1 << (value - 1).bit_length()
 
 
-__all__ = ["cdiv", "cuda_available", "jit", "next_power_of_2"]
+__all__ = [
+    "Config",
+    "autotune",
+    "cdiv",
+    "cuda_available",
+    "jit",
+    "next_power_of_2",
+]
