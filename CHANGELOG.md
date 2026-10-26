@@ -6,6 +6,19 @@ were built.
 
 ## Unreleased
 
+### Version 29: JIT runtime specialization
+
+- Added bounded pointer-alignment and integer-divisibility facts inferred from
+  NumPy, CuPy, and PyTorch runtime arguments.
+- Included specialization facts in the compilation cache key so one kernel can
+  safely keep distinct aligned and generic CUDA variants.
+- Removed redundant runtime pointer and stride alignment guards from the
+  specialized SM80 static pipeline while preserving per-CTA boundary checks
+  and the scalar zero-fill fallback for edge tiles.
+- Added cache-behavior, generated-CUDA, and irregular-shape regression tests.
+- Recorded same-session A100 results; the guard-only change is performance
+  neutral within observed Colab clock-state variance.
+
 ### Version 28: CUDA event autotuning
 
 - Added public `Config` and `autotune` APIs with Triton-style decorator order,
