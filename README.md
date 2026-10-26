@@ -65,6 +65,7 @@ full [changelog](CHANGELOG.md) and the accompanying
 | [`ver26`](https://github.com/pbelevich/mytriton/tree/ver26) | [Three-stage `cp.async` pipeline](docs/implementation.md#pipelined-tensor-core-gemm) |
 | [`ver27`](https://github.com/pbelevich/mytriton/tree/ver27) | [Static register pipeline](docs/implementation.md#static-register-pipeline) |
 | [`ver28`](https://github.com/pbelevich/mytriton/tree/ver28) | [CUDA event autotuning](docs/implementation.md#cuda-event-autotuning) |
+| [`ver29`](https://github.com/pbelevich/mytriton/tree/ver29) | [JIT runtime specialization](docs/implementation.md#jit-runtime-specialization) |
 
 ## Tensor-core matmul
 
@@ -219,11 +220,18 @@ winner cache. It selects `64 x 32 x 64` for smaller square matrices and the
 static `128 x 32 x 128` pipeline for large matrices. On A100, BF16 `8192^3`
 reaches 210.21 TFLOP/s, 86.7% of torch/cuBLAS in the same run. See the
 [Version 28 performance report](benchmarks/matmul_autotune_a100_report.md).
+Version 29 specializes JIT cache entries by safe runtime pointer-alignment and
+integer-divisibility facts. Aligned GEMM variants omit redundant alignment
+guards while retaining boundary checks and the scalar fallback for edge CTAs.
+The same-session A100 measurements are performance-neutral after accounting
+for clock-state variation; see the
+[Version 29 performance report](benchmarks/matmul_jit_specialization_a100_report.md).
 
 FP16 MMA requires `sm_75+`; native BF16 MMA requires `sm_80+`. Unsupported
 types, shapes, and targets retain the CUDA-core fallback. See the
 [implementation guide](docs/implementation.md#cuda-event-autotuning)
-for fragment layouts, shared-memory mapping, composition, and accumulation.
+for fragment layouts, shared-memory mapping, JIT specialization, composition,
+and accumulation.
 
 ## Documentation
 

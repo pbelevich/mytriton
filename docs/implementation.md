@@ -103,6 +103,16 @@ MLIR's GPU/NVVM stack to a cubin.
 - Version 24 (unreleased): warp-cooperative `ldmatrix` fragment loads,
   transposed B fragments, grouped `.x1`/`.x2`/`.x4` instructions, and operand
   register reuse across physical `mma.sync` operations.
+- Version 25 (unreleased): native SM80 `m16n8k16`, a `128 x 128 x 32` CTA tile,
+  and a direct register-to-global epilogue.
+- Version 26 (unreleased): a three-stage `cp.async` pipeline that overlaps
+  global-memory staging with fragment loading and MMA.
+- Version 27 (unreleased): a static three-phase pipeline, warp-raked copies,
+  precomputed shared addresses, and two live K-fragment sets.
+- Version 28 (unreleased): CUDA-event autotuning with Triton-style configs and
+  a per-device, per-dtype, per-shape winner cache.
+- Version 29 (unreleased): bounded runtime alignment and divisibility facts,
+  specialized compilation-cache entries, and cheaper aligned CUDA variants.
 
 ## AST frontend
 
@@ -1367,6 +1377,62 @@ The A100 sweep demonstrates why the key matters. BF16 square GEMMs choose a
 TFLOP/s, or 86.7% of torch/cuBLAS in the same run. Full results are in the
 [Version 28 performance report](../benchmarks/matmul_autotune_a100_report.md).
 
+## JIT runtime specialization
+
+Version 29 teaches the compilation cache about properties of runtime values
+that are stable for one compiled variant. Pointer arguments record their
+power-of-two alignment, capped at 16 bytes. Integer arguments record their
+power-of-two divisibility, capped at 128. Capping is important: code generation
+needs facts such as "aligned to 16" and "divisible by 32", not the complete
+pointer address or scalar value. Calls with equivalent useful properties can
+therefore share an artifact.
+
+The cache key now has three independent kinds of information:
+
+```text
+(runtime SSA types, runtime specialization facts, constexpr values)
+```
+
+For example, `K=32` and `K=96` both provide divisibility by 32. A naturally
+aligned CUDA allocation provides 16-byte pointer alignment, whereas a sliced
+view starting two bytes later selects a different generic variant. Facts are
+derived from NumPy's data pointer, PyTorch's `data_ptr()`, or the CUDA array
+interface exposed by CuPy.
+
+The SM80 static GEMM pipeline consumes these facts conservatively. When A and
+B are 16-byte aligned, their leading dimensions satisfy the 128-bit copy width,
+and M/N/K are divisible by the selected physical tiles, generated CUDA omits
+the repeated pointer and stride alignment terms from its fast-path predicate.
+It still checks the bounds of each CTA:
+
+```cuda
+// aligned tile specialization
+bool full_tile = row + BM <= M && column + BN <= N && k + BK <= K;
+if (full_tile) {
+    // 128-bit cp.async producer
+} else {
+    // masked scalar zero-fill producer
+}
+```
+
+Keeping the boundary predicate is deliberate. Runtime divisibility says that
+valid tiles have no partial edge, but it does not prove that a caller did not
+overlaunch the grid. The generic variant additionally checks pointer and
+row-stride alignment before entering the 128-bit producer. Thus specialization
+reduces dynamic guard work without changing the public launch contract or
+weakening irregular-shape correctness.
+
+This machinery is separate from `tl.constexpr`: constexpr values change the
+program's symbolic structure, while runtime facts only authorize guarded
+backend optimizations. Direct codegen calls that have no runtime facts continue
+to emit the fully generic safe path.
+
+The aligned and generic variants retain the same 213-register, 48 KiB shared
+memory resource footprint. Same-session A100 timing did not show a repeatable
+standalone speedup after accounting for GPU clock variation; the complete data
+and the required next proof are in the
+[Version 29 performance report](../benchmarks/matmul_jit_specialization_a100_report.md).
+
 ## Example
 
 ```python
@@ -1592,8 +1658,9 @@ these rewrite passes because they are not region-aware yet.
   elements to a per-thread rank-2 register tile. Scalar-only kernels use one
   thread per block. The dot thread-count policy is fixed rather than tuned for
   a particular GPU.
-- JIT cache entries are specialized by runtime types and constexpr values. Python
-  globals and closure values used by a kernel must remain unchanged; call
+- JIT cache entries are specialized by runtime types, bounded pointer-alignment
+  and integer-divisibility facts, and constexpr values. Python globals and
+  closure values used by a kernel must remain unchanged; call
   `kernel.clear_cache()` after changing them.
 - CUDA lowering currently supports program IDs, `tl.arange`, basic arithmetic and
   comparison, Boolean `&`, rank-2 `expand_dims` via `x[:, None]` and

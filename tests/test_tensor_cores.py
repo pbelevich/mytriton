@@ -3190,7 +3190,14 @@ def test_f16_multi_warp_cta_schedule_lowers_matmul_loop(
 def test_sm80_production_cta_uses_m16n8k16(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import mytriton.compiler as compiler
+
     monkeypatch.setenv("MYTRITON_BACKEND", "cuda")
+    monkeypatch.setattr(
+        compiler,
+        "DEFAULT_CUDA_TARGET",
+        CudaTarget.from_chip("sm_80"),
+    )
 
     M, N, K = 128, 128, 32
     BM, BK, BN = 128, 32, 128
@@ -3200,7 +3207,7 @@ def test_sm80_production_cta_uses_m16n8k16(
     out = np.zeros((M, N), dtype=np.float32)
 
     tensor_core_matmul_kernel.clear_cache()
-    _, ssa_ops, _ = tensor_core_matmul_kernel[(1, 1)](
+    _, ssa_ops, specialized_cuda_src = tensor_core_matmul_kernel[(1, 1)](
         a,
         b,
         out,
@@ -3285,6 +3292,88 @@ def test_sm80_production_cta_uses_m16n8k16(
     assert cuda_src.count("*reinterpret_cast<float2 *>") == 64
     assert cuda_src.count("make_float2(") == 64
 
+    specialized_full_tile = next(
+        line
+        for line in specialized_cuda_src.splitlines()
+        if "dot_pipeline_32_full_tile =" in line
+    )
+    generic_full_tile = next(
+        line for line in cuda_src.splitlines() if "dot_pipeline_32_full_tile =" in line
+    )
+    assert "aligned tile specialization" in specialized_cuda_src
+    assert "reinterpret_cast<unsigned long long>" not in specialized_full_tile
+    assert "dot_pipeline_32_full_tile" in specialized_cuda_src
+    assert "aligned tile specialization" not in cuda_src
+    assert "reinterpret_cast<unsigned long long>" in generic_full_tile
+    assert "dot_pipeline_32_full_tile" in cuda_src
+
+
+@pytest.mark.codegen
+def test_sm80_runtime_specialization_keeps_irregular_safe_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mytriton.compiler as compiler
+
+    monkeypatch.setenv("MYTRITON_BACKEND", "cuda")
+    monkeypatch.setattr(
+        compiler,
+        "DEFAULT_CUDA_TARGET",
+        CudaTarget.from_chip("sm_80"),
+    )
+
+    BM, BK, BN = 128, 32, 128
+    tensor_core_matmul_kernel.clear_cache()
+
+    aligned_a = np.zeros((128, 32), dtype=np.float16)
+    aligned_b = np.zeros((32, 128), dtype=np.float16)
+    aligned_out = np.zeros((128, 128), dtype=np.float32)
+    _, _, aligned_src = tensor_core_matmul_kernel[(1, 1)](
+        aligned_a,
+        aligned_b,
+        aligned_out,
+        128,
+        128,
+        32,
+        BM=BM,
+        BK=BK,
+        BN=BN,
+        num_warps=4,
+    )
+
+    irregular_a = np.zeros((117, 29), dtype=np.float16)
+    irregular_b = np.zeros((29, 109), dtype=np.float16)
+    irregular_out = np.zeros((117, 109), dtype=np.float32)
+    _, _, irregular_src = tensor_core_matmul_kernel[(1, 1)](
+        irregular_a,
+        irregular_b,
+        irregular_out,
+        117,
+        109,
+        29,
+        BM=BM,
+        BK=BK,
+        BN=BN,
+        num_warps=4,
+    )
+
+    assert len(tensor_core_matmul_kernel.compilation_cache) == 2
+    aligned_full_tile = next(
+        line
+        for line in aligned_src.splitlines()
+        if "dot_pipeline_32_full_tile =" in line
+    )
+    irregular_full_tile = next(
+        line
+        for line in irregular_src.splitlines()
+        if "dot_pipeline_32_full_tile =" in line
+    )
+    assert "aligned tile specialization" in aligned_src
+    assert "reinterpret_cast<unsigned long long>" not in aligned_full_tile
+    assert "dot_pipeline_32_full_tile" in aligned_src
+    assert "aligned tile specialization" not in irregular_src
+    assert "reinterpret_cast<unsigned long long>" in irregular_full_tile
+    assert "dot_pipeline_32_full_tile" in irregular_src
+
 
 @pytest.mark.execution
 def test_sm80_production_cta_executes_with_direct_epilogue(
@@ -3360,8 +3449,14 @@ def test_sm80_production_cta_executes_with_direct_epilogue(
 
         assert cuda_src.count("*reinterpret_cast<float2 *>") == 64
         assert "mma_result_" not in cuda_src
+        if M % BM == 0 and N % BN == 0 and K % BK == 0:
+            assert "aligned tile specialization" in cuda_src
+        else:
+            assert "aligned tile specialization" not in cuda_src
 
-    assert len(tensor_core_matmul_kernel.compilation_cache) == 1
+    # K=32/96, K=64, K=128, and the irregular case have four distinct
+    # bounded divisibility classes.
+    assert len(tensor_core_matmul_kernel.compilation_cache) == 4
 
     artifact = next(iter(tensor_core_matmul_kernel.compilation_cache.values()))
     assert artifact.threads_per_block == 128

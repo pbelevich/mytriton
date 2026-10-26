@@ -32,6 +32,7 @@ from .cuda_utils import (
 )
 from .mlir_codegen import MLIRCodegen, compile_mlir_source_to_cubin
 from .optim import ConstantFoldPass, CSEPass, DCEPass, PassManager
+from .runtime_specialization import runtime_specialization
 from .ssa import SSAItem, SSALowering
 from .ssa_verification import SSAVerifier
 from .trace import (
@@ -187,6 +188,10 @@ class CompiledKernel(Generic[P]):
                 if not is_constexpr_annotation(parameter.annotation)
             )
             params = make_runtime_params(self.signature, bound.arguments)
+            specializations = {
+                param.name: runtime_specialization(value)
+                for param, value in zip(params, runtime_args, strict=True)
+            }
             backend = self._resolve_backend()
             chip = None
             cuda_target = DEFAULT_CUDA_TARGET
@@ -214,6 +219,7 @@ class CompiledKernel(Generic[P]):
                 backend,
                 chip,
                 tuple(param.ty for param in params),
+                tuple(specializations[param.name] for param in params),
                 _constexpr_key(meta),
                 num_warps,
             )
@@ -293,6 +299,7 @@ class CompiledKernel(Generic[P]):
                         ssa_ops,
                         params,
                         matmul_schedule=matmul_schedule,
+                        runtime_specializations=specializations,
                     )
 
                 artifact = _CompilationArtifact(

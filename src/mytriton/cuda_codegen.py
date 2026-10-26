@@ -33,6 +33,7 @@ from .cuda_dot_staging import (
     match_cuda_dot_double_buffering,
 )
 from .cuda_target import DEFAULT_CUDA_TARGET, CudaTarget
+from .runtime_specialization import RuntimeSpecialization
 from .ssa import SSAForRange, SSAItem, SSAOp, SSAOperand, SSAValue
 from .trace import (
     BF16,
@@ -252,6 +253,7 @@ class SSACUDACodegen:
             int,
             CudaMmaCtaTileLayout,
         ] = {}
+        self.runtime_specializations: dict[str, RuntimeSpecialization] = {}
 
     def cuda_type(self, ty: Type) -> str:
         if isinstance(ty, BlockType):
@@ -2808,6 +2810,54 @@ class SSACUDACodegen:
                 f"({physical_column})) * {element_nbytes};"
             )
 
+    def runtime_argument_is_aligned(self, name: str, alignment: int) -> bool:
+        known = self.runtime_specializations.get(name)
+        return known is not None and (known.alignment or 0) >= alignment
+
+    def runtime_argument_is_divisible(self, name: str, divisor: int) -> bool:
+        known = self.runtime_specializations.get(name)
+        return known is not None and (known.divisibility or 0) >= divisor
+
+    def can_specialize_static_tile_alignment(
+        self,
+        *,
+        buffers: CudaDotSharedBuffers,
+        lhs_source: CudaGlobalTile,
+        rhs_source: CudaGlobalTile,
+    ) -> bool:
+        element_nbytes = cuda_scalar_nbytes(buffers.lhs.element_ty)
+        vector_elements = 16 // element_nbytes
+        return all(
+            (
+                self.runtime_argument_is_aligned(lhs_source.base, 16),
+                self.runtime_argument_is_aligned(rhs_source.base, 16),
+                self.runtime_argument_is_divisible(
+                    lhs_source.row_bound,
+                    buffers.lhs.rows,
+                ),
+                self.runtime_argument_is_divisible(
+                    lhs_source.column_bound,
+                    buffers.lhs.columns,
+                ),
+                self.runtime_argument_is_divisible(
+                    rhs_source.row_bound,
+                    buffers.rhs.rows,
+                ),
+                self.runtime_argument_is_divisible(
+                    rhs_source.column_bound,
+                    buffers.rhs.columns,
+                ),
+                self.runtime_argument_is_divisible(
+                    lhs_source.row_stride,
+                    vector_elements,
+                ),
+                self.runtime_argument_is_divisible(
+                    rhs_source.row_stride,
+                    vector_elements,
+                ),
+            )
+        )
+
     def emit_sm80_static_cp_async_tile(
         self,
         *,
@@ -2832,28 +2882,46 @@ class SSACUDACodegen:
         lhs_stage_bytes = buffers.lhs.stage_size * element_nbytes
         rhs_stage_bytes = buffers.rhs.stage_size * element_nbytes
         full_tile = f"{prefix}_full_tile"
+        specialize_alignment = self.can_specialize_static_tile_alignment(
+            buffers=buffers,
+            lhs_source=lhs_source,
+            rhs_source=rhs_source,
+        )
 
+        full_tile_conditions = [
+            f"({lhs_source.row_offset}) + {buffers.lhs.rows} "
+            f"<= ({lhs_source.row_bound})",
+            f"({lhs_source.column_offset}) + {buffers.lhs.columns} "
+            f"<= ({lhs_source.column_bound})",
+            f"({rhs_source.row_offset}) + {buffers.rhs.rows} "
+            f"<= ({rhs_source.row_bound})",
+            f"({rhs_source.column_offset}) + {buffers.rhs.columns} "
+            f"<= ({rhs_source.column_bound})",
+        ]
+        if specialize_alignment:
+            self.lines.append(f"{indent}    // aligned tile specialization")
+        else:
+            full_tile_conditions.extend(
+                [
+                    f"((({lhs_source.row_stride}) * {element_nbytes}) & 15) == 0",
+                    f"((({rhs_source.row_stride}) * {element_nbytes}) & 15) == 0",
+                    (
+                        f"(reinterpret_cast<unsigned long long>(&{lhs_source.base}["
+                        f"({lhs_source.row_offset}) * ({lhs_source.row_stride}) + "
+                        f"({lhs_source.column_offset})]) & 15ULL) == 0ULL"
+                    ),
+                    (
+                        f"(reinterpret_cast<unsigned long long>(&{rhs_source.base}["
+                        f"({rhs_source.row_offset}) * ({rhs_source.row_stride}) + "
+                        f"({rhs_source.column_offset})]) & 15ULL) == 0ULL"
+                    ),
+                ]
+            )
         self.lines.extend(
             [
-                (
-                    f"{indent}    bool {full_tile} = "
-                    f"({lhs_source.row_offset}) + {buffers.lhs.rows} "
-                    f"<= ({lhs_source.row_bound}) && "
-                    f"({lhs_source.column_offset}) + {buffers.lhs.columns} "
-                    f"<= ({lhs_source.column_bound}) && "
-                    f"({rhs_source.row_offset}) + {buffers.rhs.rows} "
-                    f"<= ({rhs_source.row_bound}) && "
-                    f"({rhs_source.column_offset}) + {buffers.rhs.columns} "
-                    f"<= ({rhs_source.column_bound}) && "
-                    f"((({lhs_source.row_stride}) * {element_nbytes}) & 15) == 0 && "
-                    f"((({rhs_source.row_stride}) * {element_nbytes}) & 15) == 0 && "
-                    f"(reinterpret_cast<unsigned long long>(&{lhs_source.base}["
-                    f"({lhs_source.row_offset}) * ({lhs_source.row_stride}) + "
-                    f"({lhs_source.column_offset})]) & 15ULL) == 0ULL && "
-                    f"(reinterpret_cast<unsigned long long>(&{rhs_source.base}["
-                    f"({rhs_source.row_offset}) * ({rhs_source.row_stride}) + "
-                    f"({rhs_source.column_offset})]) & 15ULL) == 0ULL;"
-                ),
+                f"{indent}    bool {full_tile} = "
+                + " && ".join(full_tile_conditions)
+                + ";",
                 f"{indent}    if ({full_tile}) {{",
             ]
         )
@@ -4086,12 +4154,14 @@ class SSACUDACodegen:
         params: list[Param],
         *,
         matmul_schedule: CudaMatmulSchedule | None = None,
+        runtime_specializations: dict[str, RuntimeSpecialization] | None = None,
     ) -> str:
         self.lines = []
         self.shared_lines = []
         self.shared_memory_bytes = 0
         self.required_headers = set()
         self.values = {}
+        self.runtime_specializations = runtime_specializations or {}
         self.definitions = SSADefinitions(ssa_ops)
         self.staging_analysis = CudaDotStagingAnalyzer(self.definitions).analyze()
         mma_operand_types = set()
