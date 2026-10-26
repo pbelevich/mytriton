@@ -3255,11 +3255,13 @@ def test_sm80_production_cta_uses_m16n8k16(
     assert expected_layout.warp_tile.instruction_count == 64
     assert expected_layout.warp_tile.accumulator_elements_per_lane == 128
 
-    assert cuda_src.count("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32") == 64
+    # The hot loop contains three statically selected shared-memory stages.
+    # Each phase owns one complete 64-instruction warp MMA tile.
+    assert cuda_src.count("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32") == 192
     assert "mma.sync.aligned.m16n8k8" not in cuda_src
 
-    assert cuda_src.count("ldmatrix.sync.aligned.m8n8.x4.shared.b16") == 8
-    assert cuda_src.count("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16") == 8
+    assert cuda_src.count("ldmatrix.sync.aligned.m8n8.x4.shared.b16") == 24
+    assert cuda_src.count("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16") == 24
 
     assert "int mma_warp_id = threadIdx.x >> 5;" in cuda_src
     assert "int mma_warp_m = mma_warp_id / 2;" in cuda_src
@@ -3268,12 +3270,15 @@ def test_sm80_production_cta_uses_m16n8k16(
     assert "mma_warp_n * 64" in cuda_src
 
     assert codegen.shared_memory_bytes == 48 * 1024
-    assert cuda_src.count("cp.async.cg.shared.global.L2::128B") == 4
-    assert cuda_src.count("cp.async.commit_group") == 2
-    assert cuda_src.count("cp.async.wait_group 1") == 2
+    assert cuda_src.count("cp.async.cg.shared.global.L2::128B") == 50
+    assert cuda_src.count("cp.async.commit_group") == 5
+    assert cuda_src.count("cp.async.wait_group 1") == 4
     assert "dot_pipeline_tiles_" in cuda_src
-    assert "dot_pipeline_write_stage_" in cuda_src
-    assert "dot_pipeline_read_stage_" in cuda_src
+    assert "dot_pipeline_write_stage_" not in cuda_src
+    assert "dot_pipeline_read_stage_" not in cuda_src
+    assert f"dot_pipeline_{dot.result.id}_lhs_shared_base" in cuda_src
+    assert f"dot_pipeline_{dot.result.id}_lhs_store_address" in cuda_src
+    assert f"dot_pipeline_{dot.result.id}_lhs_load_0" in cuda_src
     assert "mma_result_" not in cuda_src
     assert "__shared__ float mma_result_" not in cuda_src
 
@@ -3299,6 +3304,9 @@ def test_sm80_production_cta_executes_with_direct_epilogue(
 
     test_shapes = (
         (128, 128, 32),
+        (128, 128, 64),
+        (128, 128, 96),
+        (128, 128, 128),
         (117, 109, 29),
     )
 
@@ -3345,7 +3353,9 @@ def test_sm80_production_cta_executes_with_direct_epilogue(
             atol=3e-3,
         )
 
-        assert cuda_src.count("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32") == 64
+        assert (
+            cuda_src.count("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32") == 192
+        )
         assert "mma.sync.aligned.m16n8k8" not in cuda_src
 
         assert cuda_src.count("*reinterpret_cast<float2 *>") == 64

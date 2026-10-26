@@ -17,7 +17,7 @@ Usage:
   ./benchmarks/run_matmul_colab.sh [benchmark_matmul.py arguments]
 
 With no arguments, benchmark the best current BF16 tile found on A100:
-  --sizes 4096 8192 --tiles 128x32x128 --num-warps 8 --dtype bf16
+  --sizes 4096 8192 --tiles 128x32x128 --num-warps 4 --dtype bf16
 
 Examples:
   ./benchmarks/run_matmul_colab.sh
@@ -68,7 +68,7 @@ if [[ $# -eq 0 ]]; then
         --sizes 4096 8192 \
         --tiles 128x32x128 \
         --dtype bf16 \
-        --num-warps 8 \
+        --num-warps 4 \
         --warmup 3 \
         --repeats 10 \
         --artifacts-dir benchmarks/artifacts/colab-benchmark \

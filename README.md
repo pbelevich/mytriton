@@ -61,6 +61,7 @@ full [changelog](CHANGELOG.md) and the accompanying
 | [`ver24`](https://github.com/pbelevich/mytriton/tree/ver24) | [`ldmatrix` operand fragments](docs/implementation.md#warp-cooperative-ldmatrix-fragments) |
 | [`ver25`](https://github.com/pbelevich/mytriton/tree/ver25) | [SM80 production tensor tile](docs/implementation.md#sm80-production-tensor-tile) |
 | [`ver26`](https://github.com/pbelevich/mytriton/tree/ver26) | [Three-stage `cp.async` pipeline](docs/implementation.md#pipelined-tensor-core-gemm) |
+| [`ver27`](https://github.com/pbelevich/mytriton/tree/ver27) | [Static register pipeline](docs/implementation.md#static-register-pipeline) |
 
 ## Tensor-core matmul
 
@@ -136,15 +137,15 @@ _, _, cuda_source = matmul_kernel[grid](
     BM=BM,
     BK=BK,
     BN=BN,
-    num_warps=8,
+    num_warps=4,
 )
 
 expected = a.float() @ b.float()
 torch.testing.assert_close(out, expected, rtol=3e-3, atol=3e-3)
 ```
 
-The `128 x 32 x 128` CTA tile is divided into a `2 x 4` warp grid. Each warp
-owns a `64 x 32` output tile. SM80 executes physical `m16n8k16`
+The `128 x 32 x 128` CTA tile is divided into a `2 x 2` warp grid. Each warp
+owns a `64 x 64` output tile. SM80 executes physical `m16n8k16`
 instructions while FP16 SM75 tiles retain `m16n8k8`:
 
 ```cuda
@@ -200,10 +201,15 @@ correct scalar tail fallback, and K-sliced fragment consumption. With eight
 warps the `128 x 32 x 128` BF16 kernel reaches 146.21 TFLOP/s in the final
 30-sample run and 162.49 TFLOP/s in the configuration sweep on A100. See the
 [Version 26 performance report](benchmarks/matmul_pipeline_a100_report.md).
+Version 27 specializes that production tile with a static three-phase stage
+schedule, warp-raked copies, precomputed shared addresses, and two live K
+fragment sets. The final BF16 `4096^3` run reaches 187.19 TFLOP/s, with
+202.14 TFLOP/s observed in a same-day run; FP16 reaches 203.67 TFLOP/s. See the
+[Version 27 performance report](benchmarks/matmul_static_pipeline_a100_report.md).
 
 FP16 MMA requires `sm_75+`; native BF16 MMA requires `sm_80+`. Unsupported
 types, shapes, and targets retain the CUDA-core fallback. See the
-[implementation guide](docs/implementation.md#pipelined-tensor-core-gemm)
+[implementation guide](docs/implementation.md#static-register-pipeline)
 for fragment layouts, shared-memory mapping, composition, and accumulation.
 
 ## Documentation
