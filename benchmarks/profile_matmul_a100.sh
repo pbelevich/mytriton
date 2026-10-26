@@ -19,15 +19,15 @@ export CUPY_CACHE_SAVE_CUDA_SOURCE=1
     --sizes 4096 \
     --tiles 128x32x128 \
     --dtype bf16 \
-    --num-warps 8 \
+    --num-warps 4 \
     --warmup 3 \
     --repeats 10 \
     --artifacts-dir "$RUN_DIR" \
     --output "$RUN_DIR/benchmark.json" \
     | tee "$RUN_DIR/benchmark.txt"
 
-SOURCE="$RUN_DIR/matmul_bf16_m4096_n4096_k4096_bm128_bk32_bn128_nw8.cu"
-SOURCE_METADATA="$RUN_DIR/matmul_bf16_m4096_n4096_k4096_bm128_bk32_bn128_nw8.json"
+SOURCE="$RUN_DIR/matmul_bf16_m4096_n4096_k4096_bm128_bk32_bn128_nw4.cu"
+SOURCE_METADATA="$RUN_DIR/matmul_bf16_m4096_n4096_k4096_bm128_bk32_bn128_nw4.json"
 NVRTC_CUBIN="$RUN_DIR/matmul_bf16_sm80_nvrtc.cubin"
 NVCC_PTX="$RUN_DIR/matmul_bf16_sm80_nvcc.ptx"
 
@@ -91,7 +91,7 @@ ncu \
         --sizes 4096 \
         --tiles 128x32x128 \
         --dtype bf16 \
-        --num-warps 8 \
+        --num-warps 4 \
         --warmup 0 \
         --repeats 1 \
         --no-graphs \

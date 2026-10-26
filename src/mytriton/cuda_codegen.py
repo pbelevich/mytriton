@@ -419,6 +419,46 @@ class SSACUDACodegen:
 
         return registers
 
+    def emit_ldmatrix_m8n8_address(
+        self,
+        *,
+        name: str,
+        address: str,
+        matrix_count: int,
+        transpose: bool = False,
+    ) -> tuple[str, ...]:
+        """Load one to four 8x8 b16 matrices from a precomputed address."""
+
+        if matrix_count not in (1, 2, 4):
+            raise ValueError(
+                f"ldmatrix matrix count must be 1, 2, or 4, got {matrix_count}"
+            )
+        if not self.target.supports_ldmatrix:
+            raise TypeError(f"ldmatrix requires sm_75+, got {self.target.chip}")
+
+        registers = tuple(f"{name}_{index}" for index in range(matrix_count))
+        outputs = ", ".join(f'"=r"({register})' for register in registers)
+        placeholders = ", ".join(f"%{index}" for index in range(matrix_count))
+        address_placeholder = matrix_count
+        transpose_suffix = ".trans" if transpose else ""
+
+        self.lines.extend(
+            [
+                *(f"    unsigned {register};" for register in registers),
+                "    asm volatile(",
+                (
+                    '        "ldmatrix.sync.aligned.m8n8.'
+                    f"x{matrix_count}{transpose_suffix}.shared.b16 "
+                    f'{{{placeholders}}}, [%{address_placeholder}];"'
+                ),
+                f"        : {outputs}",
+                f'        : "r"({address})',
+                '        : "memory"',
+                "    );",
+            ]
+        )
+        return registers
+
     def emit_mma_operand_registers(
         self,
         *,
@@ -865,6 +905,76 @@ class SSACUDACodegen:
         self.values[result.id] = result_ref
         return result_ref
 
+    def emit_mma_warp_tile_instruction_slice_in_place(
+        self,
+        *,
+        layout: CudaMmaWarpTileLayout,
+        accumulator: CudaMmaAccumulatorRef,
+        instruction_operands: tuple[CudaMmaInstructionOperands, ...],
+        operand_ty: ScalarType,
+        k_tile: int,
+    ) -> None:
+        """Apply one loaded K slice to an existing MMA accumulator."""
+
+        coordinates = tuple(
+            coordinates
+            for coordinates in layout.instruction_coordinates()
+            if coordinates[2] == k_tile
+        )
+
+        for (m_tile, n_tile, _), operands in zip(
+            coordinates,
+            instruction_operands,
+            strict=True,
+        ):
+            fragment = accumulator.fragment_elements(
+                m_tile=m_tile,
+                n_tile=n_tile,
+            )
+            accumulator_registers = (
+                fragment[0],
+                fragment[1],
+                fragment[2],
+                fragment[3],
+            )
+
+            if isinstance(
+                layout.instruction_layout,
+                CudaMmaM16N8K16Layout,
+            ):
+                if len(operands.lhs_registers) != 4 or len(operands.rhs_registers) != 2:
+                    raise ValueError(
+                        "m16n8k16 requires four A registers and two B registers"
+                    )
+                self.emit_mma_m16n8k16_instruction(
+                    accumulator_registers=accumulator_registers,
+                    lhs_registers=(
+                        operands.lhs_registers[0],
+                        operands.lhs_registers[1],
+                        operands.lhs_registers[2],
+                        operands.lhs_registers[3],
+                    ),
+                    rhs_registers=(
+                        operands.rhs_registers[0],
+                        operands.rhs_registers[1],
+                    ),
+                    operand_ty=operand_ty,
+                )
+            else:
+                if len(operands.lhs_registers) != 2 or len(operands.rhs_registers) != 1:
+                    raise ValueError(
+                        "m16n8k8 requires two A registers and one B register"
+                    )
+                self.emit_mma_m16n8k8_instruction(
+                    accumulator_registers=accumulator_registers,
+                    lhs_registers=(
+                        operands.lhs_registers[0],
+                        operands.lhs_registers[1],
+                    ),
+                    rhs_register=operands.rhs_registers[0],
+                    operand_ty=operand_ty,
+                )
+
     def emit_mma_warp_tile_k_slices_in_place(
         self,
         *,
@@ -875,7 +985,7 @@ class SSACUDACodegen:
         accumulator: CudaMmaAccumulatorRef,
         stage: str,
     ) -> None:
-        """Load and consume one K fragment at a time into an existing accumulator."""
+        """Load and consume K fragments into an existing accumulator."""
 
         if (
             accumulator.warp_tile_layout != layout
@@ -897,70 +1007,13 @@ class SSACUDACodegen:
                 stage=stage,
                 k_tile=k_tile,
             )
-            coordinates = tuple(
-                coordinates
-                for coordinates in layout.instruction_coordinates()
-                if coordinates[2] == k_tile
+            self.emit_mma_warp_tile_instruction_slice_in_place(
+                layout=layout,
+                accumulator=accumulator,
+                instruction_operands=instruction_operands,
+                operand_ty=operand_ty,
+                k_tile=k_tile,
             )
-
-            for (m_tile, n_tile, _), operands in zip(
-                coordinates,
-                instruction_operands,
-                strict=True,
-            ):
-                fragment = accumulator.fragment_elements(
-                    m_tile=m_tile,
-                    n_tile=n_tile,
-                )
-                accumulator_registers = (
-                    fragment[0],
-                    fragment[1],
-                    fragment[2],
-                    fragment[3],
-                )
-
-                if isinstance(
-                    layout.instruction_layout,
-                    CudaMmaM16N8K16Layout,
-                ):
-                    if (
-                        len(operands.lhs_registers) != 4
-                        or len(operands.rhs_registers) != 2
-                    ):
-                        raise ValueError(
-                            "m16n8k16 requires four A registers and two B registers"
-                        )
-                    self.emit_mma_m16n8k16_instruction(
-                        accumulator_registers=accumulator_registers,
-                        lhs_registers=(
-                            operands.lhs_registers[0],
-                            operands.lhs_registers[1],
-                            operands.lhs_registers[2],
-                            operands.lhs_registers[3],
-                        ),
-                        rhs_registers=(
-                            operands.rhs_registers[0],
-                            operands.rhs_registers[1],
-                        ),
-                        operand_ty=operand_ty,
-                    )
-                else:
-                    if (
-                        len(operands.lhs_registers) != 2
-                        or len(operands.rhs_registers) != 1
-                    ):
-                        raise ValueError(
-                            "m16n8k8 requires two A registers and one B register"
-                        )
-                    self.emit_mma_m16n8k8_instruction(
-                        accumulator_registers=accumulator_registers,
-                        lhs_registers=(
-                            operands.lhs_registers[0],
-                            operands.lhs_registers[1],
-                        ),
-                        rhs_register=operands.rhs_registers[0],
-                        operand_ty=operand_ty,
-                    )
 
         self.values[result.id] = accumulator
 
@@ -2015,6 +2068,7 @@ class SSACUDACodegen:
         *,
         stage: str,
         indent: str = "",
+        assume_full_tile: bool = False,
     ) -> None:
         """Issue zero-filling 16-byte global-to-shared copies for one tile."""
 
@@ -2058,17 +2112,7 @@ class SSACUDACodegen:
         )
         element_nbytes = cuda_scalar_nbytes(target.element_ty)
 
-        lines = [
-            (
-                f"bool {full_tile} = ({source.row_offset}) + {target.rows} "
-                f"<= ({source.row_bound}) && ({source.column_offset}) + "
-                f"{target.columns} <= ({source.column_bound}) && "
-                f"((({source.row_stride}) * {element_nbytes}) & 15) == 0 && "
-                f"(reinterpret_cast<unsigned long long>(&{source.base}["
-                f"({source.row_offset}) * ({source.row_stride}) + "
-                f"({source.column_offset})]) & 15ULL) == 0ULL;"
-            ),
-            f"if ({full_tile}) {{",
+        copy_lines = [
             "    #pragma unroll",
             (
                 f"    for (int {vector} = threadIdx.x; {vector} < {vector_count}; "
@@ -2097,6 +2141,24 @@ class SSACUDACodegen:
             '            : "memory"',
             "        );",
             "    }",
+        ]
+
+        if assume_full_tile:
+            self.lines.extend(f"{indent}    {line}" for line in copy_lines)
+            return
+
+        lines = [
+            (
+                f"bool {full_tile} = ({source.row_offset}) + {target.rows} "
+                f"<= ({source.row_bound}) && ({source.column_offset}) + "
+                f"{target.columns} <= ({source.column_bound}) && "
+                f"((({source.row_stride}) * {element_nbytes}) & 15) == 0 && "
+                f"(reinterpret_cast<unsigned long long>(&{source.base}["
+                f"({source.row_offset}) * ({source.row_stride}) + "
+                f"({source.column_offset})]) & 15ULL) == 0ULL;"
+            ),
+            f"if ({full_tile}) {{",
+            *copy_lines,
             "} else {",
             "    #pragma unroll",
             (
@@ -2173,7 +2235,6 @@ class SSACUDACodegen:
             element_ty=element_ty,
             stage_count=stage_count,
         )
-
         self.emit_vectorized_cooperative_load(
             buffers.lhs,
             lhs_source,
@@ -2642,6 +2703,280 @@ class SSACUDACodegen:
         )
         self.assign(result, f"{shared}[0]")
 
+    def emit_sm80_static_pipeline_addresses(
+        self,
+        *,
+        dot_result_id: int,
+        buffers: CudaDotSharedBuffers,
+        layout: CudaMmaWarpTileLayout,
+        cta_layout: CudaMmaCtaTileLayout,
+    ) -> None:
+        """Precompute addresses for the 128x128x32 SM80 fast path."""
+
+        if cta_layout.warp_tile != layout:
+            raise ValueError("static pipeline requires the CTA warp tile layout")
+
+        prefix = f"dot_pipeline_{dot_result_id}"
+        lhs_base = f"{prefix}_lhs_shared_base"
+        rhs_base = f"{prefix}_rhs_shared_base"
+        lhs_store_row = f"{prefix}_lhs_store_row"
+        lhs_store_column = f"{prefix}_lhs_store_column"
+        rhs_store_row = f"{prefix}_rhs_store_row"
+        rhs_store_column = f"{prefix}_rhs_store_column"
+        lhs_store_address = f"{prefix}_lhs_store_address"
+        rhs_store_address = f"{prefix}_rhs_store_address"
+        rhs_row4_delta = f"{prefix}_rhs_row4_delta"
+        lhs_k16_delta = f"{prefix}_lhs_k16_delta"
+        element_nbytes = cuda_scalar_nbytes(buffers.lhs.element_ty)
+
+        lhs_store_physical_column = buffers.lhs.physical_column(
+            lhs_store_row,
+            lhs_store_column,
+        )
+        rhs_store_physical_column = buffers.rhs.physical_column(
+            rhs_store_row,
+            rhs_store_column,
+        )
+        rhs_row4_physical_column = buffers.rhs.physical_column(
+            f"{rhs_store_row} + 4",
+            rhs_store_column,
+        )
+        lhs_delta_row = "(mma_lane_id & 15)"
+        lhs_k0_physical_column = buffers.lhs.physical_column(
+            lhs_delta_row,
+            "(mma_lane_id >> 4) * 8",
+        )
+        lhs_k16_physical_column = buffers.lhs.physical_column(
+            lhs_delta_row,
+            "16 + (mma_lane_id >> 4) * 8",
+        )
+
+        self.lines.extend(
+            [
+                (
+                    f"    unsigned {lhs_base} = static_cast<unsigned>("
+                    f"__cvta_generic_to_shared(&{buffers.lhs.name}[0]));"
+                ),
+                (
+                    f"    unsigned {rhs_base} = static_cast<unsigned>("
+                    f"__cvta_generic_to_shared(&{buffers.rhs.name}[0]));"
+                ),
+                f"    int {lhs_store_row} = mma_warp_id * 32 + mma_lane_id / 4;",
+                f"    int {lhs_store_column} = (mma_lane_id & 3) * 8;",
+                f"    int {rhs_store_row} = mma_warp_id * 8 + mma_lane_id / 8;",
+                f"    int {rhs_store_column} = (mma_lane_id & 7) * 8;",
+                (
+                    f"    unsigned {lhs_store_address} = {lhs_base} + "
+                    f"({lhs_store_row} * {buffers.lhs.row_stride} + "
+                    f"({lhs_store_physical_column})) * {element_nbytes};"
+                ),
+                (
+                    f"    unsigned {rhs_store_address} = {rhs_base} + "
+                    f"({rhs_store_row} * {buffers.rhs.row_stride} + "
+                    f"({rhs_store_physical_column})) * {element_nbytes};"
+                ),
+                (
+                    f"    int {rhs_row4_delta} = (4 * {buffers.rhs.row_stride} + "
+                    f"({rhs_row4_physical_column}) - "
+                    f"({rhs_store_physical_column})) * {element_nbytes};"
+                ),
+                (
+                    f"    int {lhs_k16_delta} = (({lhs_k16_physical_column}) - "
+                    f"({lhs_k0_physical_column})) * {element_nbytes};"
+                ),
+            ]
+        )
+
+        for m_tile in range(layout.m_tiles):
+            row = f"mma_warp_m * {layout.m} + {m_tile * 16} + (mma_lane_id & 15)"
+            column = "(mma_lane_id >> 4) * 8"
+            physical_column = buffers.lhs.physical_column(row, column)
+            self.lines.append(
+                f"    unsigned {prefix}_lhs_load_{m_tile} = {lhs_base} + "
+                f"(({row}) * {buffers.lhs.row_stride} + "
+                f"({physical_column})) * {element_nbytes};"
+            )
+
+        rhs_batch_count = layout.n_tiles // 2
+        for batch in range(rhs_batch_count):
+            row = "(mma_lane_id & 15)"
+            column = f"mma_warp_n * {layout.n} + {batch * 16} + (mma_lane_id >> 4) * 8"
+            physical_column = buffers.rhs.physical_column(row, column)
+            self.lines.append(
+                f"    unsigned {prefix}_rhs_load_{batch} = {rhs_base} + "
+                f"(({row}) * {buffers.rhs.row_stride} + "
+                f"({physical_column})) * {element_nbytes};"
+            )
+
+    def emit_sm80_static_cp_async_tile(
+        self,
+        *,
+        dot_result_id: int,
+        buffers: CudaDotSharedBuffers,
+        lhs_source: CudaGlobalTile,
+        rhs_source: CudaGlobalTile,
+        stage: int,
+        indent: str,
+    ) -> None:
+        """Stage one tile with a warp-raked aligned path and safe fallback."""
+
+        prefix = f"dot_pipeline_{dot_result_id}"
+        element_nbytes = cuda_scalar_nbytes(buffers.lhs.element_ty)
+        lhs_store_row = f"{prefix}_lhs_store_row"
+        lhs_store_column = f"{prefix}_lhs_store_column"
+        rhs_store_row = f"{prefix}_rhs_store_row"
+        rhs_store_column = f"{prefix}_rhs_store_column"
+        lhs_store_address = f"{prefix}_lhs_store_address"
+        rhs_store_address = f"{prefix}_rhs_store_address"
+        rhs_row4_delta = f"{prefix}_rhs_row4_delta"
+        lhs_stage_bytes = buffers.lhs.stage_size * element_nbytes
+        rhs_stage_bytes = buffers.rhs.stage_size * element_nbytes
+        full_tile = f"{prefix}_full_tile"
+
+        self.lines.extend(
+            [
+                (
+                    f"{indent}    bool {full_tile} = "
+                    f"({lhs_source.row_offset}) + {buffers.lhs.rows} "
+                    f"<= ({lhs_source.row_bound}) && "
+                    f"({lhs_source.column_offset}) + {buffers.lhs.columns} "
+                    f"<= ({lhs_source.column_bound}) && "
+                    f"({rhs_source.row_offset}) + {buffers.rhs.rows} "
+                    f"<= ({rhs_source.row_bound}) && "
+                    f"({rhs_source.column_offset}) + {buffers.rhs.columns} "
+                    f"<= ({rhs_source.column_bound}) && "
+                    f"((({lhs_source.row_stride}) * {element_nbytes}) & 15) == 0 && "
+                    f"((({rhs_source.row_stride}) * {element_nbytes}) & 15) == 0 && "
+                    f"(reinterpret_cast<unsigned long long>(&{lhs_source.base}["
+                    f"({lhs_source.row_offset}) * ({lhs_source.row_stride}) + "
+                    f"({lhs_source.column_offset})]) & 15ULL) == 0ULL && "
+                    f"(reinterpret_cast<unsigned long long>(&{rhs_source.base}["
+                    f"({rhs_source.row_offset}) * ({rhs_source.row_stride}) + "
+                    f"({rhs_source.column_offset})]) & 15ULL) == 0ULL;"
+                ),
+                f"{indent}    if ({full_tile}) {{",
+            ]
+        )
+
+        for group in range(4):
+            lhs_global_row = (
+                f"({lhs_source.row_offset}) + {lhs_store_row} + {group * 8}"
+            )
+            lhs_global_column = f"({lhs_source.column_offset}) + {lhs_store_column}"
+            lhs_source_index = (
+                f"({lhs_global_row}) * ({lhs_source.row_stride}) + "
+                f"({lhs_global_column})"
+            )
+            lhs_destination = (
+                f"{lhs_store_address} + {stage * lhs_stage_bytes} + "
+                f"{group * 8 * buffers.lhs.row_stride * element_nbytes}"
+            )
+
+            rhs_row_group = group // 2
+            rhs_column_group = group % 2
+            rhs_global_row = (
+                f"({rhs_source.row_offset}) + {rhs_store_row} + {rhs_row_group * 4}"
+            )
+            rhs_global_column = (
+                f"({rhs_source.column_offset}) + {rhs_store_column} + "
+                f"{rhs_column_group * 64}"
+            )
+            rhs_source_index = (
+                f"({rhs_global_row}) * ({rhs_source.row_stride}) + "
+                f"({rhs_global_column})"
+            )
+            rhs_destination = (
+                f"{rhs_store_address} + {stage * rhs_stage_bytes} + "
+                f"{rhs_column_group * 64 * element_nbytes} + "
+                f"{rhs_row_group} * {rhs_row4_delta}"
+            )
+
+            for destination, source_base, source_index in (
+                (lhs_destination, lhs_source.base, lhs_source_index),
+                (rhs_destination, rhs_source.base, rhs_source_index),
+            ):
+                self.lines.extend(
+                    [
+                        f"{indent}        asm volatile(",
+                        (
+                            f'{indent}            "cp.async.cg.shared.global.'
+                            'L2::128B [%0], [%1], 16;"'
+                        ),
+                        f"{indent}            :",
+                        (
+                            f'{indent}            : "r"({destination}), '
+                            f'"l"(&{source_base}[{source_index}])'
+                        ),
+                        f'{indent}            : "memory"',
+                        f"{indent}        );",
+                    ]
+                )
+
+        self.lines.append(f"{indent}    }} else {{")
+        self.emit_cp_async_cooperative_load(
+            buffers.lhs,
+            lhs_source,
+            stage=str(stage),
+            indent=f"{indent}    ",
+        )
+        self.emit_cp_async_cooperative_load(
+            buffers.rhs,
+            rhs_source,
+            stage=str(stage),
+            indent=f"{indent}    ",
+        )
+        self.lines.append(f"{indent}    }}")
+
+    def emit_sm80_static_mma_operands(
+        self,
+        *,
+        dot_result_id: int,
+        layout: CudaMmaWarpTileLayout,
+        stage: int,
+        k_tile: int,
+        name_suffix: str,
+    ) -> tuple[CudaMmaInstructionOperands, ...]:
+        """Load one fast-path K slice from precomputed shared addresses."""
+
+        prefix = f"dot_pipeline_{dot_result_id}"
+        stage_bytes = 128 * 32 * 2
+        lhs_k_offset = "0" if k_tile == 0 else f"{prefix}_lhs_k16_delta"
+        rhs_k_offset = k_tile * 16 * 128 * 2
+
+        lhs_registers: dict[int, tuple[str, ...]] = {}
+        for m_tile in range(layout.m_tiles):
+            address = (
+                f"{prefix}_lhs_load_{m_tile} + {stage * stage_bytes} + ({lhs_k_offset})"
+            )
+            lhs_registers[m_tile] = self.emit_ldmatrix_m8n8_address(
+                name=f"mma_a_{dot_result_id}_{name_suffix}_{m_tile}",
+                address=address,
+                matrix_count=4,
+            )
+
+        rhs_registers: dict[int, tuple[str, ...]] = {}
+        for batch in range(layout.n_tiles // 2):
+            address = (
+                f"{prefix}_rhs_load_{batch} + {stage * stage_bytes} + {rhs_k_offset}"
+            )
+            loaded = self.emit_ldmatrix_m8n8_address(
+                name=f"mma_b_{dot_result_id}_{name_suffix}_{batch}",
+                address=address,
+                matrix_count=4,
+                transpose=True,
+            )
+            rhs_registers[batch * 2] = loaded[:2]
+            rhs_registers[batch * 2 + 1] = loaded[2:]
+
+        return tuple(
+            CudaMmaInstructionOperands(
+                lhs_registers=lhs_registers[m_tile],
+                rhs_registers=rhs_registers[n_tile],
+            )
+            for m_tile in range(layout.m_tiles)
+            for n_tile in range(layout.n_tiles)
+        )
+
     def emit_pipelined_tensor_core_loop(
         self,
         *,
@@ -2711,6 +3046,23 @@ class SSACUDACodegen:
             element_ty=element_ty,
             stage_count=stage_count,
         )
+        use_static_sm80_pipeline = (
+            cta_layout is not None
+            and cta_layout.schedule.block_shape == (128, 32, 128)
+            and cta_layout.schedule.warp_tile_shape == (64, 64)
+            and cta_layout.schedule.warp_shape == (2, 2)
+            and isinstance(mma_layout.instruction_layout, CudaMmaM16N8K16Layout)
+            and mma_layout.k_tiles == 2
+        )
+
+        if use_static_sm80_pipeline:
+            assert cta_layout is not None
+            self.emit_sm80_static_pipeline_addresses(
+                dot_result_id=plan_dot_result_id,
+                buffers=buffers,
+                layout=mma_layout,
+                cta_layout=cta_layout,
+            )
 
         def sources_at(k_expression: str) -> tuple[CudaGlobalTile, CudaGlobalTile]:
             return (
@@ -2738,81 +3090,203 @@ class SSACUDACodegen:
         tile_count = f"dot_pipeline_tiles_{plan_dot_result_id}"
         prefetch = f"dot_pipeline_prefetch_{plan_dot_result_id}"
         prefetch_k = f"dot_pipeline_prefetch_k_{plan_dot_result_id}"
-        write_stage = f"dot_pipeline_write_stage_{plan_dot_result_id}"
-        read_stage = f"dot_pipeline_read_stage_{plan_dot_result_id}"
 
         self.lines.append(
             f"    int {tile_count} = (({stop}) - ({start}) + ({step}) - 1) / ({step});"
         )
-        self.lines.append(
-            f"    for (int {prefetch} = 0; {prefetch} < 2; ++{prefetch}) {{"
-        )
-        self.lines.append(f"        if ({prefetch} < {tile_count}) {{")
-        self.lines.append(
-            f"            int {prefetch_k} = ({start}) + {prefetch} * ({step});"
-        )
-        self.lines.append(
-            f"            int {write_stage} = {prefetch} % {stage_count};"
-        )
-        prologue_lhs, prologue_rhs = sources_at(prefetch_k)
-        self.emit_cp_async_cooperative_load(
-            buffers.lhs,
-            prologue_lhs,
-            stage=write_stage,
-            indent="        ",
-        )
-        self.emit_cp_async_cooperative_load(
-            buffers.rhs,
-            prologue_rhs,
-            stage=write_stage,
-            indent="        ",
-        )
-        self.lines.append("        }")
-        self.emit_cp_async_commit_group(indent="    ")
-        self.lines.append("    }")
+
+        if not use_static_sm80_pipeline:
+            dynamic_write_stage = f"dot_pipeline_write_stage_{plan_dot_result_id}"
+            dynamic_read_stage = f"dot_pipeline_read_stage_{plan_dot_result_id}"
+            self.lines.append(
+                f"    for (int {prefetch} = 0; {prefetch} < 2; ++{prefetch}) {{"
+            )
+            self.lines.append(f"        if ({prefetch} < {tile_count}) {{")
+            self.lines.append(
+                f"            int {prefetch_k} = ({start}) + {prefetch} * ({step});"
+            )
+            self.lines.append(
+                f"            int {dynamic_write_stage} = {prefetch} % {stage_count};"
+            )
+            prologue_lhs, prologue_rhs = sources_at(prefetch_k)
+            self.emit_cp_async_cooperative_load(
+                buffers.lhs,
+                prologue_lhs,
+                stage=dynamic_write_stage,
+                indent="        ",
+            )
+            self.emit_cp_async_cooperative_load(
+                buffers.rhs,
+                prologue_rhs,
+                stage=dynamic_write_stage,
+                indent="        ",
+            )
+            self.lines.append("        }")
+            self.emit_cp_async_commit_group(indent="    ")
+            self.lines.append("    }")
+            self.emit_cp_async_wait_group(1)
+            self.emit_block_barrier()
+
+            self.lines.append(
+                f"    for (int {tile} = 0; {tile} < {tile_count}; ++{tile}) {{"
+            )
+            self.lines.append(f"        int {prefetch} = {tile} + 2;")
+            self.lines.append(f"        if ({prefetch} < {tile_count}) {{")
+            self.lines.append(
+                f"            int {prefetch_k} = ({start}) + {prefetch} * ({step});"
+            )
+            self.lines.append(
+                f"            int {dynamic_write_stage} = {prefetch} % {stage_count};"
+            )
+            body_lhs, body_rhs = sources_at(prefetch_k)
+            self.emit_cp_async_cooperative_load(
+                buffers.lhs,
+                body_lhs,
+                stage=dynamic_write_stage,
+                indent="        ",
+            )
+            self.emit_cp_async_cooperative_load(
+                buffers.rhs,
+                body_rhs,
+                stage=dynamic_write_stage,
+                indent="        ",
+            )
+            self.lines.append("        }")
+            self.emit_cp_async_commit_group(indent="    ")
+            self.lines.append(
+                f"        int {dynamic_read_stage} = {tile} % {stage_count};"
+            )
+
+            mma_start = len(self.lines)
+            self.emit_mma_warp_tile_k_slices_in_place(
+                result=dot.result,
+                buffers=buffers,
+                layout=mma_layout,
+                cta_layout=cta_layout,
+                accumulator=accumulator,
+                stage=dynamic_read_stage,
+            )
+            self.lines[mma_start:] = [f"    {line}" for line in self.lines[mma_start:]]
+            self.emit_cp_async_wait_group(1, indent="    ")
+            self.lines.append("        __syncthreads();")
+            self.lines.append("    }")
+
+            self.values[plan_dot_result_id] = accumulator
+            self.values[accumulation_result_id] = accumulator
+            self.values[loop.index.id] = f"({start}) + {tile} * ({step})"
+            return True
+
+        for prologue_stage in range(2):
+            self.lines.append(f"    if ({prologue_stage} < {tile_count}) {{")
+            prologue_k = f"({start}) + {prologue_stage} * ({step})"
+            prologue_lhs, prologue_rhs = sources_at(prologue_k)
+            if use_static_sm80_pipeline:
+                self.emit_sm80_static_cp_async_tile(
+                    dot_result_id=plan_dot_result_id,
+                    buffers=buffers,
+                    lhs_source=prologue_lhs,
+                    rhs_source=prologue_rhs,
+                    stage=prologue_stage,
+                    indent="    ",
+                )
+            else:
+                self.emit_cp_async_cooperative_load(
+                    buffers.lhs,
+                    prologue_lhs,
+                    stage=str(prologue_stage),
+                    indent="    ",
+                )
+                self.emit_cp_async_cooperative_load(
+                    buffers.rhs,
+                    prologue_rhs,
+                    stage=str(prologue_stage),
+                    indent="    ",
+                )
+            self.lines.append("    }")
+            self.emit_cp_async_commit_group()
+
         self.emit_cp_async_wait_group(1)
         self.emit_block_barrier()
 
         self.lines.append(
-            f"    for (int {tile} = 0; {tile} < {tile_count}; ++{tile}) {{"
+            f"    for (int {tile} = 0; {tile} < {tile_count}; {tile} += {stage_count}) {{"
         )
-        self.lines.append(f"        int {prefetch} = {tile} + 2;")
-        self.lines.append(f"        if ({prefetch} < {tile_count}) {{")
-        self.lines.append(
-            f"            int {prefetch_k} = ({start}) + {prefetch} * ({step});"
-        )
-        self.lines.append(
-            f"            int {write_stage} = {prefetch} % {stage_count};"
-        )
-        body_lhs, body_rhs = sources_at(prefetch_k)
-        self.emit_cp_async_cooperative_load(
-            buffers.lhs,
-            body_lhs,
-            stage=write_stage,
-            indent="        ",
-        )
-        self.emit_cp_async_cooperative_load(
-            buffers.rhs,
-            body_rhs,
-            stage=write_stage,
-            indent="        ",
-        )
-        self.lines.append("        }")
-        self.emit_cp_async_commit_group(indent="    ")
-        self.lines.append(f"        int {read_stage} = {tile} % {stage_count};")
 
-        mma_start = len(self.lines)
-        self.emit_mma_warp_tile_k_slices_in_place(
-            result=dot.result,
-            buffers=buffers,
-            layout=mma_layout,
-            cta_layout=cta_layout,
-            accumulator=accumulator,
-            stage=read_stage,
-        )
-        self.lines[mma_start:] = [f"    {line}" for line in self.lines[mma_start:]]
-        self.emit_cp_async_wait_group(1, indent="    ")
-        self.lines.append("        __syncthreads();")
+        for read_stage in range(stage_count):
+            tile_offset = read_stage
+            write_stage = (read_stage + 2) % stage_count
+            self.lines.append(f"        if ({tile} + {tile_offset} < {tile_count}) {{")
+            self.lines.append("            {")
+            self.lines.append(
+                f"                int {prefetch} = {tile} + {tile_offset + 2};"
+            )
+            self.lines.append(f"                if ({prefetch} < {tile_count}) {{")
+            self.lines.append(
+                f"                    int {prefetch_k} = ({start}) + {prefetch} * ({step});"
+            )
+            body_lhs, body_rhs = sources_at(prefetch_k)
+            if use_static_sm80_pipeline:
+                self.emit_sm80_static_cp_async_tile(
+                    dot_result_id=plan_dot_result_id,
+                    buffers=buffers,
+                    lhs_source=body_lhs,
+                    rhs_source=body_rhs,
+                    stage=write_stage,
+                    indent="                ",
+                )
+            else:
+                self.emit_cp_async_cooperative_load(
+                    buffers.lhs,
+                    body_lhs,
+                    stage=str(write_stage),
+                    indent="                ",
+                )
+                self.emit_cp_async_cooperative_load(
+                    buffers.rhs,
+                    body_rhs,
+                    stage=str(write_stage),
+                    indent="                ",
+                )
+            self.lines.append("                }")
+            self.emit_cp_async_commit_group(indent="            ")
+
+            mma_start = len(self.lines)
+            if use_static_sm80_pipeline:
+                operands_by_k = tuple(
+                    self.emit_sm80_static_mma_operands(
+                        dot_result_id=plan_dot_result_id,
+                        layout=mma_layout,
+                        stage=read_stage,
+                        k_tile=k_tile,
+                        name_suffix=f"s{read_stage}_k{k_tile}",
+                    )
+                    for k_tile in range(mma_layout.k_tiles)
+                )
+                for k_tile, instruction_operands in enumerate(operands_by_k):
+                    self.emit_mma_warp_tile_instruction_slice_in_place(
+                        layout=mma_layout,
+                        accumulator=accumulator,
+                        instruction_operands=instruction_operands,
+                        operand_ty=element_ty,
+                        k_tile=k_tile,
+                    )
+            else:
+                self.emit_mma_warp_tile_k_slices_in_place(
+                    result=dot.result,
+                    buffers=buffers,
+                    layout=mma_layout,
+                    cta_layout=cta_layout,
+                    accumulator=accumulator,
+                    stage=str(read_stage),
+                )
+            self.lines[mma_start:] = [
+                f"            {line}" for line in self.lines[mma_start:]
+            ]
+            self.emit_cp_async_wait_group(1, indent="            ")
+            self.lines.append("                __syncthreads();")
+            self.lines.append("            }")
+            self.lines.append("        }")
+
         self.lines.append("    }")
 
         self.values[plan_dot_result_id] = accumulator

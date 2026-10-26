@@ -1264,6 +1264,54 @@ load/MMA interleaving remain useful future work. See the
 [Version 26 performance report](../benchmarks/matmul_pipeline_a100_report.md)
 for the complete measurements.
 
+### Static register pipeline
+
+Version 27 specializes the SM80 `128 x 128 x 32` CTA with four `64 x 64`
+warp tiles. The public kernel remains unchanged; the CUDA backend recognizes
+this exact schedule and emits a static fast path while every other layout
+keeps the Version 26 dynamic pipeline.
+
+The three shared stages are expanded into three source-level phases. Stage
+numbers are compile-time constants, so shared-memory addresses do not contain
+`tile % 3` in the hot loop:
+
+```text
+phase 0: cp.async -> stage 2 | ldmatrix/MMA <- stage 0
+phase 1: cp.async -> stage 0 | ldmatrix/MMA <- stage 1
+phase 2: cp.async -> stage 1 | ldmatrix/MMA <- stage 2
+```
+
+The cooperative producer is warp-raked. Each of four warps owns 32 rows of A
+and eight rows of B, and every lane issues four 16-byte copies for each
+operand. This mapping preserves coalescing while matching the compact XOR
+shared layout. Shared store addresses, four A fragment addresses, and four B
+fragment addresses are computed once before the K loop. Later instructions
+add only a constant stage offset and, for the second `K=16` fragment, a small
+precomputed delta.
+
+Within each phase both `BK=32` register-fragment sets are loaded before their
+MMA groups. This exposes independent `ldmatrix` work to the CUDA scheduler and
+forms a two-slot register pipeline. A controlled sequential-fragment run had
+nearly the same same-run ratio to `torch.mm`, so most of the measured Version
+27 gain comes from the static stage schedule, warp-raked producer, precomputed
+addresses, and reduced cross-warp operand duplication—not from source-order
+fragment buffering alone.
+
+The aligned path is selected per tile. A partial tile, odd leading dimension,
+or misaligned base address uses the Version 26 cooperative scalar zero-fill
+producer under the same commit/wait/barrier protocol. Full `128 x 128 x 32`
+and irregular `117 x 109 x 29` execution cases pass on A100.
+
+The final 30-sample BF16 `4096^3` run reaches 187.19 TFLOP/s, or 86.8% of the
+simultaneously measured `torch.mm`; a same-day run reached 202.14 TFLOP/s.
+FP16 reaches 203.67 TFLOP/s. Nsight Compute measures 67.61% SM throughput and
+6.61 warp cycles per issued instruction, compared with 55.36% and 8.60 in
+Version 26. The four-warp tile uses 213 registers per thread and therefore
+runs at 12.5% occupancy; shape selection and further scheduling remain useful.
+See the
+[Version 27 performance report](../benchmarks/matmul_static_pipeline_a100_report.md)
+for methodology and profiler counters.
+
 ## Example
 
 ```python

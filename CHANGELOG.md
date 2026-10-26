@@ -6,6 +6,20 @@ were built.
 
 ## Unreleased
 
+### Version 27: Static register pipeline
+
+- Added a specialized SM80 `128x32x128`, four-warp lowering with a static
+  three-phase shared-stage schedule and no stage modulo in the hot loop.
+- Added warp-raked global-to-shared copies and precomputed shared addresses for
+  both cooperative stores and `ldmatrix` fragment loads.
+- Preloaded both `BK=32` K fragments before their MMA groups while retaining
+  the target-gated dynamic pipeline for other schedules and architectures.
+- Preserved irregular-shape correctness through the existing masked scalar
+  zero-fill producer.
+- Improved final A100 BF16 `4096^3` raw throughput from 146.21 TFLOP/s in
+  Version 26 to 187.19 TFLOP/s, with 202.14 TFLOP/s observed in a same-day
+  run. FP16 reaches 203.67 TFLOP/s.
+
 ### Version 26: Pipelined Tensor Core GEMM
 
 - Added target-aware SM80 `cp.async` lowering with three shared-memory stages,
